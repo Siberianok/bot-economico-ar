@@ -1,0 +1,12 @@
+services:
+  - type: worker
+    name: bot-economico-ar
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot_econ_full_plus_rank_alerts.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false  # set this in Render dashboard
+      - key: ALERTS_DB_PATH
+        value: /var/tmp/alerts.db
