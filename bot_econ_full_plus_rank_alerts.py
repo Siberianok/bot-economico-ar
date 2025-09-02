@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot Económico AR — Telegram
+Bot Económico AR — Telegram (Web Service compatible para Render Free)
 Comandos:
   /dolar
   /reservas
@@ -19,31 +19,29 @@ Comandos:
 Fuentes:
 - Dólares: DolarAPI (Ámbito) con fallback CriptoYa
 - Reservas e Inflación: apis.datos.gob.ar (series oficiales)
-- Riesgo país: ArgentinaDatos con fallback a listado
+- Riesgo país: ArgentinaDatos
 - Acciones/CEDEARs: Yahoo Finance (chart)
 - Noticias: RSS de medios económicos locales
 
-Runtime: Python-telegram-bot v20.x (asyncio), httpx
-Persistencia de alertas: SQLite (stdlib), archivo local ./alerts.db
+Runtime: python-telegram-bot v20.8 (async handlers), httpx
+Persistencia de alertas: SQLite (archivo local ./alerts.db o el que definas en ALERTS_DB_PATH)
 Zona horaria: America/Argentina/Buenos_Aires
+
+Compatibilidad Render Web: levanta un HTTP server en $PORT para health checks (/healthz).
 """
 
-import asyncio
 import os
 import re
 import math
-import json
-import time
 import sqlite3
-from datetime import datetime, timezone, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
+from typing import Optional
 
 import httpx
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, ContextTypes
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ---------- Config ----------
 
@@ -55,48 +53,41 @@ CRIPTOYA_DOLAR = "https://criptoya.com/api/dolar"
 ARGDATOS_RIESGO_ULTIMO = "https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais/ultimo"
 ARGDATOS_RIESGO_LISTA = "https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais"
 
-# Series oficiales (probaremos varias hasta obtener dato)
-# Reservas internacionales (millones de USD)
+# Series oficiales (probamos varias IDs para robustez)
 RESERVAS_SERIES_CANDIDATAS = [
-    # Serie de Reservas del dataset SSPM (nombres varían según versiones)
-    "92.2_RESERVAS_IRES_0_0_32_40",  # frecuente
+    "92.2_RESERVAS_IRES_0_0_32_40",
     "92.1_RESERVA_0_0_26",
     "92.1_RESERVAS_0_0_26",
     "92.1_RESERVAS_D_0_0_18",
 ]
-# IPC mensual (variación m/m). Intentamos series de variación y, si falla, derivamos desde índice
 IPC_MENSUAL_SERIES_VARIACION = [
-    "148.3_INIVELNAL_DICI_M_26",  # INDEC Nivel general (variación m/m) — común
+    "148.3_INIVELNAL_DICI_M_26",
     "148.3_INIVELNAL_DICI_M_12",
-    "103.1_I2N_2016_M_19",        # IPC Total Nacional variación m/m (algunas versiones)
+    "103.1_I2N_2016_M_19",
 ]
 IPC_INDICE_SERIES = [
-    "103.1_I2N_2016_M_15",        # Índice nivel general (Nacional)
+    "103.1_I2N_2016_M_15",
 ]
 
 DATOS_API = "https://apis.datos.gob.ar/series/api/series"
 
-# Universos (pueden ampliarse fácilmente)
+# Universos iniciales (ampliables)
 BYMA_UNIVERSO = [
-    # Bancos / Financieras
     ("GGAL.BA", "Grupo Financiero Galicia", "Bancos"),
     ("BMA.BA", "Banco Macro", "Bancos"),
     ("BBAR.BA", "BBVA Argentina", "Bancos"),
     ("SUPV.BA", "Supervielle", "Bancos"),
     ("VALO.BA", "Grupo Valores", "Servicios Financieros"),
     ("BYMA.BA", "Bolsas y Mercados Argentinos", "Servicios Financieros"),
-    # Energía
     ("YPFD.BA", "YPF", "Energía"),
     ("PAMP.BA", "Pampa Energía", "Energía"),
     ("CEPU.BA", "Central Puerto", "Energía"),
     ("TGSU2.BA", "Transportadora de Gas del Sur", "Energía"),
     ("TGNO4.BA", "Transportadora de Gas del Norte", "Energía"),
-    # Industriales / Materiales
     ("TXAR.BA", "Ternium Argentina", "Materiales"),
     ("ALUA.BA", "Aluar", "Materiales"),
     ("LOMA.BA", "Loma Negra", "Materiales"),
     ("COME.BA", "Soc. Comercial del Plata", "Industriales"),
-    # Telecom / Medios / Real Estate / Agro
     ("TECO2.BA", "Telecom Argentina", "Telecom"),
     ("CVH.BA", "Cablevisión Holding", "Medios/Telecom"),
     ("CRES.BA", "Cresud", "Agro/Real Estate"),
@@ -120,7 +111,7 @@ CEDEARS_UNIVERSO = [
     ("MSTR.BA", "MicroStrategy", "Tecnología"),
 ]
 
-# RSS de medios económicos en AR
+# RSS económicos locales
 RSS_FEEDS = [
     "https://www.ambito.com/contenidos/economia.xml",
     "https://www.cronista.com/files/rss/economia.xml",
@@ -142,7 +133,6 @@ NEWS_KEYWORDS_NEG = ["quiniela", "horóscopo", "salud", "covid", "farandula", "e
 # ---------- Utilidades ----------
 
 def fmt_money_ars(x: float) -> str:
-    """Formatea ARS con punto de miles y coma decimal, sin redondeos extraños."""
     try:
         s = f"{x:,.2f}"
     except Exception:
@@ -153,9 +143,6 @@ def fmt_money_ars(x: float) -> str:
 def now_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
 
-def take_last_safe(seq):
-    return seq[-1] if seq else None
-
 def pct(a: float, b: float) -> float:
     try:
         return (a/b - 1.0) * 100.0
@@ -163,17 +150,20 @@ def pct(a: float, b: float) -> float:
         return float('nan')
 
 def human_pct(x: float) -> str:
-    if x != x or math.isinf(x):  # NaN or inf
+    if x != x or math.isinf(x):
         return "n/d"
     return f"{x:+.2f}%"
 
 # ---------- HTTP ----------
 
-_http_client = httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=8.0))
+_http_client = httpx.AsyncClient(
+    timeout=httpx.Timeout(12.0, connect=8.0),
+    headers={"User-Agent": "AR-EconBot/1.0"}
+)
 
-async def http_json(url: str, params: dict | None = None):
+async def http_json(url: str, params: Optional[dict] = None):
     try:
-        r = await _http_client.get(url, params=params, headers={"User-Agent": "AR-EconBot/1.0"})
+        r = await _http_client.get(url, params=params)
         r.raise_for_status()
         return r.json()
     except Exception:
@@ -181,7 +171,7 @@ async def http_json(url: str, params: dict | None = None):
 
 async def http_text(url: str):
     try:
-        r = await _http_client.get(url, headers={"User-Agent": "AR-EconBot/1.0"})
+        r = await _http_client.get(url)
         r.raise_for_status()
         return r.text
     except Exception:
@@ -210,19 +200,10 @@ async def fetch_dolar_fallback():
     j = await http_json(CRIPTOYA_DOLAR)
     out = {}
     if j:
-        # Mapear estructura criptoya -> similar a dolarapi
-        mapping = {
-            "blue": "blue",
-            "mep": "mep",
-            "ccl": "ccl",
-            "oficial": "oficial",
-            "mayorista": "mayorista",
-            "cripto": "cripto",
-        }
-        for a,b in mapping.items():
+        mapping = {"blue": "blue", "mep": "mep", "ccl": "ccl", "oficial": "oficial", "mayorista": "mayorista", "cripto": "cripto"}
+        for a, b in mapping.items():
             node = j.get(b)
             if node:
-                # algunos campos pueden variar; normalizamos
                 venta = node.get("venta") or node.get("price") or node.get("ask") or node.get("promedio")
                 compra = node.get("compra") or node.get("bid") or venta
                 out[a] = {
@@ -239,7 +220,7 @@ async def get_all_dolares():
     data = await fetch_dolar_ambito()
     if len(data) < 6:
         fb = await fetch_dolar_fallback()
-        data = {**fb, **data}  # preferimos Ámbito, completamos con fallback
+        data = {**fb, **data}  # preferimos Ámbito
     return data
 
 def format_dolares_block(data: dict) -> str:
@@ -252,14 +233,13 @@ def format_dolares_block(data: dict) -> str:
         compra = d.get("compra")
         venta = d.get("venta")
         compra_s = fmt_money_ars(compra) if isinstance(compra, (int, float)) else "n/d"
-        venta_s  = fmt_money_ars(venta)  if isinstance(venta, (int, float)) else "n/d"
-        name = k.upper()
-        lines.append(f"{name:10s} | Compra: {compra_s:>12s} | Venta: {venta_s:>12s}")
+        venta_s  = fmt_money_ars(venta)  if isinstance(venta,  (int, float)) else "n/d"
+        lines.append(f"{k.upper():10s} | Compra: {compra_s:>12s} | Venta: {venta_s:>12s}")
     return "```\n" + "\n".join(lines) + "\n```"
 
 # ---------- Series oficiales (reservas / IPC) ----------
 
-async def fetch_series_last_value(series_id: str, representation_mode: str | None = None):
+async def fetch_series_last_value(series_id: str, representation_mode: Optional[str] = None):
     params = {"ids": series_id, "limit": 1}
     if representation_mode:
         params["representation_mode"] = representation_mode
@@ -268,14 +248,13 @@ async def fetch_series_last_value(series_id: str, representation_mode: str | Non
         data = j["data"]
         if not data:
             return None
-        val = data[-1][1]
+        val = float(data[-1][1])
         date = data[-1][0][:10]
-        return {"fecha": date, "valor": float(val)}
+        return {"fecha": date, "valor": val}
     except Exception:
         return None
 
 async def get_reservas_usd():
-    # intentamos series candidatas
     for sid in RESERVAS_SERIES_CANDIDATAS:
         r = await fetch_series_last_value(sid)
         if r and r["valor"] is not None:
@@ -283,12 +262,10 @@ async def get_reservas_usd():
     return None
 
 async def get_ipc_mensual():
-    # primero intentamos series de variación ya calculadas
     for sid in IPC_MENSUAL_SERIES_VARIACION:
         r = await fetch_series_last_value(sid)
         if r and r["valor"] is not None and -10.0 < r["valor"] < 100.0:
             return r | {"serie": sid, "unidad": "%"}
-    # Si no hay, derivamos desde índice nivel general con percent_change
     for sid in IPC_INDICE_SERIES:
         r = await fetch_series_last_value(sid, representation_mode="percent_change")
         if r and r["valor"] is not None and -10.0 < r["valor"] < 100.0:
@@ -300,12 +277,19 @@ async def get_ipc_mensual():
 async def get_riesgo_pais():
     j = await http_json(ARGDATOS_RIESGO_ULTIMO)
     if j and isinstance(j, dict) and "valor" in j:
-        return {"fecha": j.get("fecha"), "valor": float(j["valor"])}
-    # fallback list
+        try:
+            val = float(j["valor"])
+        except Exception:
+            val = None
+        return {"fecha": j.get("fecha"), "valor": val}
     lst = await http_json(ARGDATOS_RIESGO_LISTA)
     if lst and isinstance(lst, list) and lst:
         last = lst[-1]
-        return {"fecha": last.get("fecha"), "valor": float(last.get("valor"))}
+        try:
+            val = float(last.get("valor"))
+        except Exception:
+            val = None
+        return {"fecha": last.get("fecha"), "valor": val}
     return None
 
 # ---------- Yahoo Finance ----------
@@ -319,25 +303,19 @@ async def yf_history_close(symbol: str, period: str = "6mo", interval: str = "1d
         res = j["chart"]["result"][0]
         closes = res["indicators"]["quote"][0]["close"]
         timestamps = res["timestamp"]
-        # limpiamos NaN
         series = [(ts, c) for ts, c in zip(timestamps, closes) if c is not None]
         return series
     except Exception:
         return None
 
-def trailing_returns_from_series(series: list[tuple[int, float]]):
-    # series: list of (timestamp, close) ascending
+def trailing_returns_from_series(series):
     if not series:
         return None
     closes = [c for _, c in series]
     last = closes[-1]
-    # 21, 63, 126 ~ 1m, 3m, 6m de ruedas
     def ret_at(days):
         idx = -days-1
-        if len(closes) > abs(idx):
-            base = closes[idx]
-        else:
-            base = closes[0]
+        base = closes[idx] if len(closes) > abs(idx) else closes[0]
         return pct(last, base)
     r1 = ret_at(21)
     r3 = ret_at(63)
@@ -350,7 +328,10 @@ async def compute_universe_returns(universe):
         series = await yf_history_close(symbol, period="6mo", interval="1d")
         if not series:
             continue
-        last, r1, r3, r6 = trailing_returns_from_series(series)
+        t = trailing_returns_from_series(series)
+        if not t:
+            continue
+        last, r1, r3, r6 = t
         out.append({
             "symbol": symbol, "name": name, "sector": sector,
             "price": last, "r1": r1, "r3": r3, "r6": r6
@@ -358,17 +339,15 @@ async def compute_universe_returns(universe):
     return out
 
 def pick_top_by_3m(data, topn=3):
-    # ordena por r3 desc, filtra NaN
-    filtered = [d for d in data if d["r3"] == d["r3"]]  # not NaN
+    filtered = [d for d in data if d["r3"] == d["r3"]]
     return sorted(filtered, key=lambda x: x["r3"], reverse=True)[:topn]
 
 def pick_top_by_projection(data, topn=5):
-    # score = 0.1*1m + 0.3*3m + 0.6*6m
     def score(d):
         s = 0.0
         for w, k in [(0.1, "r1"), (0.3, "r3"), (0.6, "r6")]:
             v = d.get(k)
-            if v == v:  # not NaN
+            if v == v:
                 s += w * v
         return s
     for d in data:
@@ -377,23 +356,20 @@ def pick_top_by_projection(data, topn=5):
     return sorted(filtered, key=lambda x: x["_score"], reverse=True)[:topn]
 
 def format_card(item):
-    # Ticker (Empresa) — Precio / • Sector / Rendimientos: 1m · 3m · 6m
     price = item.get("price")
     s_price = f"${price:.2f}" if isinstance(price, (int, float)) else "n/d"
-    s = f"• {item['symbol']} ({item['name']}) — {s_price}\n" \
-        f"  • Sector: {item['sector']}\n" \
+    return (
+        f"• {item['symbol']} ({item['name']}) — {s_price}\n"
+        f"  • Sector: {item['sector']}\n"
         f"  • Rendimientos: {human_pct(item['r1'])} · {human_pct(item['r3'])} · {human_pct(item['r6'])}"
-    return s
+    )
 
-# ---------- Noticias ----------
+# ---------- Noticias (RSS) ----------
 
 def simple_rss_parse(xml_text: str):
-    # Parser mínimo compatible con RSS/Atom (sin dependencia extra)
-    # Devuelve lista de dicts: {title, link, published}
     items = []
     if not xml_text:
         return items
-    # RSS
     for m in re.finditer(r"<item>(.*?)</item>", xml_text, re.DOTALL | re.IGNORECASE):
         block = m.group(1)
         title = re.search(r"<title>(.*?)</title>", block, re.DOTALL | re.IGNORECASE)
@@ -404,7 +380,6 @@ def simple_rss_parse(xml_text: str):
             "link": (link.group(1).strip() if link else "").strip(),
             "published": (date.group(1).strip() if date else "").strip(),
         })
-    # Atom
     if not items:
         for m in re.finditer(r"<entry>(.*?)</entry>", xml_text, re.DOTALL | re.IGNORECASE):
             block = m.group(1)
@@ -429,21 +404,19 @@ async def fetch_news_filtered(limit=5):
             t = (it["title"] or "").lower()
             if t and any(k in t for k in NEWS_KEYWORDS_POS) and not any(k in t for k in NEWS_KEYWORDS_NEG):
                 hits.append(it)
-    # ordenar por 'published' si posible, sin romper
+    # ordenar por fecha (si se puede)
     def parse_dt(s):
         try:
             return datetime.strptime(s[:25], "%a, %d %b %Y %H:%M:%S")
         except Exception:
             return datetime.now()
     hits = sorted(hits, key=lambda x: parse_dt(x.get("published","")), reverse=True)
-    # dedup by title
-    seen = set()
-    uniq = []
+    # deduplicar por título
+    seen, uniq = set(), []
     for h in hits:
-        key = h["title"]
-        if key in seen:
+        if h["title"] in seen:
             continue
-        seen.add(key)
+        seen.add(h["title"])
         uniq.append(h)
         if len(uniq) >= limit:
             break
@@ -503,7 +476,7 @@ def db_list_all_active():
     con.close()
     return rows
 
-# ---------- Bot Handlers ----------
+# ---------- Handlers ----------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
@@ -550,7 +523,7 @@ async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = await get_riesgo_pais()
-    if not r:
+    if not r or r.get("valor") is None:
         await update.message.reply_text("📉 Riesgo país: dato no disponible ahora (ArgentinaDatos).")
         return
     txt = f"📉 *Riesgo País (EMBI+)*\n`{r['fecha']}` — {int(round(r['valor']))} pts"
@@ -597,9 +570,7 @@ async def cmd_ranking_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text("🏁 *Ranking CEDEARs (proyección 6M)*\n" + "\n\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_alerta_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /alerta_dolar <tipo> <umbral>
-    msg = (update.message.text or "").strip()
-    parts = msg.split()
+    parts = (update.message.text or "").strip().split()
     if len(parts) != 3:
         await update.message.reply_text("Uso: /alerta_dolar <tipo> <umbral>\nTipos: blue|mep|ccl|cripto|oficial|mayorista")
         return
@@ -650,28 +621,11 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     riesgo = await get_riesgo_pais()
     news = await fetch_news_filtered(limit=5)
 
-    # Dólares
     block = format_dolares_block(dolares) if dolares else "n/d"
+    reservas_txt = f"`{reservas['fecha']}` — {reservas['valor']:.2f} M USD" if reservas else "Dato no disponible"
+    ipc_txt = f"`{ipc['fecha']}` — {ipc['valor']:.2f}%" if ipc else "Dato no disponible"
+    riesgo_txt = f"`{riesgo['fecha']}` — {int(round(riesgo['valor']))} pts" if riesgo and riesgo.get("valor") is not None else "Dato no disponible"
 
-    # Reservas
-    if reservas:
-        reservas_txt = f"`{reservas['fecha']}` — {reservas['valor']:.2f} M USD"
-    else:
-        reservas_txt = "Dato no disponible"
-
-    # Inflación
-    if ipc:
-        ipc_txt = f"`{ipc['fecha']}` — {ipc['valor']:.2f}%"
-    else:
-        ipc_txt = "Dato no disponible"
-
-    # Riesgo
-    if riesgo:
-        riesgo_txt = f"`{riesgo['fecha']}` — {int(round(riesgo['valor']))} pts"
-    else:
-        riesgo_txt = "Dato no disponible"
-
-    # Noticias
     if news:
         news_lines = [f"• [{n['title']}]({n['link']})" for n in news]
         news_txt = "\n".join(news_lines)
@@ -688,31 +642,54 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
     await update.message.reply_text(out, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
-# ---------- Loop de alertas ----------
+# ---------- Alertas con JobQueue (cada 90s) ----------
 
-async def alert_loop(app):
-    await asyncio.sleep(5)  # pequeña espera al iniciar
-    while True:
+async def job_check_alerts(context: ContextTypes.DEFAULT_TYPE):
+    rows = db_list_all_active()
+    if not rows:
+        return
+    dolares = await get_all_dolares()
+    for (alert_id, chat_id, tipo, umbral) in rows:
+        d = dolares.get(tipo) if dolares else None
+        precio = d.get("venta") if d else None
         try:
-            rows = db_list_all_active()
-            if rows:
-                dolares = await get_all_dolares()
-                for (alert_id, chat_id, tipo, umbral) in rows:
-                    d = dolares.get(tipo) if dolares else None
-                    precio = d.get("venta") if d else None
-                    if isinstance(precio, (int, float)) and precio >= float(umbral):
-                        # disparar alerta
-                        txt = f"🔔 *Alerta #{alert_id}*\n{tipo.upper()} alcanzó {fmt_money_ars(precio)} (umbral {fmt_money_ars(umbral)})."
-                        try:
-                            await app.bot.send_message(chat_id=chat_id, text=txt, parse_mode=ParseMode.MARKDOWN)
-                        except Exception:
-                            pass
-                        # eliminamos la alerta luego de disparar (alertas one-shot)
-                        db_delete_alert(chat_id, alert_id)
-            # frecuencia de chequeo
-            await asyncio.sleep(90)  # 1.5 minutos
+            thr = float(umbral)
         except Exception:
-            await asyncio.sleep(120)
+            continue
+        if isinstance(precio, (int, float)) and precio >= thr:
+            txt = f"🔔 *Alerta #{alert_id}*\n{tipo.upper()} alcanzó {fmt_money_ars(precio)} (umbral {fmt_money_ars(thr)})."
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=txt, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                pass
+            db_delete_alert(chat_id, alert_id)
+
+# ---------- Health server (thread, sin asyncio) ----------
+
+def start_health_server_in_thread():
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    port = int(os.environ.get("PORT", "0") or "0")
+    if port <= 0:
+        return
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/healthz":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK")
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(b"OK")
+        def log_message(self, *args):
+            return  # silenciar logs
+    server = HTTPServer(("0.0.0.0", port), Handler)
+    t = threading.Thread(target=server.serve_forever, daemon=True)
+    t.start()
+    print(f"[health] HTTP server (thread) listening on 0.0.0.0:{port}")
 
 # ---------- Main ----------
 
@@ -741,17 +718,21 @@ def build_app():
 
     app.add_handler(CommandHandler("resumen_diario", cmd_resumen_diario))
 
+    # Job de alertas cada 90s (empieza a los 10s)
+    app.job_queue.run_repeating(job_check_alerts, interval=90, first=10)
+
     return app
 
-async def main():
+def main():
     db_init()
     app = build_app()
-    # lanzamos loop de alertas paralelo
-    asyncio.get_event_loop().create_task(alert_loop(app))
-    await app.run_polling(close_loop=False)
+    # HTTP health server (Render Web)
+    start_health_server_in_thread()
+    # Importante: en PTB 20.x, run_polling maneja su propio event loop
+    app.run_polling()
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        main()
     except (KeyboardInterrupt, SystemExit):
         pass
