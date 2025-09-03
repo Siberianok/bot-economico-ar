@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Bot Económico AR — Telegram (Render Free, WEBHOOK con reintentos)
+Bot Económico AR — Telegram (Render Free, WEBHOOK estable)
 Comandos:
   /dolar, /reservas, /inflacion, /riesgo, /acciones, /cedears,
   /ranking_acciones, /ranking_cedears,
@@ -12,7 +12,6 @@ Comandos:
 import os
 import re
 import time
-import math
 import json
 import sqlite3
 import asyncio
@@ -27,7 +26,6 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, Defaults
 )
 from telegram.request import HTTPXRequest
-from telegram.error import TimedOut
 
 # ===================== Configuración =====================
 
@@ -336,6 +334,10 @@ def _pass_noticia(title: str):
     if any(k in t for k in KEYWORDS_OK): return True
     return False
 
+def _escape_url(u: str) -> str:
+    # Para MarkdownV2: escapamos paréntesis en URLs para evitar parse errors
+    return u.replace(")", "%29").replace("(", "%28")
+
 async def get_news():
     v = CACHE.get("news")
     if v: return v
@@ -363,7 +365,7 @@ async def get_news():
 
 def fmt_news_links(items):
     if not items: return "Sin noticias filtradas ahora."
-    return "\n".join(f"• [{esc(t)}]({u})" for t, u in items)
+    return "\n".join(f"• [{esc(t)}]({_escape_url(u)})" for t, u in items)
 
 # ===================== Alertas (sqlite) =====================
 
@@ -575,7 +577,7 @@ def build_app():
         app.job_queue.run_repeating(job_check_alerts, interval=90, first=15)
     return app
 
-# ===================== MAIN — WEBHOOK con reintentos =====================
+# ===================== MAIN — WEBHOOK simple =====================
 
 def main():
     db_init()
@@ -584,30 +586,16 @@ def main():
     secret_path = WEBHOOK_PATH or BOT_TOKEN
     port = int(os.getenv("PORT", "10000"))
 
-    # Reintenta levantar el webhook si hay TimedOut durante initialize()
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            app = build_app()
-            app.run_webhook(
-                listen="0.0.0.0",
-                port=port,
-                url_path=secret_path,
-                webhook_url=f"{PUBLIC_URL}/{secret_path}",
-                drop_pending_updates=True,
-                stop_signals=None,
-            )
-            break  # si sale del run_webhook, ya no reintenta
-        except TimedOut:
-            wait = min(10, 2 * attempt)
-            print(f"[startup] Telegram TimedOut al iniciar (intento {attempt}). Reintentando en {wait}s…", flush=True)
-            time.sleep(wait)
-        except Exception as e:
-            # Cualquier otro error: log y reintento suave
-            wait = min(10, 2 * attempt)
-            print(f"[startup] Error al iniciar webhook: {e}. Reintento en {wait}s…", flush=True)
-            time.sleep(wait)
+    app = build_app()
+    # Bloqueante; PTB maneja su propio event loop. No hacer reintentos acá.
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=secret_path,
+        webhook_url=f"{PUBLIC_URL}/{secret_path}",
+        drop_pending_updates=True,
+        stop_signals=None,
+    )
 
 if __name__ == "__main__":
     main()
