@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Bot Económico AR — Telegram (Render Free, polling)
+Bot Económico AR — Telegram (Render Free, WEBHOOK)
 Comandos:
   /dolar
   /reservas
@@ -21,12 +21,11 @@ Fuentes:
   - Dólares: DolarAPI (principal) + fallback CriptoYa
   - Reservas / Inflación: apis.datos.gob.ar (series oficiales) [multi-intento]
   - Riesgo país: ArgentinaDatos (principal) + fallback DolarAPI
-  - Acciones/CEDEARs: Yahoo Finance Spark (1d, 6mo) para armar 1m/3m/6m
-  - Noticias: RSS medios locales + filtro económico (solo títulos clickeables)
+  - Acciones/CEDEARs: Yahoo Finance Spark (6 meses diarios) → 1m/3m/6m
+  - Noticias: RSS medios locales + filtro económico (solo títulos como links)
 
 Render:
-  - Web service (Free). Incluye HTTP de salud en PORT (default 10000).
-  - Polling de Telegram con JobQueue (prefetch periódico + alertas).
+  - Web Service (Free). Este script usa WEBHOOK (no polling) para evitar conflictos.
 """
 
 import os
@@ -36,22 +35,22 @@ import math
 import json
 import asyncio
 import sqlite3
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import datetime, timedelta, timezone
-
-import httpx
+from datetime import datetime
 from xml.etree import ElementTree as ET
 
-from telegram import Update
+import httpx
+
+from telegram import Update, LinkPreviewOptions
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters, Defaults
 )
 
-# ============== Config ===================
+# ===================== Configuración =====================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip().rstrip("/")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "").strip()  # si está vacío, usaremos el BOT_TOKEN
 ALERTS_DB_PATH = os.getenv("ALERTS_DB_PATH", "/var/tmp/alerts.db")
 NEWS_MAX_ITEMS = int(os.getenv("NEWS_MAX_ITEMS", "5"))
 
@@ -63,17 +62,17 @@ TTL_IPC = 86400       # 24 hs
 TTL_YF = 300          # 5 min
 TTL_NEWS = 600        # 10 min
 
-# Yahoo universos (podés ampliar libremente)
+# Universos Yahoo (podés ampliar libremente)
 UNIVERSO_ACCIONES_BA = [
     # Bancos
     "GGAL.BA", "BMA.BA", "BBAR.BA", "SUPV.BA",
     # Energía
     "YPFD.BA", "PAMP.BA", "CEPU.BA", "EDN.BA", "TGSU2.BA", "TGNO4.BA", "TRAN.BA",
-    # Industriales/Materiales
+    # Industriales/Materiales/Real estate
     "ALUA.BA", "TXAR.BA", "LOMA.BA", "CRES.BA",
-    # Telecom/Tech
+    # Telecom/Servicios
     "TECO2.BA", "MIRG.BA",
-    # Consumo/Real estate/Otros
+    # Consumo/Finanzas/Otros
     "VALO.BA", "COME.BA", "HAVA.BA",
 ]
 
@@ -83,7 +82,6 @@ UNIVERSO_CEDEARS_BA = [
     "NFLX.BA", "NKE.BA", "INTC.BA", "AMD.BA", "BIDU.BA"
 ]
 
-# Sectores muy generales (para tarjeta). Podés ajustar mapping a gusto.
 SECTORES = {
     "GGAL.BA": "Bancos", "BMA.BA": "Bancos", "BBAR.BA": "Bancos", "SUPV.BA": "Bancos",
     "YPFD.BA": "Energía", "PAMP.BA": "Energía", "CEPU.BA": "Energía", "EDN.BA": "Energía",
@@ -93,11 +91,10 @@ SECTORES = {
     "VALO.BA": "Finanzas", "COME.BA": "Consumo", "HAVA.BA": "Otros",
 }
 
-# Nombre “bonito” (si no está, mostramos el ticker)
 NOMBRES = {
     "GGAL.BA": "Grupo Galicia", "BMA.BA": "Banco Macro", "BBAR.BA": "BBVA Arg", "SUPV.BA": "Supervielle",
     "YPFD.BA": "YPF", "PAMP.BA": "Pampa Energía", "CEPU.BA": "Central Puerto", "EDN.BA": "Edenor",
-    "TGSU2.BA": "Transportadora Gas Sur", "TGNO4.BA": "Transportadora Gas Norte", "TRAN.BA": "Transener",
+    "TGSU2.BA": "Transp. Gas Sur", "TGNO4.BA": "Transp. Gas Norte", "TRAN.BA": "Transener",
     "ALUA.BA": "Aluar", "TXAR.BA": "Ternium Arg", "LOMA.BA": "Loma Negra", "CRES.BA": "Cresud",
     "TECO2.BA": "Telecom Arg", "MIRG.BA": "Mirgor",
     "VALO.BA": "Grupo Valores", "COME.BA": "Siderar/Comercial", "HAVA.BA": "Havanna",
@@ -108,21 +105,21 @@ NOMBRES = {
     "AMD.BA": "AMD", "BIDU.BA": "Baidu"
 }
 
-# Series oficiales candidatos (multi-intento por si alguno falla/cambia)
-SERIES_RESERVAS = [
-    # Intentos (completá aquí el que usabas si lo conocés)
+# Series oficiales (con override por Environment si lo definís)
+SERIES_RESERVAS = [s for s in [
+    os.getenv("SERIES_RESERVAS_ID"),
     "BCRA.RESERVAS_INTERNACIONALES_USD",
     "BCRA.RESERVAS_INTERNACIONALES",
-]
-SERIES_IPC_MOM = [
-    # Variación mensual % (nivel general). Ajustá si conocés tu id exacto.
+] if s]
+
+SERIES_IPC_MOM = [s for s in [
+    os.getenv("SERIES_IPC_MOM_ID"),
     "INDEC.IPC.NIVEL_GENERAL_Variacion_mensual",
     "INDEC.IPC.VAR_MENSUAL",
-]
+] if s]
 
-# RSS (medios locales, economía/finanzas)
+# RSS economía locales
 RSS_FEEDS = [
-    # Si alguna URL cambia, el bot la ignora silenciosamente.
     "https://www.ambito.com/rss/economia.xml",
     "https://www.cronista.com/files/rss/economia.xml",
     "https://www.baenegocios.com/rss/economia.xml",
@@ -135,43 +132,41 @@ RSS_FEEDS = [
 
 KEYWORDS_OK = [
     "dólar", "dolar", "inflación", "inflacion", "reservas", "riesgo", "mercado",
-    "acciones", "bonos", "tasa", "mev", "mep", "ccl", "pbi", "actividad", "export", "import",
-    "ipim", "icm", "ipo", "inflacion", "brecha", "blue", "oficial", "mayorista"
+    "acciones", "bonos", "tasa", "mep", "ccl", "brecha", "blue", "oficial", "mayorista",
+    "pbi", "actividad", "export", "import", "ipim", "icm"
 ]
 KEYWORDS_BAN = [
-    "salud", "fútbol", "futbol", "quiniela", "espectáculo", "espectaculo", "policial", "horóscopo", "horoscopo"
+    "salud", "fútbol", "futbol", "quiniela", "espectáculo", "espectaculo",
+    "policial", "horóscopo", "horoscopo"
 ]
 
-# ============== Utilidades comunes ===================
+# ===================== Utilidades comunes =====================
 
-# Markdown V2: escapador para títulos y texto
 _MDV2_RE = re.compile(r'([_*\[\]()~`>#+\-=|{}.!])')
 def esc(s: str) -> str:
     return _MDV2_RE.sub(r'\\\1', s or "")
 
-def now_utc() -> float:
+def now_ts() -> float:
     return time.time()
 
 class TTLCache:
     def __init__(self):
-        self.data = {}  # key -> (expire_ts, value)
-
+        self.data = {}  # key -> (expire, value)
     def get(self, key):
-        item = self.data.get(key)
-        if not item:
+        v = self.data.get(key)
+        if not v:
             return None
-        exp, val = item
-        if exp < now_utc():
+        exp, val = v
+        if exp < now_ts():
             self.data.pop(key, None)
             return None
         return val
-
-    def set(self, key, value, ttl: int):
-        self.data[key] = (now_utc() + ttl, value)
+    def set(self, key, value, ttl):
+        self.data[key] = (now_ts() + ttl, value)
 
 CACHE = TTLCache()
 
-# Cliente HTTP compartido (keep-alive + timeouts + UA)
+# Cliente HTTP compartido
 HTTP_TIMEOUT = httpx.Timeout(connect=10, read=12, write=12, pool=12)
 HTTP_LIMITS  = httpx.Limits(max_connections=20, max_keepalive_connections=20)
 HTTP_HEADERS = {"User-Agent": "bot-econ-ar/1.0 (+github.com/Siberianok/bot-economico-ar)"}
@@ -184,7 +179,7 @@ http = httpx.AsyncClient(
 )
 
 async def fetch_json(url: str, params: dict | None = None):
-    for i in range(2):  # dos intentos rápidos
+    for i in range(2):
         try:
             r = await http.get(url, params=params)
             if r.status_code == 200:
@@ -193,49 +188,43 @@ async def fetch_json(url: str, params: dict | None = None):
             await asyncio.sleep(0.4 * (i + 1))
     return None
 
-async def fetch_text(url: str, params: dict | None = None):
+async def fetch_text(url: str):
     for i in range(2):
         try:
-            r = await http.get(url, params=params)
+            r = await http.get(url)
             if r.status_code == 200:
                 return r.text
         except httpx.RequestError:
             await asyncio.sleep(0.4 * (i + 1))
     return None
 
-# ============== Datos: Dólares ===================
+# ===================== Dólares =====================
 
 USD_TYPES = ["blue", "mep", "ccl", "cripto", "oficial", "mayorista"]
 
 async def get_dolares():
-    cache_key = "usd_all"
-    val = CACHE.get(cache_key)
-    if val:
-        return val
+    ck = "usd_all"
+    v = CACHE.get(ck)
+    if v:
+        return v
     out = {}
 
-    # Principal: DolarAPI
     async def _dapi(tipo):
-        url = f"https://dolarapi.com/v1/dolares/{tipo}"
-        data = await fetch_json(url)
+        data = await fetch_json(f"https://dolarapi.com/v1/dolares/{tipo}")
         if data and "compra" in data and "venta" in data:
             return {"buy": float(data["compra"]), "sell": float(data["venta"])}
 
-    # Fallback: CriptoYa
     async def _cy(tipo):
         data = await fetch_json("https://criptoya.com/api/dolar")
         if not data:
             return None
-        mapping = {
-            "blue": "blue", "mep": "mep", "ccl": "ccl",
-            "oficial": "oficial", "mayorista": "mayorista", "cripto": "cripto"
-        }
-        k = mapping.get(tipo)
-        if k and k in data and isinstance(data[k], dict):
-            bid = data[k].get("bid") or data[k].get("compra") or data[k].get("buy")
-            ask = data[k].get("ask") or data[k].get("venta") or data[k].get("sell")
-            if bid and ask:
-                return {"buy": float(bid), "sell": float(ask)}
+        k = {"blue":"blue","mep":"mep","ccl":"ccl","oficial":"oficial","mayorista":"mayorista","cripto":"cripto"}.get(tipo)
+        if not k or k not in data or not isinstance(data[k], dict):
+            return None
+        bid = data[k].get("bid") or data[k].get("compra") or data[k].get("buy")
+        ask = data[k].get("ask") or data[k].get("venta") or data[k].get("sell")
+        if bid and ask:
+            return {"buy": float(bid), "sell": float(ask)}
         return None
 
     for t in USD_TYPES:
@@ -246,11 +235,11 @@ async def get_dolares():
             out[t] = q
 
     if out:
-        CACHE.set(cache_key, out, TTL_USD)
+        CACHE.set(ck, out, TTL_USD)
     return out
 
 def fmt_dolares_block(d):
-    # bloque monoespaciado
+    g = lambda t,k: d.get(t,{}).get(k, 0.0)
     lines = [
         "BLUE      | Compra: $ {b1:>7,.2f} | Venta: $ {s1:>7,.2f}",
         "MEP       | Compra: $ {b2:>7,.2f} | Venta: $ {s2:>7,.2f}",
@@ -259,7 +248,6 @@ def fmt_dolares_block(d):
         "OFICIAL   | Compra: $ {b5:>7,.2f} | Venta: $ {s5:>7,.2f}",
         "MAYORISTA | Compra: $ {b6:>7,.2f} | Venta: $ {s6:>7,.2f}",
     ]
-    g = lambda t,k: d.get(t,{}).get(k, 0.0)
     s = "\n".join(lines).format(
         b1=g("blue","buy"),   s1=g("blue","sell"),
         b2=g("mep","buy"),    s2=g("mep","sell"),
@@ -270,7 +258,7 @@ def fmt_dolares_block(d):
     )
     return "```\n" + s + "\n```"
 
-# ============== Datos: Series oficiales (Reservas / IPC) ===================
+# ===================== Series oficiales =====================
 
 async def series_last(ids: str):
     data = await fetch_json(
@@ -285,8 +273,8 @@ async def series_last(ids: str):
     return None
 
 async def get_reservas():
-    cache_key = "reservas"
-    v = CACHE.get(cache_key)
+    ck = "reservas"
+    v = CACHE.get(ck)
     if v is not None:
         return v
     val = None
@@ -295,12 +283,12 @@ async def get_reservas():
         if val is not None:
             break
     if val is not None:
-        CACHE.set(cache_key, val, TTL_RESERVAS)
+        CACHE.set(ck, val, TTL_RESERVAS)
     return val
 
 async def get_ipc_mom():
-    cache_key = "ipc_mom"
-    v = CACHE.get(cache_key)
+    ck = "ipc_mom"
+    v = CACHE.get(ck)
     if v is not None:
         return v
     val = None
@@ -309,34 +297,30 @@ async def get_ipc_mom():
         if val is not None:
             break
     if val is not None:
-        CACHE.set(cache_key, val, TTL_IPC)
+        CACHE.set(ck, val, TTL_IPC)
     return val
 
-# ============== Datos: Riesgo País ===================
+# ===================== Riesgo país =====================
 
 async def get_riesgo_pais():
-    cache_key = "riesgo"
-    v = CACHE.get(cache_key)
+    ck = "riesgo"
+    v = CACHE.get(ck)
     if v is not None:
         return v
-    # Principal: ArgentinaDatos
-    data = await fetch_json("https://api.argentinadatos.com/v1/finanzas/mercados/riesgo-pais")
+
     val = None
+    data = await fetch_json("https://api.argentinadatos.com/v1/finanzas/mercados/riesgo-pais")
     try:
-        # Ejemplo esperado: {"fecha":"YYYY-MM-DD","valor": XXX}
-        if data:
-            if isinstance(data, dict) and "valor" in data:
-                val = int(round(float(data["valor"])))
-            elif isinstance(data, list) and data:
-                # tomar el último elemento que tenga valor
-                for row in reversed(data):
-                    if "valor" in row:
-                        val = int(round(float(row["valor"])))
-                        break
+        if isinstance(data, dict) and "valor" in data:
+            val = int(round(float(data["valor"])))
+        elif isinstance(data, list) and data:
+            for row in reversed(data):
+                if "valor" in row:
+                    val = int(round(float(row["valor"])))
+                    break
     except Exception:
         val = None
 
-    # Fallback: DolarAPI (si existiese)
     if val is None:
         dapi = await fetch_json("https://dolarapi.com/v1/otros/riesgo-pais")
         if dapi and "valor" in dapi:
@@ -346,10 +330,10 @@ async def get_riesgo_pais():
                 val = None
 
     if val is not None:
-        CACHE.set(cache_key, val, TTL_RIESGO)
+        CACHE.set(ck, val, TTL_RIESGO)
     return val
 
-# ============== Datos: Yahoo Finance ===================
+# ===================== Yahoo Finance =====================
 
 def _pct(a: float, b: float) -> float:
     if a is None or b is None or a == 0:
@@ -357,13 +341,9 @@ def _pct(a: float, b: float) -> float:
     return (b - a) / a * 100.0
 
 async def yf_spark(symbols: list[str]):
-    """
-    Devuelve dict[symbol] = {"close": [...]} con 6 meses diarios.
-    """
     out = {}
     if not symbols:
         return out
-    # Yahoo Spark batch
     syms = ",".join(symbols)
     url = "https://query1.finance.yahoo.com/v7/finance/spark"
     data = await fetch_json(url, {"symbols": syms, "range": "6mo", "interval": "1d"})
@@ -373,30 +353,26 @@ async def yf_spark(symbols: list[str]):
         sym = item.get("symbol")
         close = item.get("response", [{}])[0].get("indicators", {}).get("quote", [{}])[0].get("close")
         if sym and isinstance(close, list):
-            # filtrar None
             close = [c for c in close if c is not None]
             if len(close) >= 5:
                 out[sym] = {"close": close}
     return out
 
 def perf_1m_3m_6m(closes: list[float]):
-    """
-    Aprox: 1m=21 días hábiles, 3m=63, 6m=126
-    """
     if not closes:
-        return 0.0,0.0,0.0
+        return 0.0, 0.0, 0.0
     last = closes[-1]
-    def get(idx_from_end):
-        idx = max(0, len(closes) - idx_from_end - 1)
+    def price_ndays(n):
+        idx = max(0, len(closes) - n - 1)
         return closes[idx]
-    m1 = _pct(get(21), last)
-    m3 = _pct(get(63), last)
-    m6 = _pct(get(126), last)
+    m1 = _pct(price_ndays(21), last)
+    m3 = _pct(price_ndays(63), last)
+    m6 = _pct(price_ndays(126), last)
     return m1, m3, m6
 
 async def top_universo(symbols: list[str], topn=3):
-    cache_key = f"yf_{hash(tuple(symbols))}"
-    v = CACHE.get(cache_key)
+    ck = f"yf_{hash(tuple(symbols))}"
+    v = CACHE.get(ck)
     if v:
         return v
     data = await yf_spark(symbols)
@@ -407,29 +383,24 @@ async def top_universo(symbols: list[str], topn=3):
             continue
         m1, m3, m6 = perf_1m_3m_6m(closes)
         price = closes[-1]
-        nm = NOMBRES.get(sym, sym.replace(".BA",""))
+        nm = NOMBRES.get(sym, sym.replace(".BA", ""))
         sector = SECTORES.get(sym, "—")
         cards.append((sym, nm, price, sector, m1, m3, m6))
-
-    # orden por 3m desc
-    cards.sort(key=lambda x: x[5], reverse=True)
+    cards.sort(key=lambda x: x[5], reverse=True)  # 3m desc
     top = cards[:topn]
-    CACHE.set(cache_key, top, TTL_YF)
+    CACHE.set(ck, top, TTL_YF)
     return top
 
 async def ranking_6m(symbols: list[str], topn=5):
-    # score = 0.1*1m + 0.3*3m + 0.6*6m
-    data = await top_universo(symbols, topn=len(symbols))
+    base = await top_universo(symbols, topn=len(symbols))
     scored = []
-    for (sym, nm, price, sector, m1, m3, m6) in data:
+    for (sym, nm, price, sector, m1, m3, m6) in base:
         score = 0.1*m1 + 0.3*m3 + 0.6*m6
         scored.append((score, sym, nm, price, sector, m1, m3, m6))
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:topn]
 
 def fmt_card(sym, nm, price, sector, m1, m3, m6):
-    # Ticker (Empresa) — Precio / • Sector / Rendimientos: 1m · 3m · 6m
-    # Usamos Markdown V2 -> escapamos
     t = esc(sym.replace(".BA",""))
     n = esc(nm)
     p = f"{price:,.2f}"
@@ -437,7 +408,7 @@ def fmt_card(sym, nm, price, sector, m1, m3, m6):
     def sign(x): return ("+" if x>=0 else "") + f"{x:,.2f}%"
     return f"*{t}* \\({n}\\) — ${p}\n• {s}\nRendimientos: {esc(sign(m1))} · {esc(sign(m3))} · {esc(sign(m6))}"
 
-# ============== Noticias (RSS) ===================
+# ===================== Noticias (RSS) =====================
 
 def _pass_noticia(title: str):
     t = (title or "").lower()
@@ -445,12 +416,11 @@ def _pass_noticia(title: str):
         return False
     if any(k in t for k in KEYWORDS_OK):
         return True
-    # si no matchea nada, lo ignoramos
     return False
 
 async def get_news():
-    cache_key = "news"
-    v = CACHE.get(cache_key)
+    ck = "news"
+    v = CACHE.get(ck)
     if v:
         return v
     items = []
@@ -477,19 +447,15 @@ async def get_news():
         seen.add(k)
         uniq.append((t, u))
     out = uniq[:NEWS_MAX_ITEMS]
-    CACHE.set(cache_key, out, TTL_NEWS)
+    CACHE.set(ck, out, TTL_NEWS)
     return out
 
 def fmt_news_links(items):
-    # links Markdown V2 con títulos escapados (sin preview, por Defaults)
     if not items:
         return "Sin noticias filtradas ahora."
-    lines = []
-    for t, u in items:
-        lines.append(f"• [{esc(t)}]({u})")
-    return "\n".join(lines)
+    return "\n".join(f"• [{esc(t)}]({u})" for t, u in items)
 
-# ============== Alertas de dólar (sqlite) ===================
+# ===================== Alertas (sqlite) =====================
 
 def db_init():
     os.makedirs(os.path.dirname(ALERTS_DB_PATH), exist_ok=True)
@@ -526,9 +492,9 @@ def db_del_alert(chat_id: int, alert_id: int):
     c = conn.cursor()
     c.execute("DELETE FROM alerts WHERE chat_id=? AND id=?", (chat_id, alert_id))
     conn.commit()
-    ch = c.rowcount
+    ok = c.rowcount > 0
     conn.close()
-    return ch > 0
+    return ok
 
 async def job_check_alerts(context: ContextTypes.DEFAULT_TYPE):
     usd = await get_dolares()
@@ -544,13 +510,10 @@ async def job_check_alerts(context: ContextTypes.DEFAULT_TYPE):
         if not q:
             continue
         precio = q.get("sell") or q.get("buy")
-        if not precio:
-            continue
-        if float(precio) >= float(umbral):
+        if precio and float(precio) >= float(umbral):
             try:
-                txt = f"🔔 *Alerta dólar {esc(tipo.upper())}*\nPrecio: ${precio:,.2f} ≥ umbral ${umbral:,.2f}"
+                txt = f"🔔 *Alerta dólar {esc(tipo.upper())}*\nPrecio: ${float(precio):,.2f} ≥ umbral ${float(umbral):,.2f}"
                 await context.bot.send_message(chat_id=chat_id, text=txt)
-                # borrar alerta dispadara
                 conn = sqlite3.connect(ALERTS_DB_PATH)
                 c = conn.cursor()
                 c.execute("DELETE FROM alerts WHERE id=?", (alert_id,))
@@ -559,25 +522,14 @@ async def job_check_alerts(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-# ============== Prefetch periódico ===================
+# ===================== Prefetch =====================
 
 async def job_prefetch(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        await get_dolares()
-    except Exception:
-        pass
-    try:
-        await get_reservas()
-    except Exception:
-        pass
-    try:
-        await get_ipc_mom()
-    except Exception:
-        pass
-    try:
-        await get_riesgo_pais()
-    except Exception:
-        pass
+    for fn in (get_dolares, get_reservas, get_ipc_mom, get_riesgo_pais):
+        try:
+            await fn()
+        except Exception:
+            pass
     try:
         await top_universo(UNIVERSO_ACCIONES_BA, topn=6)
         await top_universo(UNIVERSO_CEDEARS_BA, topn=6)
@@ -588,7 +540,7 @@ async def job_prefetch(context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         pass
 
-# ============== Handlers ===================
+# ===================== Handlers =====================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
@@ -671,7 +623,6 @@ async def cmd_rank_ced(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🏆 *Ranking 6M CEDEARs*\n\n" + "\n\n".join(lines))
 
 async def cmd_alerta_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /alerta_dolar <tipo> <umbral>
     if len(context.args) != 2:
         await update.message.reply_text("Uso: /alerta_dolar <tipo> <umbral>\nEj: /alerta_dolar blue 1500")
         return
@@ -721,51 +672,25 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         lines.append("💵 *Dólares*: no disponible")
 
-    if reservas is None:
-        lines.append("💹 *Reservas*: Dato no disponible")
-    else:
-        lines.append(f"💹 *Reservas*: USD {reservas:,.0f}")
-
-    if ipc is None:
-        lines.append("📈 *Inflación*: Dato no disponible")
-    else:
-        lines.append(f"📈 *Inflación*: {ipc:,.2f}%")
-
-    if riesgo is None:
-        lines.append("📉 *Riesgo País*: Dato no disponible")
-    else:
-        lines.append(f"📉 *Riesgo País*: {riesgo:,} pb")
+    lines.append("💹 *Reservas*: " + (f"USD {reservas:,.0f}" if reservas is not None else "Dato no disponible"))
+    lines.append("📈 *Inflación*: " + (f"{ipc:,.2f}%" if ipc is not None else "Dato no disponible"))
+    lines.append("📉 *Riesgo País*: " + (f"{riesgo:,} pb" if riesgo is not None else "Dato no disponible"))
 
     lines.append("\n📰 *Noticias*")
     lines.append(fmt_news_links(news))
 
     await update.message.reply_text("\n".join(lines))
 
-# ============== HTTP de salud (Render Web Service) ===================
-
-class _Health(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type","text/plain; charset=utf-8")
-        self.end_headers()
-        self.wfile.write(b"ok")
-    def log_message(self, *args, **kwargs):
-        pass
-
-def start_health_server():
-    port = int(os.getenv("PORT", "10000"))
-    server = HTTPServer(("0.0.0.0", port), _Health)
-    t = threading.Thread(target=server.serve_forever, daemon=True)
-    t.start()
-
-# ============== Main ===================
+# ===================== Construcción de la App (Defaults + Jobs) =====================
 
 def build_app():
     if not BOT_TOKEN:
         raise RuntimeError("Falta BOT_TOKEN en variables de entorno.")
 
-    # MarkdownV2 y sin previews para links limpios
-    defaults = Defaults(parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
+    defaults = Defaults(
+        parse_mode=ParseMode.MARKDOWN_V2,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),  # sin preview para que el feed quede “limpio”
+    )
     app = ApplicationBuilder().token(BOT_TOKEN).defaults(defaults).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -781,27 +706,46 @@ def build_app():
     app.add_handler(CommandHandler("alertas", cmd_alertas))
     app.add_handler(CommandHandler("alerta_borrar", cmd_alerta_borrar))
     app.add_handler(CommandHandler("resumen_diario", cmd_resumen_diario))
-    # ignoramos todo lo demás
-    app.add_handler(MessageHandler(filters.COMMAND, cmd_start))
+    app.add_handler(MessageHandler(filters.COMMAND, cmd_start))  # fallback de comandos raros
 
-    # Jobs programados
+    # Jobs (si está disponible el JobQueue)
     if app.job_queue:
         app.job_queue.run_repeating(job_prefetch, interval=300, first=5)   # cada 5 min
         app.job_queue.run_repeating(job_check_alerts, interval=90, first=15)
 
     return app
 
+# ===================== MAIN — WEBHOOK (sin polling) =====================
+
 def main():
+    # DB para alertas
     db_init()
-    start_health_server()
+
+    if not PUBLIC_URL or not PUBLIC_URL.startswith("http"):
+        raise RuntimeError("Falta PUBLIC_URL en Environment (ej: https://bot-economico-ar.onrender.com)")
+    secret_path = WEBHOOK_PATH or BOT_TOKEN  # ruta 'secreta' del webhook
+    port = int(os.getenv("PORT", "10000"))
+
     app = build_app()
-    # Polling robusto
-    app.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-        close_loop=False,
-        stop_signals=None,
-    )
+
+    async def runner():
+        # limpiamos cualquier webhook anterior y descartamos updates pendientes
+        try:
+            await app.bot.delete_webhook(drop_pending_updates=True)
+        except Exception:
+            pass
+
+        # Ejecuta el webhook en Render
+        await app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=secret_path,
+            webhook_url=f"{PUBLIC_URL}/{secret_path}",
+            drop_pending_updates=True,
+            stop_signals=None,
+        )
+
+    asyncio.run(runner())
 
 if __name__ == "__main__":
     main()
