@@ -3,30 +3,25 @@
 """
 Bot Económico AR — Telegram (Render Free, Web Service)
 
-Mejoras:
-- Concurrencia (httpx + asyncio.Semaphore) para bajar latencia.
-- Caché con TTL por sección (respuestas casi instantáneas tras primer hit).
-- Jobs opcionales (si hay JobQueue) para refrescar cachés cada 5 min.
-- Health-check HTTP /healthz en thread (sin asyncio).
-- Series oficiales ajustadas (IPC mensual) y fallbacks robustos.
+- Universo ampliado BYMA/CEDEARs (como el original).
+- Noticias SOLO títulos (sin links) y filtro a Argentina.
+- Series oficiales (reservas/IPC) + riesgo país con fallbacks y TTLs:
+  riesgo (5m), reservas (1h), IPC (24h).
+- Concurrencia (12), timeouts cortos, prefetch al iniciar, caché breve.
+- Elimina webhook al arrancar para evitar conflictos con otros pollings.
 """
 
-import os
-import re
-import math
-import time
-import sqlite3
-import asyncio
+import os, re, math, time, sqlite3, asyncio, threading
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 import httpx
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ---------- Config ----------
+# ===================== Config =====================
 TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 
 # Dólares
@@ -43,15 +38,17 @@ DOLAR_TIPOS = {
 
 # Series oficiales (INDEC / datos.gob.ar)
 DATOS_API = "https://apis.datos.gob.ar/series/api/series"
-# IPC mensual (nivel general, tasa de variación) — base dic-2016:
+
+# IPC mensual (variación %) — dos IDs frecuentes + índice para percent_change
 IPC_MENSUAL_SERIES_VARIACION = [
-    "145.3_INGNACUAL_DICI_M_38",      # (Primaria) IPC, tasa variación mensual, nivel general
-    "103.1_I2N_2016_M_19",            # (Fallback) variación % (representation_mode)
+    "148.3_INIVELNAL_DICI_M_26",
+    "145.3_INGNACUAL_DICI_M_38",
 ]
 IPC_INDICE_SERIES = [
-    "103.1_I2N_2016_M_15",            # Índice IPC, por si hace falta percent_change
+    "103.1_I2N_2016_M_15",
 ]
-# Reservas internacionales (candidatas, la 92.2_* suele funcionar)
+
+# Reservas internacionales — varios candidatos
 RESERVAS_SERIES_CANDIDATAS = [
     "92.2_RESERVAS_IRES_0_0_32_40",
     "92.1_RESERVAS_0_0_26",
@@ -65,7 +62,7 @@ ARGDATOS_RIESGO_LISTA  = "https://api.argentinadatos.com/v1/finanzas/indices/rie
 # Yahoo Finance
 YF_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
-# RSS económicos locales
+# RSS (solo medios AR)
 RSS_FEEDS = [
     "https://www.ambito.com/contenidos/economia.xml",
     "https://www.cronista.com/files/rss/economia.xml",
@@ -76,57 +73,61 @@ RSS_FEEDS = [
     "https://www.telam.com.ar/rss2/economia.xml",
     "https://www.iprofesional.com/rss/economia",
 ]
-NEWS_KEYWORDS_POS = [
-    "dólar","dolar","mep","ccl","reservas","inflación","ipc","riesgo país","riesgo-pais",
-    "bcra","bono","bonos","acciones","cedear","merval","mercado","pbi","exportaciones",
-    "tasa","liquidez","deuda","fmi","brecha","superávit","déficit","blue","cambio","oficial",
+NEWS_POS = [
+    "argentina","argentino","dólar","dolar","blue","mep","ccl","reservas","inflación","ipc",
+    "riesgo país","bcra","bono","bonos","acciones","cedear","merval","mercado","tasa","brecha","oficial","peso",
 ]
-NEWS_KEYWORDS_NEG = ["quiniela","horóscopo","salud","covid","farandula","espectáculo","policiales"]
+NEWS_NEG = [
+    "brasil","real ","euro","europa","china","estados unidos","ee.uu","eeuu","yen",
+    "uruguay","paraguay","chile","mexico","colombia","perú","peru","bolivia",
+    "euro blue","real blue",
+]
 
-# Universos iniciales (ampliables)
+# Universo ampliado BYMA (como el inicial)
 BYMA_UNIVERSO = [
-    ("GGAL.BA", "Grupo Financiero Galicia", "Bancos"),
-    ("BMA.BA", "Banco Macro", "Bancos"),
-    ("BBAR.BA", "BBVA Argentina", "Bancos"),
-    ("SUPV.BA", "Supervielle", "Bancos"),
-    ("VALO.BA", "Grupo Valores", "Servicios Financieros"),
-    ("BYMA.BA", "Bolsas y Mercados Argentinos", "Servicios Financieros"),
-    ("YPFD.BA", "YPF", "Energía"),
-    ("PAMP.BA", "Pampa Energía", "Energía"),
-    ("CEPU.BA", "Central Puerto", "Energía"),
-    ("TGSU2.BA", "Transportadora de Gas del Sur", "Energía"),
-    ("TGNO4.BA", "Transportadora de Gas del Norte", "Energía"),
-    ("TXAR.BA", "Ternium Argentina", "Materiales"),
-    ("ALUA.BA", "Aluar", "Materiales"),
-    ("LOMA.BA", "Loma Negra", "Materiales"),
-    ("COME.BA", "Soc. Comercial del Plata", "Industriales"),
-    ("TECO2.BA", "Telecom Argentina", "Telecom"),
-    ("CVH.BA", "Cablevisión Holding", "Medios/Telecom"),
-    ("CRES.BA", "Cresud", "Agro/Real Estate"),
-    ("IRSA.BA", "IRSA", "Real Estate"),
-    ("IRCP.BA", "IRSA Prop. Comerciales", "Real Estate"),
-]
-CEDEARS_UNIVERSO = [
-    ("AAPL.BA", "Apple", "Tecnología"),
-    ("MSFT.BA", "Microsoft", "Tecnología"),
-    ("GOOGL.BA", "Alphabet A", "Tecnología"),
-    ("AMZN.BA", "Amazon", "Tecnología"),
-    ("NVDA.BA", "NVIDIA", "Tecnología"),
-    ("META.BA", "Meta Platforms", "Tecnología"),
-    ("TSLA.BA", "Tesla", "Autos/Tech"),
-    ("BRKB.BA", "Berkshire Hathaway B", "Finanzas"),
-    ("JPM.BA", "JPMorgan", "Finanzas"),
-    ("KO.BA", "Coca-Cola", "Consumo"),
-    ("PEP.BA", "PepsiCo", "Consumo"),
-    ("MELI.BA", "MercadoLibre (ADR)", "Tecnología"),
-    ("MSTR.BA", "MicroStrategy", "Tecnología"),
+    ("GGAL.BA","Grupo Financiero Galicia","Bancos"),
+    ("BMA.BA","Banco Macro","Bancos"),
+    ("BBAR.BA","BBVA Argentina","Bancos"),
+    ("SUPV.BA","Supervielle","Bancos"),
+    ("VALO.BA","Grupo Valores","Servicios Financieros"),
+    ("BYMA.BA","Bolsas y Mercados Argentinos","Servicios Financieros"),
+    ("YPFD.BA","YPF","Energía"),
+    ("PAMP.BA","Pampa Energía","Energía"),
+    ("CEPU.BA","Central Puerto","Energía"),
+    ("TGSU2.BA","Transportadora de Gas del Sur","Energía"),
+    ("TGNO4.BA","Transportadora de Gas del Norte","Energía"),
+    ("TXAR.BA","Ternium Argentina","Materiales"),
+    ("ALUA.BA","Aluar","Materiales"),
+    ("LOMA.BA","Loma Negra","Materiales"),
+    ("COME.BA","Soc. Comercial del Plata","Industriales"),
+    ("TECO2.BA","Telecom Argentina","Telecom"),
+    ("CVH.BA","Cablevisión Holding","Medios/Telecom"),
+    ("CRES.BA","Cresud","Agro/Real Estate"),
+    ("IRSA.BA","IRSA","Real Estate"),
+    ("IRCP.BA","IRSA Prop. Comerciales","Real Estate"),
 ]
 
-# ---------- Utilidades ----------
+# Universo ampliado CEDEARs (grandes)
+CEDEARS_UNIVERSO = [
+    ("AAPL.BA","Apple","Tecnología"),
+    ("MSFT.BA","Microsoft","Tecnología"),
+    ("GOOGL.BA","Alphabet A","Tecnología"),
+    ("AMZN.BA","Amazon","Tecnología"),
+    ("NVDA.BA","NVIDIA","Tecnología"),
+    ("META.BA","Meta Platforms","Tecnología"),
+    ("TSLA.BA","Tesla","Autos/Tech"),
+    ("BRKB.BA","Berkshire Hathaway B","Finanzas"),
+    ("JPM.BA","JPMorgan","Finanzas"),
+    ("KO.BA","Coca-Cola","Consumo"),
+    ("PEP.BA","PepsiCo","Consumo"),
+    ("MELI.BA","MercadoLibre (ADR)","Tecnología"),
+    ("MSTR.BA","MicroStrategy","Tecnología"),
+]
+
+# ===================== Utils =====================
 def fmt_money_ars(x: float) -> str:
     try:
-        s = f"{x:,.2f}"
-        s = s.replace(",", "_").replace(".", ",").replace("_", ".")
+        s = f"{x:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
         return f"$ {s}"
     except Exception:
         return str(x)
@@ -145,16 +146,16 @@ def human_pct(x: float) -> str:
         return "n/d"
     return f"{x:+.2f}%"
 
-# ---------- HTTP (concurrencia y reintentos) ----------
-_HTTP_LIMIT = int(os.environ.get("HTTP_CONCURRENCY", "8"))
+# ===================== HTTP rápido =====================
+_HTTP_LIMIT = int(os.environ.get("HTTP_CONCURRENCY", "12"))
 _SEM = asyncio.Semaphore(_HTTP_LIMIT)
 
 _CLIENT = httpx.AsyncClient(
-    timeout=httpx.Timeout(12.0, connect=8.0),
-    headers={"User-Agent": "AR-EconBot/1.1"}
+    timeout=httpx.Timeout(7.0, connect=3.0, read=6.0, write=5.0),
+    headers={"User-Agent": "AR-EconBot/1.3"}
 )
 
-async def _get_json(url: str, params: Optional[dict] = None, retries=2):
+async def _get_json(url: str, params: Optional[dict] = None, retries=1):
     for i in range(retries + 1):
         try:
             async with _SEM:
@@ -164,9 +165,9 @@ async def _get_json(url: str, params: Optional[dict] = None, retries=2):
         except Exception:
             if i == retries:
                 return None
-            await asyncio.sleep(0.6 * (i + 1))
+            await asyncio.sleep(0.5 * (i + 1))
 
-async def _get_text(url: str, retries=2):
+async def _get_text(url: str, retries=1):
     for i in range(retries + 1):
         try:
             async with _SEM:
@@ -176,37 +177,31 @@ async def _get_text(url: str, retries=2):
         except Exception:
             if i == retries:
                 return None
-            await asyncio.sleep(0.6 * (i + 1))
+            await asyncio.sleep(0.5 * (i + 1))
 
-# ---------- Caché simple (memoria) ----------
+# ===================== Caché =====================
 _CACHE: Dict[str, Tuple[float, Any]] = {}
 
+def cache_valid(key: str) -> bool:
+    it = _CACHE.get(key)
+    return bool(it) and time.time() < it[0]
+
 def cache_get(key: str):
-    item = _CACHE.get(key)
-    if not item:
-        return None
-    ts, val = item
-    return val
+    it = _CACHE.get(key)
+    return it[1] if it else None
 
 def cache_set(key: str, value: Any, ttl_s: int):
     _CACHE[key] = (time.time() + ttl_s, value)
 
-def cache_valid(key: str) -> bool:
-    item = _CACHE.get(key)
-    if not item:
-        return False
-    expires, _ = item
-    return time.time() < expires
-
-# ---------- Dólares ----------
-async def _fetch_dolar_ambito_one(k: str, url: str):
+# ===================== Dólares =====================
+async def _ambito_one(k: str, url: str):
     j = await _get_json(url)
     if j and isinstance(j, dict) and "venta" in j:
         return k, j
     return k, None
 
 async def fetch_dolar_ambito_all():
-    tasks = [asyncio.create_task(_fetch_dolar_ambito_one(k, u)) for k, u in DOLAR_TIPOS.items()]
+    tasks = [asyncio.create_task(_ambito_one(k, u)) for k, u in DOLAR_TIPOS.items()]
     pairs = await asyncio.gather(*tasks)
     return {k: v for k, v in pairs if v}
 
@@ -214,8 +209,8 @@ async def fetch_dolar_fallback():
     j = await _get_json(CRIPTOYA_DOLAR)
     out = {}
     if j:
-        mapping = {"blue":"blue","mep":"mep","ccl":"ccl","oficial":"oficial","mayorista":"mayorista","cripto":"cripto"}
-        for a,b in mapping.items():
+        mp = {"blue":"blue","mep":"mep","ccl":"ccl","oficial":"oficial","mayorista":"mayorista","cripto":"cripto"}
+        for a,b in mp.items():
             node = j.get(b)
             if node:
                 venta = node.get("venta") or node.get("price") or node.get("ask") or node.get("promedio")
@@ -236,7 +231,7 @@ async def get_all_dolares():
     if len(data) < 6:
         fb = await fetch_dolar_fallback()
         data = {**fb, **data}
-    cache_set(key, data, ttl_s=20)  # 20 segundos
+    cache_set(key, data, ttl_s=20)  # 20s
     return data
 
 def format_dolares_block(data: dict) -> str:
@@ -244,15 +239,14 @@ def format_dolares_block(data: dict) -> str:
     lines = []
     for k in order:
         d = data.get(k)
-        if not d:
-            continue
-        compra = d.get("compra"); venta = d.get("venta")
-        compra_s = fmt_money_ars(compra) if isinstance(compra,(int,float)) else "n/d"
-        venta_s  = fmt_money_ars(venta)  if isinstance(venta,(int,float))  else "n/d"
-        lines.append(f"{k.upper():10s} | Compra: {compra_s:>12s} | Venta: {venta_s:>12s}")
+        if not d: continue
+        compra, venta = d.get("compra"), d.get("venta")
+        cs = fmt_money_ars(compra) if isinstance(compra,(int,float)) else "n/d"
+        vs = fmt_money_ars(venta)  if isinstance(venta,(int,float)) else "n/d"
+        lines.append(f"{k.upper():10s} | Compra: {cs:>12s} | Venta: {vs:>12s}")
     return "```\n" + "\n".join(lines) + "\n```"
 
-# ---------- Series oficiales (reservas / IPC) ----------
+# ===================== Series oficiales =====================
 async def fetch_series_last_value(series_id: str, representation_mode: Optional[str] = None):
     params = {"ids": series_id, "limit": 1, "format": "json"}
     if representation_mode:
@@ -260,8 +254,7 @@ async def fetch_series_last_value(series_id: str, representation_mode: Optional[
     j = await _get_json(DATOS_API, params=params)
     try:
         data = j["data"]
-        if not data:
-            return None
+        if not data: return None
         val_raw = data[-1][1]
         val = float(val_raw) if val_raw is not None else None
         date = data[-1][0][:10]
@@ -271,219 +264,176 @@ async def fetch_series_last_value(series_id: str, representation_mode: Optional[
 
 async def get_reservas_usd():
     key = "reservas"
-    if cache_valid(key):
-        return cache_get(key)
+    if cache_valid(key): return cache_get(key)
     for sid in RESERVAS_SERIES_CANDIDATAS:
         r = await fetch_series_last_value(sid)
         if r and r["valor"] is not None:
             r = r | {"serie": sid, "unidad": "millones de USD"}
-            cache_set(key, r, ttl_s=6*3600)  # 6 horas
+            cache_set(key, r, ttl_s=3600)  # 1h
             return r
     return None
 
 async def get_ipc_mensual():
     key = "ipc_mensual"
-    if cache_valid(key):
-        return cache_get(key)
-    # Primero: serie ya en tasa mensual
-    for sid in IPC_MENSUAL_SERIES_VARIACION[:1]:
+    if cache_valid(key): return cache_get(key)
+    for sid in IPC_MENSUAL_SERIES_VARIACION:
         r = await fetch_series_last_value(sid)
         if r and r["valor"] is not None and -10.0 < r["valor"] < 200.0:
             r = r | {"serie": sid, "unidad": "%"}
             cache_set(key, r, ttl_s=24*3600)  # 24h
             return r
-    # Fallback: calcular percent_change a partir del índice
     for sid in IPC_INDICE_SERIES:
         r = await fetch_series_last_value(sid, representation_mode="percent_change")
         if r and r["valor"] is not None and -10.0 < r["valor"] < 200.0:
             r = r | {"serie": sid, "unidad": "%"}
             cache_set(key, r, ttl_s=24*3600)
             return r
-    # Último recurso: segundo ID alternativo de variación
-    for sid in IPC_MENSUAL_SERIES_VARIACION[1:]:
-        r = await fetch_series_last_value(sid)
-        if r and r["valor"] is not None and -10.0 < r["valor"] < 200.0:
-            r = r | {"serie": sid, "unidad": "%"}
-            cache_set(key, r, ttl_s=24*3600)
-            return r
     return None
 
-# ---------- Riesgo país ----------
+# ===================== Riesgo país =====================
 async def get_riesgo_pais():
     key = "riesgo"
-    if cache_valid(key):
-        return cache_get(key)
+    if cache_valid(key): return cache_get(key)
     j = await _get_json(ARGDATOS_RIESGO_ULTIMO)
     if j and isinstance(j, dict) and "valor" in j:
-        try:
-            val = float(j["valor"])
-        except Exception:
-            val = None
+        try: val = float(j["valor"])
+        except Exception: val = None
         out = {"fecha": j.get("fecha"), "valor": val}
-        cache_set(key, out, ttl_s=15*60)  # 15 minutos
+        cache_set(key, out, ttl_s=5*60)  # 5 min
         return out
     lst = await _get_json(ARGDATOS_RIESGO_LISTA)
     if lst and isinstance(lst, list) and lst:
         last = lst[-1]
-        try:
-            val = float(last.get("valor"))
-        except Exception:
-            val = None
+        try: val = float(last.get("valor"))
+        except Exception: val = None
         out = {"fecha": last.get("fecha"), "valor": val}
-        cache_set(key, out, ttl_s=15*60)
+        cache_set(key, out, ttl_s=5*60)
         return out
     return None
 
-# ---------- Yahoo Finance (concurrencia + caché) ----------
+# ===================== Yahoo Finance =====================
 async def yf_history_close(symbol: str, period: str = "6mo", interval: str = "1d"):
     params = {"period1": "0", "range": period, "interval": interval}
     j = await _get_json(YF_CHART.format(symbol=symbol), params=params)
     try:
         res = j["chart"]["result"][0]
         closes = res["indicators"]["quote"][0]["close"]
-        timestamps = res["timestamp"]
-        series = [(ts, c) for ts, c in zip(timestamps, closes) if c is not None]
-        return series
+        ts = res["timestamp"]
+        return [(t, c) for t, c in zip(ts, closes) if c is not None]
     except Exception:
         return None
 
-def trailing_returns_from_series(series):
-    if not series:
-        return None
+def trailing_returns(series):
+    if not series: return None
     closes = [c for _, c in series]
     last = closes[-1]
     def ret_at(days):
         idx = -days-1
         base = closes[idx] if len(closes) > abs(idx) else closes[0]
         return pct(last, base)
-    r1 = ret_at(21); r3 = ret_at(63); r6 = ret_at(126)
-    return last, r1, r3, r6
+    return last, ret_at(21), ret_at(63), ret_at(126)
 
 async def _compute_one(symbol, name, sector):
-    series = await yf_history_close(symbol, period="6mo", interval="1d")
-    if not series:
-        return None
-    t = trailing_returns_from_series(series)
-    if not t:
-        return None
+    s = await yf_history_close(symbol, period="6mo", interval="1d")
+    if not s: return None
+    t = trailing_returns(s)
+    if not t: return None
     last, r1, r3, r6 = t
     return {"symbol": symbol, "name": name, "sector": sector, "price": last, "r1": r1, "r3": r3, "r6": r6}
 
-async def compute_universe_returns(universe, cache_key: str):
-    if cache_valid(cache_key):
-        return cache_get(cache_key)
-    sem = asyncio.Semaphore(8)
-    async def wrapped(sym, nam, sec):
+async def compute_universe(universe, cache_key: str):
+    if cache_valid(cache_key): return cache_get(cache_key)
+    sem = asyncio.Semaphore(12)
+    async def wrapped(s, n, sec):
         async with sem:
-            return await _compute_one(sym, nam, sec)
+            return await _compute_one(s, n, sec)
     tasks = [asyncio.create_task(wrapped(s, n, sec)) for s, n, sec in universe]
-    results = await asyncio.gather(*tasks)
-    data = [r for r in results if r]
-    cache_set(cache_key, data, ttl_s=5*60)  # 5 minutos
+    res = await asyncio.gather(*tasks)
+    data = [r for r in res if r]
+    cache_set(cache_key, data, ttl_s=5*60)  # 5 min
     return data
 
-def pick_top_by_3m(data, topn=3):
-    filtered = [d for d in data if d["r3"] == d["r3"]]
-    return sorted(filtered, key=lambda x: x["r3"], reverse=True)[:topn]
+def top_by_3m(data, n=3):
+    data = [d for d in data if d["r3"] == d["r3"]]
+    return sorted(data, key=lambda x: x["r3"], reverse=True)[:n]
 
-def pick_top_by_projection(data, topn=5):
+def top_by_projection(data, n=5):
     def score(d):
         s = 0.0
-        for w, k in [(0.1,"r1"), (0.3,"r3"), (0.6,"r6")]:
+        for w, k in [(0.1,"r1"),(0.3,"r3"),(0.6,"r6")]:
             v = d.get(k)
-            if v == v:
-                s += w * v
+            if v == v: s += w*v
         return s
-    for d in data:
-        d["_score"] = score(d)
-    filtered = [d for d in data if d["_score"] == d["_score"]]
-    return sorted(filtered, key=lambda x: x["_score"], reverse=True)[:topn]
+    for d in data: d["_score"] = score(d)
+    data = [d for d in data if d["_score"] == d["_score"]]
+    return sorted(data, key=lambda x: x["_score"], reverse=True)[:n]
 
-def format_card(item):
-    price = item.get("price")
-    s_price = f"${price:.2f}" if isinstance(price,(int,float)) else "n/d"
+def format_card(it):
+    p = it.get("price")
+    ptxt = f"${p:.2f}" if isinstance(p,(int,float)) else "n/d"
     return (
-        f"• {item['symbol']} ({item['name']}) — {s_price}\n"
-        f"  • Sector: {item['sector']}\n"
-        f"  • Rendimientos: {human_pct(item['r1'])} · {human_pct(item['r3'])} · {human_pct(item['r6'])}"
+        f"• {it['symbol']} ({it['name']}) — {ptxt}\n"
+        f"  • Sector: {it['sector']}\n"
+        f"  • Rendimientos: {human_pct(it['r1'])} · {human_pct(it['r3'])} · {human_pct(it['r6'])}"
     )
 
-# ---------- Noticias (concurrencia + filtro + caché) ----------
-def simple_rss_parse(xml_text: str):
+# ===================== Noticias AR (solo títulos) =====================
+def rss_parse(xml: str):
     items = []
-    if not xml_text:
-        return items
+    if not xml: return items
     # RSS 2.0
-    for m in re.finditer(r"<item>(.*?)</item>", xml_text, re.DOTALL|re.IGNORECASE):
-        block = m.group(1)
-        title = re.search(r"<title>(.*?)</title>", block, re.DOTALL|re.IGNORECASE)
-        link  = re.search(r"<link>(.*?)</link>", block, re.DOTALL|re.IGNORECASE)
-        date  = re.search(r"<pubDate>(.*?)</pubDate>", block, re.DOTALL|re.IGNORECASE)
-        t = (title.group(1).strip() if title else "").strip()
-        # Quitar CDATA
-        t = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", t)
-        items.append({"title": t, "link": (link.group(1).strip() if link else "").strip(),
-                      "published": (date.group(1).strip() if date else "").strip()})
-    # Atom fallback
+    for m in re.finditer(r"<item>(.*?)</item>", xml, re.DOTALL|re.IGNORECASE):
+        b = m.group(1)
+        t = re.search(r"<title>(.*?)</title>", b, re.DOTALL|re.IGNORECASE)
+        d = re.search(r"<pubDate>(.*?)</pubDate>", b, re.DOTALL|re.IGNORECASE)
+        title = (t.group(1).strip() if t else "")
+        title = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", title)
+        items.append({"title": title, "published": (d.group(1).strip() if d else "")})
+    # Atom
     if not items:
-        for m in re.finditer(r"<entry>(.*?)</entry>", xml_text, re.DOTALL|re.IGNORECASE):
-            block = m.group(1)
-            title = re.search(r"<title>(.*?)</title>", block, re.DOTALL|re.IGNORECASE)
-            link_m = re.search(r"<link[^>]*href=['\"](.*?)['\"][^>]*/?>", block, re.DOTALL|re.IGNORECASE)
-            date  = re.search(r"<updated>(.*?)</updated>", block, re.DOTALL|re.IGNORECASE) or \
-                    re.search(r"<published>(.*?)</published>", block, re.DOTALL|re.IGNORECASE)
-            t = (title.group(1).strip() if title else "").strip()
-            t = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", t)
-            items.append({"title": t, "link": (link_m.group(1).strip() if link_m else "").strip(),
-                          "published": (date.group(1).strip() if date else "").strip()})
+        for m in re.finditer(r"<entry>(.*?)</entry>", xml, re.DOTALL|re.IGNORECASE):
+            b = m.group(1)
+            t = re.search(r"<title>(.*?)</title>", b, re.DOTALL|re.IGNORECASE)
+            d = re.search(r"<updated>(.*?)</updated>", b, re.DOTALL|re.IGNORECASE) or re.search(r"<published>(.*?)</published>", b, re.DOTALL|re.IGNORECASE)
+            title = (t.group(1).strip() if t else "")
+            title = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", title)
+            items.append({"title": title, "published": (d.group(1).strip() if d else "")})
     return items
 
-async def fetch_news_filtered(limit=5):
-    key = "news5"
-    if cache_valid(key):
-        return cache_get(key)
-    async def load_feed(url):
-        return await _get_text(url)
-    tasks = [asyncio.create_task(load_feed(u)) for u in RSS_FEEDS]
+async def news_filtered(limit=5):
+    key = "news_ar"
+    if cache_valid(key): return cache_get(key)
+    tasks = [asyncio.create_task(_get_text(u)) for u in RSS_FEEDS]
     xmls = await asyncio.gather(*tasks)
     hits = []
     for xml in xmls:
-        if not xml:
-            continue
-        for it in simple_rss_parse(xml)[:25]:
+        if not xml: continue
+        for it in rss_parse(xml)[:25]:
             t = (it["title"] or "").lower()
-            if (not t) or any(bad in t for bad in NEWS_KEYWORDS_NEG):
+            if not t: continue
+            if any(bad in t for bad in NEWS_NEG):
                 continue
-            if NEWS_KEYWORDS_POS and not any(kw in t for kw in NEWS_KEYWORDS_POS):
+            if not any(ok in t for ok in NEWS_POS):
                 continue
             hits.append(it)
-    # si no hay hits por filtro, devolvemos 5 últimas de lo que haya
     if not hits:
         for xml in xmls:
-            if not xml:
-                continue
-            base = simple_rss_parse(xml)[:10]
-            hits.extend(base)
-    # ordenar y deduplicar
-    def parse_dt(s):
-        try:
-            return datetime.strptime(s[:25], "%a, %d %b %Y %H:%M:%S")
-        except Exception:
-            return datetime.now()
-    hits = sorted(hits, key=lambda x: parse_dt(x.get("published","")), reverse=True)
-    seen, uniq = set(), []
+            if not xml: continue
+            hits.extend(rss_parse(xml)[:5])
+    def pdt(s):
+        try: return datetime.strptime(s[:25], "%a, %d %b %Y %H:%M:%S")
+        except Exception: return datetime.now()
+    hits = sorted(hits, key=lambda x: pdt(x.get("published","")), reverse=True)
+    seen, out = set(), []
     for h in hits:
-        title = h["title"].strip()
-        if title in seen or not title:
-            continue
-        seen.add(title)
-        uniq.append(h)
-        if len(uniq) >= limit:
-            break
-    cache_set(key, uniq, ttl_s=15*60)  # 15 minutos
-    return uniq
+        ti = h["title"].strip()
+        if not ti or ti in seen: continue
+        seen.add(ti); out.append(h)
+        if len(out) >= limit: break
+    cache_set(key, out, ttl_s=15*60)
+    return out
 
-# ---------- Alertas (SQLite) ----------
+# ===================== DB Alertas =====================
 DB_PATH = os.environ.get("ALERTS_DB_PATH", "./alerts.db")
 
 def db_init():
@@ -502,105 +452,107 @@ def db_add_alert(chat_id: int, tipo: str, umbral: float) -> int:
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
     cur.execute("INSERT INTO alerts (chat_id, tipo, umbral, created_at, active) VALUES (?,?,?,?,1)",
                 (chat_id, tipo, umbral, datetime.now(TZ).isoformat()))
-    con.commit(); alert_id = cur.lastrowid; con.close(); return alert_id
+    con.commit(); rid = cur.lastrowid; con.close(); return rid
 
 def db_list_alerts(chat_id: int):
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("SELECT id, tipo, umbral, active, created_at FROM alerts WHERE chat_id = ? ORDER BY id DESC", (chat_id,))
+    cur.execute("SELECT id, tipo, umbral, active, created_at FROM alerts WHERE chat_id=? ORDER BY id DESC",(chat_id,))
     rows = cur.fetchall(); con.close(); return rows
 
 def db_delete_alert(chat_id: int, alert_id: int) -> bool:
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("DELETE FROM alerts WHERE id = ? AND chat_id = ?", (alert_id, chat_id))
-    con.commit(); ok = cur.rowcount > 0; con.close(); return ok
+    cur.execute("DELETE FROM alerts WHERE id=? AND chat_id=?", (alert_id, chat_id))
+    con.commit(); ok = cur.rowcount>0; con.close(); return ok
 
 def db_list_all_active():
     con = sqlite3.connect(DB_PATH); cur = con.cursor()
-    cur.execute("SELECT id, chat_id, tipo, umbral FROM alerts WHERE active = 1")
+    cur.execute("SELECT id, chat_id, tipo, umbral FROM alerts WHERE active=1")
     rows = cur.fetchall(); con.close(); return rows
 
-# ---------- Handlers ----------
+# ===================== Handlers =====================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
+    await update.message.reply_text(
         "👋 Bienvenido al *Bot Económico AR*.\n\n"
         "/dolar /reservas /inflacion /riesgo\n"
         "/acciones /cedears /ranking_acciones /ranking_cedears\n"
         "/alerta_dolar <tipo> <umbral>  /alertas  /alerta_borrar <id>\n"
-        "/resumen_diario"
+        "/resumen_diario",
+        parse_mode=ParseMode.MARKDOWN
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = await get_all_dolares()
     if not data:
         await update.message.reply_text("⚠️ No pude obtener cotizaciones ahora.")
         return
-    block = format_dolares_block(data)
-    await update.message.reply_text("💵 *Dólares (Ámbito / fallback CriptoYa)*\n" + block, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("💵 *Dólares (Ámbito / fallback CriptoYa)*\n"+format_dolares_block(data),
+                                    parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = await get_reservas_usd()
     if not r:
         await update.message.reply_text("🏦 Reservas BCRA: dato no disponible ahora (fuente oficial).")
         return
-    txt = f"🏦 *Reservas BCRA*\n`{r['fecha']}` — {r['valor']:.2f} millones de USD  \n_(Serie: {r['serie']})_"
-    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"🏦 *Reservas BCRA*\n`{r['fecha']}` — {r['valor']:.2f} millones de USD  \n_(Serie: {r['serie']})_",
+                                    parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = await get_ipc_mensual()
     if not r:
         await update.message.reply_text("📈 Inflación mensual: dato no disponible ahora (INDEC).")
         return
-    txt = f"📈 *Inflación (variación mensual)*\n`{r['fecha']}` — {r['valor']:.2f}%  \n_(Serie: {r['serie']})_"
-    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"📈 *Inflación (variación mensual)*\n`{r['fecha']}` — {r['valor']:.2f}%  \n_(Serie: {r['serie']})_",
+                                    parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     r = await get_riesgo_pais()
     if not r or r.get("valor") is None:
         await update.message.reply_text("📉 Riesgo país: dato no disponible ahora (ArgentinaDatos).")
         return
-    txt = f"📉 *Riesgo País (EMBI+)*\n`{r['fecha']}` — {int(round(r['valor']))} pts"
-    await update.message.reply_text(txt, parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"📉 *Riesgo País (EMBI+)*\n`{r['fecha']}` — {int(round(r['valor']))} pts",
+                                    parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = await compute_universe_returns(BYMA_UNIVERSO, cache_key="byma_universe")
-    top = pick_top_by_3m(data, topn=3)
+    data = await compute_universe(BYMA_UNIVERSO, "byma_universe")
+    top = top_by_3m(data, n=3)
     if not top:
         await update.message.reply_text("📊 No pude calcular el top de acciones ahora.")
         return
-    cards = "\n\n".join(format_card(x) for x in top)
-    await update.message.reply_text(f"📊 *Top 3 Acciones BYMA (3M)*\n{cards}", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("📊 *Top 3 Acciones BYMA (3M)*\n"+ "\n\n".join(format_card(x) for x in top),
+                                    parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = await compute_universe_returns(CEDEARS_UNIVERSO, cache_key="cedears_universe")
-    top = pick_top_by_3m(data, topn=3)
+    data = await compute_universe(CEDEARS_UNIVERSO, "cedears_universe")
+    top = top_by_3m(data, n=3)
     if not top:
         await update.message.reply_text("🌎 No pude calcular el top de CEDEARs ahora.")
         return
-    cards = "\n\n".join(format_card(x) for x in top)
-    await update.message.reply_text(f"🌎 *Top 3 CEDEARs (3M)*\n{cards}", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("🌎 *Top 3 CEDEARs (3M)*\n"+ "\n\n".join(format_card(x) for x in top),
+                                    parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_ranking_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = await compute_universe_returns(BYMA_UNIVERSO, cache_key="byma_universe")
-    top = pick_top_by_projection(data, topn=5)
+    data = await compute_universe(BYMA_UNIVERSO, "byma_universe")
+    top = top_by_projection(data, n=5)
     if not top:
         await update.message.reply_text("🏁 No pude armar el ranking de acciones ahora.")
         return
-    lines = [f"{i}. {x['symbol']} — score: {x['_score']:.2f}\n   {format_card(x)}" for i, x in enumerate(top, 1)]
-    await update.message.reply_text("🏁 *Ranking Acciones BYMA (proyección 6M)*\n" + "\n\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    lines = [f"{i}. {x['symbol']} — score: {x['_score']:.2f}\n   {format_card(x)}" for i,x in enumerate(top,1)]
+    await update.message.reply_text("🏁 *Ranking Acciones BYMA (proyección 6M)*\n" + "\n\n".join(lines),
+                                    parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_ranking_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = await compute_universe_returns(CEDEARS_UNIVERSO, cache_key="cedears_universe")
-    top = pick_top_by_projection(data, topn=5)
+    data = await compute_universe(CEDEARS_UNIVERSO, "cedears_universe")
+    top = top_by_projection(data, n=5)
     if not top:
         await update.message.reply_text("🏁 No pude armar el ranking de CEDEARs ahora.")
         return
-    lines = [f"{i}. {x['symbol']} — score: {x['_score']:.2f}\n   {format_card(x)}" for i, x in enumerate(top, 1)]
-    await update.message.reply_text("🏁 *Ranking CEDEARs (proyección 6M)*\n" + "\n\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    lines = [f"{i}. {x['symbol']} — score: {x['_score']:.2f}\n   {format_card(x)}" for i,x in enumerate(top,1)]
+    await update.message.reply_text("🏁 *Ranking CEDEARs (proyección 6M)*\n" + "\n\n".join(lines),
+                                    parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_alerta_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = (update.message.text or "").strip().split()
-    if len(parts) != 3:
+    if len(parts)!=3:
         await update.message.reply_text("Uso: /alerta_dolar <tipo> <umbral>\nTipos: blue|mep|ccl|cripto|oficial|mayorista")
         return
     _, tipo, umbral = parts
@@ -613,111 +565,113 @@ async def cmd_alerta_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Umbral inválido. Ej: 1250 o 1234.50")
         return
-    alert_id = db_add_alert(update.message.chat_id, tipo, umbral)
-    await update.message.reply_text(f"🔔 Alerta creada (ID {alert_id}) — {tipo.upper()} ≥ {fmt_money_ars(umbral)}")
+    rid = db_add_alert(update.message.chat_id, tipo, umbral)
+    await update.message.reply_text(f"🔔 Alerta creada (ID {rid}) — {tipo.upper()} ≥ {fmt_money_ars(umbral)}")
 
 async def cmd_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = db_list_alerts(update.message.chat_id)
     if not rows:
-        await update.message.reply_text("🔔 No tenés alertas activas.")
-        return
+        await update.message.reply_text("🔔 No tenés alertas activas."); return
     lines = []
-    for (id_, tipo, umbral, active, created_at) in rows:
+    for (i,tipo,umbral,active,created) in rows:
         status = "ON" if active else "OFF"
-        lines.append(f"#{id_:03d} — {tipo.upper()} ≥ {fmt_money_ars(umbral)} — {status} — {created_at[:16]}")
-    await update.message.reply_text("🔔 *Alertas*\n" + "```\n" + "\n".join(lines) + "\n```", parse_mode=ParseMode.MARKDOWN)
+        lines.append(f"#{i:03d} — {tipo.upper()} ≥ {fmt_money_ars(umbral)} — {status} — {created[:16]}")
+    await update.message.reply_text("🔔 *Alertas*\n```\n"+"\n".join(lines)+"\n```", parse_mode=ParseMode.MARKDOWN)
 
 async def cmd_alerta_borrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = (update.message.text or "").strip().split()
-    if len(parts) != 2:
-        await update.message.reply_text("Uso: /alerta_borrar <id>")
-        return
+    if len(parts)!=2:
+        await update.message.reply_text("Uso: /alerta_borrar <id>"); return
     try:
-        alert_id = int(parts[1])
+        rid = int(parts[1])
     except ValueError:
-        await update.message.reply_text("ID inválido.")
-        return
-    ok = db_delete_alert(update.message.chat_id, alert_id)
+        await update.message.reply_text("ID inválido."); return
+    ok = db_delete_alert(update.message.chat_id, rid)
     await update.message.reply_text("🗑️ Alerta eliminada." if ok else "No se encontró esa alerta.")
 
 async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dolares, reservas, ipc, riesgo, news = await asyncio.gather(
-        get_all_dolares(), get_reservas_usd(), get_ipc_mensual(), get_riesgo_pais(), fetch_news_filtered(limit=5)
+        get_all_dolares(), get_reservas_usd(), get_ipc_mensual(), get_riesgo_pais(), news_filtered(limit=5)
     )
     block = format_dolares_block(dolares) if dolares else "n/d"
-    reservas_txt = f"`{reservas['fecha']}` — {reservas['valor']:.2f} M USD" if reservas else "Dato no disponible"
-    ipc_txt      = f"`{ipc['fecha']}` — {ipc['valor']:.2f}%" if ipc else "Dato no disponible"
-    riesgo_txt   = f"`{riesgo['fecha']}` — {int(round(riesgo['valor']))} pts" if (riesgo and riesgo.get("valor") is not None) else "Dato no disponible"
-    news_txt = "\n".join([f"• [{n['title']}]({n['link']})" for n in (news or [])]) if news else "_Sin noticias filtradas ahora mismo._"
-    out = (
+    res_txt = f"`{reservas['fecha']}` — {reservas['valor']:.2f} M USD" if reservas else "Dato no disponible"
+    ipc_txt  = f"`{ipc['fecha']}` — {ipc['valor']:.2f}%" if ipc else "Dato no disponible"
+    rsk_txt  = f"`{riesgo['fecha']}` — {int(round(riesgo['valor']))} pts" if (riesgo and riesgo.get("valor") is not None) else "Dato no disponible"
+    # SOLO títulos (sin links):
+    news_txt = "\n".join([f"• {n['title']}" for n in (news or [])]) if news else "_Sin noticias filtradas ahora mismo._"
+    await update.message.reply_text(
         f"🗓️ *Resumen {now_str()}*\n\n"
         f"💵 *Dólares*\n{block}\n"
-        f"🏦 *Reservas*: {reservas_txt}\n"
+        f"🏦 *Reservas*: {res_txt}\n"
         f"📈 *Inflación*: {ipc_txt}\n"
-        f"📉 *Riesgo País*: {riesgo_txt}\n\n"
-        f"📰 *Noticias*\n{news_txt}"
+        f"📉 *Riesgo País*: {rsk_txt}\n\n"
+        f"📰 *Noticias*\n{news_txt}",
+        parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True
     )
-    await update.message.reply_text(out, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
-# ---------- Job de alertas y refresh cachés (si JobQueue disponible) ----------
+# -------- Jobs (opcionales si JobQueue instalado) --------
 async def job_check_alerts(context: ContextTypes.DEFAULT_TYPE):
     rows = db_list_all_active()
-    if not rows:
-        return
+    if not rows: return
     dolares = await get_all_dolares()
-    for (alert_id, chat_id, tipo, umbral) in rows:
+    for (rid, chat_id, tipo, umbral) in rows:
         d = dolares.get(tipo) if dolares else None
         precio = d.get("venta") if d else None
-        try:
-            thr = float(umbral)
-        except Exception:
-            continue
-        if isinstance(precio, (int, float)) and precio >= thr:
-            txt = f"🔔 *Alerta #{alert_id}*\n{tipo.upper()} alcanzó {fmt_money_ars(precio)} (umbral {fmt_money_ars(thr)})."
-            try:
-                await context.bot.send_message(chat_id=chat_id, text=txt, parse_mode=ParseMode.MARKDOWN)
-            except Exception:
-                pass
-            db_delete_alert(chat_id, alert_id)
+        try: thr = float(umbral)
+        except Exception: continue
+        if isinstance(precio,(int,float)) and precio >= thr:
+            txt = f"🔔 *Alerta #{rid}*\n{tipo.upper()} alcanzó {fmt_money_ars(precio)} (umbral {fmt_money_ars(thr)})."
+            try: await context.bot.send_message(chat_id=chat_id, text=txt, parse_mode=ParseMode.MARKDOWN)
+            except Exception: pass
+            db_delete_alert(chat_id, rid)
 
-async def job_refresh_caches(context: ContextTypes.DEFAULT_TYPE):
-    # refresca cachés para respuestas instantáneas
+async def job_prefetch_all(context: ContextTypes.DEFAULT_TYPE):
     await asyncio.gather(
-        get_all_dolares(),
-        get_reservas_usd(),
-        get_ipc_mensual(),
-        get_riesgo_pais(),
-        compute_universe_returns(BYMA_UNIVERSO, cache_key="byma_universe"),
-        compute_universe_returns(CEDEARS_UNIVERSO, cache_key="cedears_universe"),
-        fetch_news_filtered(limit=5),
+        get_all_dolares(), get_reservas_usd(), get_ipc_mensual(), get_riesgo_pais(),
+        compute_universe(BYMA_UNIVERSO, "byma_universe"),
+        compute_universe(CEDEARS_UNIVERSO, "cedears_universe"),
+        news_filtered(limit=5),
     )
 
-# ---------- Health server (thread) ----------
+# -------- Health server (thread) --------
 def start_health_server_in_thread():
-    import threading
-    from http.server import BaseHTTPRequestHandler, HTTPServer
     port = int(os.environ.get("PORT", "0") or "0")
-    if port <= 0:
-        return
-    class Handler(BaseHTTPRequestHandler):
+    if port <= 0: return
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    class H(BaseHTTPRequestHandler):
         def do_GET(self):
-            if self.path == "/healthz":
-                self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers(); self.wfile.write(b"OK")
-            else:
-                self.send_response(200); self.send_header("Content-Type", "text/plain"); self.end_headers(); self.wfile.write(b"OK")
-        def log_message(self, *args): return
-    server = HTTPServer(("0.0.0.0", port), Handler)
-    t = threading.Thread(target=server.serve_forever, daemon=True); t.start()
+            self.send_response(200); self.send_header("Content-Type","text/plain"); self.end_headers(); self.wfile.write(b"OK")
+        def log_message(self, *a): return
+    def _serve():
+        HTTPServer(("0.0.0.0", port), H).serve_forever()
+    threading.Thread(target=_serve, daemon=True).start()
     print(f"[health] HTTP server (thread) listening on 0.0.0.0:{port}")
 
-# ---------- Main ----------
+# -------- Post-init: matar webhook y prefetch al arrancar --------
+async def _post_init(app):
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        print("[startup] Webhook eliminado y updates viejos descartados.")
+    except Exception as e:
+        print(f"[startup] delete_webhook: {e}")
+    try:
+        await asyncio.wait_for(job_prefetch_all(type("ctx",(),{"bot":app.bot})()), timeout=12.0)
+        print("[startup] Prefetch inicial OK.")
+    except Exception as e:
+        print(f"[startup] Prefetch inicial: {e}")
+
+# ===================== Main =====================
 def build_app():
     token = os.environ.get("BOT_TOKEN")
     if not token:
         raise RuntimeError("Falta BOT_TOKEN en variables de entorno.")
-    app = ApplicationBuilder().token(token).build()
+    app = (
+        ApplicationBuilder()
+        .token(token)
+        .post_init(_post_init)
+        .build()
+    )
 
-    # Handlers
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help",  cmd_start))
     app.add_handler(CommandHandler("dolar", cmd_dolar))
@@ -733,13 +687,12 @@ def build_app():
     app.add_handler(CommandHandler("alerta_borrar", cmd_alerta_borrar))
     app.add_handler(CommandHandler("resumen_diario", cmd_resumen_diario))
 
-    # Jobs (si está disponible JobQueue)
     jq = getattr(app, "job_queue", None)
     if jq is not None:
         jq.run_repeating(job_check_alerts, interval=90, first=10)
-        jq.run_repeating(job_refresh_caches, interval=300, first=5)  # refresca cachés cada 5 min
+        jq.run_repeating(job_prefetch_all, interval=300, first=30)
     else:
-        print("[jobs] JobQueue no disponible — instalá 'python-telegram-bot[job-queue]' para habilitar alertas y prefetch.")
+        print("[jobs] JobQueue no disponible — instalá 'python-telegram-bot[job-queue]' para alertas/prefetch.")
 
     return app
 
