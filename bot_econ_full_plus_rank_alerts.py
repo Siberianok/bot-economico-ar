@@ -33,7 +33,6 @@ import re
 import time
 import math
 import json
-import asyncio
 import sqlite3
 from datetime import datetime
 from xml.etree import ElementTree as ET
@@ -62,7 +61,7 @@ TTL_IPC = 86400       # 24 hs
 TTL_YF = 300          # 5 min
 TTL_NEWS = 600        # 10 min
 
-# Universos Yahoo (podés ampliar libremente)
+# Universos Yahoo
 UNIVERSO_ACCIONES_BA = [
     # Bancos
     "GGAL.BA", "BMA.BA", "BBAR.BA", "SUPV.BA",
@@ -105,7 +104,7 @@ NOMBRES = {
     "AMD.BA": "AMD", "BIDU.BA": "Baidu"
 }
 
-# Series oficiales (con override por Environment si lo definís)
+# Series oficiales (override por Environment si querés)
 SERIES_RESERVAS = [s for s in [
     os.getenv("SERIES_RESERVAS_ID"),
     "BCRA.RESERVAS_INTERNACIONALES_USD",
@@ -146,23 +145,20 @@ _MDV2_RE = re.compile(r'([_*\[\]()~`>#+\-=|{}.!])')
 def esc(s: str) -> str:
     return _MDV2_RE.sub(r'\\\1', s or "")
 
-def now_ts() -> float:
-    return time.time()
-
 class TTLCache:
     def __init__(self):
-        self.data = {}  # key -> (expire, value)
+        self.data = {}  # key -> (expire_ts, value)
     def get(self, key):
         v = self.data.get(key)
         if not v:
             return None
         exp, val = v
-        if exp < now_ts():
+        if exp < time.time():
             self.data.pop(key, None)
             return None
         return val
     def set(self, key, value, ttl):
-        self.data[key] = (now_ts() + ttl, value)
+        self.data[key] = (time.time() + ttl, value)
 
 CACHE = TTLCache()
 
@@ -170,13 +166,7 @@ CACHE = TTLCache()
 HTTP_TIMEOUT = httpx.Timeout(connect=10, read=12, write=12, pool=12)
 HTTP_LIMITS  = httpx.Limits(max_connections=20, max_keepalive_connections=20)
 HTTP_HEADERS = {"User-Agent": "bot-econ-ar/1.0 (+github.com/Siberianok/bot-economico-ar)"}
-
-http = httpx.AsyncClient(
-    timeout=HTTP_TIMEOUT,
-    limits=HTTP_LIMITS,
-    headers=HTTP_HEADERS,
-    follow_redirects=True,
-)
+http = httpx.AsyncClient(timeout=HTTP_TIMEOUT, limits=HTTP_LIMITS, headers=HTTP_HEADERS, follow_redirects=True)
 
 async def fetch_json(url: str, params: dict | None = None):
     for i in range(2):
@@ -203,8 +193,7 @@ async def fetch_text(url: str):
 USD_TYPES = ["blue", "mep", "ccl", "cripto", "oficial", "mayorista"]
 
 async def get_dolares():
-    ck = "usd_all"
-    v = CACHE.get(ck)
+    v = CACHE.get("usd_all")
     if v:
         return v
     out = {}
@@ -235,7 +224,7 @@ async def get_dolares():
             out[t] = q
 
     if out:
-        CACHE.set(ck, out, TTL_USD)
+        CACHE.set("usd_all", out, TTL_USD)
     return out
 
 def fmt_dolares_block(d):
@@ -273,8 +262,7 @@ async def series_last(ids: str):
     return None
 
 async def get_reservas():
-    ck = "reservas"
-    v = CACHE.get(ck)
+    v = CACHE.get("reservas")
     if v is not None:
         return v
     val = None
@@ -283,12 +271,11 @@ async def get_reservas():
         if val is not None:
             break
     if val is not None:
-        CACHE.set(ck, val, TTL_RESERVAS)
+        CACHE.set("reservas", val, TTL_RESERVAS)
     return val
 
 async def get_ipc_mom():
-    ck = "ipc_mom"
-    v = CACHE.get(ck)
+    v = CACHE.get("ipc_mom")
     if v is not None:
         return v
     val = None
@@ -297,17 +284,15 @@ async def get_ipc_mom():
         if val is not None:
             break
     if val is not None:
-        CACHE.set(ck, val, TTL_IPC)
+        CACHE.set("ipc_mom", val, TTL_IPC)
     return val
 
 # ===================== Riesgo país =====================
 
 async def get_riesgo_pais():
-    ck = "riesgo"
-    v = CACHE.get(ck)
+    v = CACHE.get("riesgo")
     if v is not None:
         return v
-
     val = None
     data = await fetch_json("https://api.argentinadatos.com/v1/finanzas/mercados/riesgo-pais")
     try:
@@ -320,7 +305,6 @@ async def get_riesgo_pais():
                     break
     except Exception:
         val = None
-
     if val is None:
         dapi = await fetch_json("https://dolarapi.com/v1/otros/riesgo-pais")
         if dapi and "valor" in dapi:
@@ -328,9 +312,8 @@ async def get_riesgo_pais():
                 val = int(round(float(dapi["valor"])))
             except Exception:
                 val = None
-
     if val is not None:
-        CACHE.set(ck, val, TTL_RIESGO)
+        CACHE.set("riesgo", val, TTL_RIESGO)
     return val
 
 # ===================== Yahoo Finance =====================
@@ -410,6 +393,9 @@ def fmt_card(sym, nm, price, sector, m1, m3, m6):
 
 # ===================== Noticias (RSS) =====================
 
+KEYWORDS_OK = KEYWORDS_OK
+KEYWORDS_BAN = KEYWORDS_BAN
+
 def _pass_noticia(title: str):
     t = (title or "").lower()
     if any(b in t for b in KEYWORDS_BAN):
@@ -419,8 +405,7 @@ def _pass_noticia(title: str):
     return False
 
 async def get_news():
-    ck = "news"
-    v = CACHE.get(ck)
+    v = CACHE.get("news")
     if v:
         return v
     items = []
@@ -447,7 +432,7 @@ async def get_news():
         seen.add(k)
         uniq.append((t, u))
     out = uniq[:NEWS_MAX_ITEMS]
-    CACHE.set(ck, out, TTL_NEWS)
+    CACHE.set("news", out, TTL_NEWS)
     return out
 
 def fmt_news_links(items):
@@ -522,34 +507,44 @@ async def job_check_alerts(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-# ===================== Prefetch =====================
-
 async def job_prefetch(context: ContextTypes.DEFAULT_TYPE):
-    for fn in (get_dolares, get_reservas, get_ipc_mom, get_riesgo_pais):
-        try:
-            await fn()
-        except Exception:
-            pass
-    try:
-        await top_universo(UNIVERSO_ACCIONES_BA, topn=6)
-        await top_universo(UNIVERSO_CEDEARS_BA, topn=6)
-    except Exception:
-        pass
-    try:
-        await get_news()
-    except Exception:
-        pass
+    # para calentar caches
+    try: await get_dolares()
+    except Exception: pass
+    try: await get_reservas()
+    except Exception: pass
+    try: await get_ipc_mom()
+    except Exception: pass
+    try: await get_riesgo_pais()
+    except Exception: pass
+    try: await top_universo(UNIVERSO_ACCIONES_BA, topn=6)
+    except Exception: pass
+    try: await top_universo(UNIVERSO_CEDEARS_BA, topn=6)
+    except Exception: pass
+    try: await get_news()
+    except Exception: pass
 
 # ===================== Handlers =====================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = (
         "👋 *Observatorio Económico AR*\n\n"
-        "Comandos: /dolar /reservas /inflacion /riesgo /acciones /cedears\n"
-        "/ranking_acciones /ranking_cedears\n"
-        "/alerta_dolar <tipo> <umbral>  (blue|mep|ccl|cripto|oficial|mayorista)\n"
-        "/alertas  /alerta_borrar <id>\n"
-        "/resumen_diario"
+        "Comandos:\n"
+        "```\n"
+        "/dolar\n"
+        "/reservas\n"
+        "/inflacion\n"
+        "/riesgo\n"
+        "/acciones\n"
+        "/cedears\n"
+        "/ranking_acciones\n"
+        "/ranking_cedears\n"
+        "/alerta_dolar <tipo> <umbral>\n"
+        "/alertas\n"
+        "/alerta_borrar <id>\n"
+        "/resumen_diario\n"
+        "```\n"
+        "Tipos válidos alerta dólar: blue|mep|ccl|cripto|oficial|mayorista"
     )
     await update.message.reply_text(txt)
 
@@ -624,11 +619,15 @@ async def cmd_rank_ced(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_alerta_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 2:
-        await update.message.reply_text("Uso: /alerta_dolar <tipo> <umbral>\nEj: /alerta_dolar blue 1500")
+        await update.message.reply_text(
+            "Uso:\n```\n/alerta_dolar <tipo> <umbral>\nEj: /alerta_dolar blue 1500\n```"
+        )
         return
     tipo = context.args[0].lower().strip()
     if tipo not in USD_TYPES:
-        await update.message.reply_text("Tipos válidos: blue|mep|ccl|cripto|oficial|mayorista")
+        await update.message.reply_text(
+            "Tipos válidos:\n```\nblue | mep | ccl | cripto | oficial | mayorista\n```"
+        )
         return
     try:
         umbral = float(context.args[1].replace(",", "."))
@@ -636,7 +635,7 @@ async def cmd_alerta_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Umbral inválido. Ej: 1500")
         return
     db_add_alert(update.effective_chat.id, tipo, umbral)
-    await update.message.reply_text(f"✅ Alerta creada: {tipo.upper()} ≥ ${umbral:,.2f}")
+    await update.message.reply_text(f"✅ Alerta creada: {esc(tipo.upper())} ≥ ${umbral:,.2f}")
 
 async def cmd_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows = db_list_alerts(update.effective_chat.id)
@@ -648,7 +647,7 @@ async def cmd_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_alerta_borrar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Uso: /alerta_borrar <id>")
+        await update.message.reply_text("Uso:\n```\n/alerta_borrar <id>\n```")
         return
     try:
         a_id = int(context.args[0])
@@ -708,14 +707,14 @@ def build_app():
     app.add_handler(CommandHandler("resumen_diario", cmd_resumen_diario))
     app.add_handler(MessageHandler(filters.COMMAND, cmd_start))  # fallback de comandos raros
 
-    # Jobs (si está disponible el JobQueue)
+    # Jobs si hay JobQueue disponible
     if app.job_queue:
-        app.job_queue.run_repeating(job_prefetch, interval=300, first=5)   # cada 5 min
+        app.job_queue.run_repeating(job_prefetch, interval=300, first=5)
         app.job_queue.run_repeating(job_check_alerts, interval=90, first=15)
 
     return app
 
-# ===================== MAIN — WEBHOOK (sin polling) =====================
+# ===================== MAIN — WEBHOOK (sin polling, sin asyncio.run) =====================
 
 def main():
     # DB para alertas
@@ -728,24 +727,15 @@ def main():
 
     app = build_app()
 
-    async def runner():
-        # limpiamos cualquier webhook anterior y descartamos updates pendientes
-        try:
-            await app.bot.delete_webhook(drop_pending_updates=True)
-        except Exception:
-            pass
-
-        # Ejecuta el webhook en Render
-        await app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path=secret_path,
-            webhook_url=f"{PUBLIC_URL}/{secret_path}",
-            drop_pending_updates=True,
-            stop_signals=None,
-        )
-
-    asyncio.run(runner())
+    # IMPORTANTE: NO envolver en asyncio.run — run_webhook maneja el loop internamente.
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        url_path=secret_path,
+        webhook_url=f"{PUBLIC_URL}/{secret_path}",
+        drop_pending_updates=True,
+        stop_signals=None,
+    )
 
 if __name__ == "__main__":
     main()
