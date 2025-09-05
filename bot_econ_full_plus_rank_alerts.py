@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Bot Económico AR — Telegram (Render Free, WEBHOOK estable)
+Bot Económico AR — Telegram (Render Free, WEBHOOK)
 Comandos:
   /dolar, /reservas, /inflacion, /riesgo, /acciones, /cedears,
   /ranking_acciones, /ranking_cedears,
@@ -335,7 +335,6 @@ def _pass_noticia(title: str):
     return False
 
 def _escape_url(u: str) -> str:
-    # Para MarkdownV2: escapamos paréntesis en URLs para evitar parse errors
     return u.replace(")", "%29").replace("(", "%28")
 
 async def get_news():
@@ -553,7 +552,6 @@ def build_app():
         parse_mode=ParseMode.MARKDOWN_V2,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
-    # Timeouts más altos al hablar con Telegram (evita TimedOut en cold start)
     req = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0, write_timeout=30.0, pool_timeout=30.0)
     app = ApplicationBuilder().token(BOT_TOKEN).request(req).defaults(defaults).build()
 
@@ -579,21 +577,35 @@ def build_app():
 
 # ===================== MAIN — WEBHOOK simple =====================
 
+def delete_webhook_sync():
+    """Borra webhook antes de iniciar para evitar Conflicts."""
+    if not BOT_TOKEN: return
+    try:
+        r = httpx.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/deleteWebhook",
+            params={"drop_pending_updates": "true"},
+            timeout=10.0,
+        )
+        print("[startup] deleteWebhook:", r.text[:200])
+    except Exception as e:
+        print("[startup] deleteWebhook error:", e)
+
 def main():
-    db_init()
     if not PUBLIC_URL or not PUBLIC_URL.startswith("http"):
         raise RuntimeError("Falta PUBLIC_URL (ej: https://bot-economico-ar.onrender.com)")
+    db_init()
+    delete_webhook_sync()
+
     secret_path = WEBHOOK_PATH or BOT_TOKEN
     port = int(os.getenv("PORT", "10000"))
 
     app = build_app()
-    # Bloqueante; PTB maneja su propio event loop. No hacer reintentos acá.
     app.run_webhook(
         listen="0.0.0.0",
         port=port,
         url_path=secret_path,
         webhook_url=f"{PUBLIC_URL}/{secret_path}",
-        drop_pending_updates=True,
+        drop_pending_updates=False,   # <— clave para evitar getUpdates tras setWebhook
         stop_signals=None,
     )
 
