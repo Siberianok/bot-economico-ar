@@ -10,7 +10,7 @@
 #   /reservas /inflacion /riesgo /resumen_diario
 #   /alertas /alertas_add /alertas_clear
 #
-# Fuentes sin credenciales: CriptoYa, DolarAPI, ArgentinaDatos, Yahoo Finance v8, RSS (iProfesional/Clarín/La Nación/Ámbito)
+# Fuentes: CriptoYa, DolarAPI, ArgentinaDatos, Yahoo Finance (v8 chart), RSS (iProfesional/Clarín/La Nación/Ámbito)
 #
 # requirements.txt:
 #   python-telegram-bot>=21.5
@@ -51,15 +51,15 @@ WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 CRYPTOYA_DOLAR_URL = "https://criptoya.com/api/dolar"
 DOLARAPI_BASE = "https://dolarapi.com/v1"
 ARG_DATOS_BASES = [
-    "https://api.argentinadatos.com/v1/finanzas/indices",  # principal
-    "https://argentinadatos.com/v1/finanzas/indices",       # fallback
+    "https://api.argentinadatos.com/v1/finanzas/indices",
+    "https://argentinadatos.com/v1/finanzas/indices",
 ]
 LAMACRO_RESERVAS_URL = "https://www.lamacro.ar/variables/1"
 
 # Yahoo Finance v8 chart
 YF_URLS = [
     "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
-    "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}",  # fallback
+    "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}",
 ]
 YF_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
@@ -105,7 +105,7 @@ def anchor(href: str, text: str) -> str:
 def fmt_fecha_ddmmyyyy_from_iso(s: Optional[str]) -> Optional[str]:
     if not s: return None
     try:
-        if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        if re.match(r"^\d{4}-\d{2}-\d{2}", s):
             return datetime.strptime(s[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
     except Exception:
         pass
@@ -121,6 +121,14 @@ def last_day_of_month_str(periodo_yyyy_mm: str) -> Optional[str]:
         return d.strftime("%d/%m/%Y")
     except Exception:
         return None
+
+def parse_period_to_ddmmyyyy(per: Optional[str]) -> Optional[str]:
+    if not per: return None
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", per):
+        return fmt_fecha_ddmmyyyy_from_iso(per)
+    if re.match(r"^\d{4}-\d{2}$", per):
+        return last_day_of_month_str(per)
+    return per  # última chance: ya viene en dd/mm/aaaa o texto legible
 
 # ------------------------------ HTTP helpers --------------------------------
 
@@ -149,7 +157,6 @@ async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str
 # ------------------------------ Dólares ------------------------------------
 
 async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
-    """CriptoYa primero; DolarAPI fallback/complemento."""
     data: Dict[str, Dict[str, Any]] = {}
 
     # CriptoYa
@@ -167,7 +174,7 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
             if c is not None or v is not None:
                 data[k] = {"compra": c, "venta": v, "fuente": "CriptoYa"}
 
-    # DolarAPI
+    # DolarAPI (completa fechas)
     async def dolarapi(path: str):
         j = await fetch_json(session, f"{DOLARAPI_BASE}{path}")
         if not j: return (None, None, None)
@@ -232,12 +239,10 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
     return None
 
 async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
-    """Devuelve (valor %, fecha dd/mm/aaaa). Usa varios endpoints por compat."""
+    """Devuelve (valor %, fecha dd/mm/aaaa)."""
     j = await arg_datos_get(session, "/inflacion")
-    if not j:
-        j = await arg_datos_get(session, "/inflacion/mensual/ultimo")
-    if not j:
-        j = await arg_datos_get(session, "/inflacion/mensual")
+    if not j: j = await arg_datos_get(session, "/inflacion/mensual/ultimo")
+    if not j: j = await arg_datos_get(session, "/inflacion/mensual")
     if isinstance(j, dict) and "serie" in j and isinstance(j["serie"], list) and j["serie"]:
         j = j["serie"]
 
@@ -250,12 +255,7 @@ async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float,
         val = j.get("valor"); per = j.get("fecha") or j.get("periodo")
 
     if val is None: return None
-
-    if per and len(per) >= 7 and per[4] == "-" and per[6] == "-":
-        fecha = last_day_of_month_str(per[:7])
-    else:
-        fecha = fmt_fecha_ddmmyyyy_from_iso(per)
-
+    fecha = parse_period_to_ddmmyyyy(per)
     try:
         return (float(val), fecha)
     except Exception:
@@ -276,7 +276,7 @@ async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, 
         except Exception: return None
     return None
 
-# ------------------------------ Yahoo retornos (con fecha) -----------------
+# ------------------------------ Yahoo retornos -----------------------------
 
 RET_CACHE_1Y: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}  # key: f"{host}|{symbol}|{interval}"
 RET_TTL = 600  # 10 minutos
@@ -353,6 +353,11 @@ async def returns_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
         if ts:
             last_ts = ts if last_ts is None else max(last_ts, ts)
     return out, last_ts
+
+def top_n_by_window(retmap: Dict[str, Dict[str, Optional[float]]], window: str, n=3) -> List[Tuple[str, float]]:
+    pairs = [(sym, float(v)) for sym,d in retmap.items() if (v:=d.get(window)) is not None]
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    return pairs[:n]
 
 def rank_projection(retmap: Dict[str, Dict[str, Optional[float]]], n=5) -> List[Tuple[str, float, float, float]]:
     syms = list(retmap.keys())
@@ -480,7 +485,7 @@ async def alerts_loop(app: Application):
             log.warning("alerts_loop error: %s", e)
             await asyncio.sleep(30)
 
-# ------------------------------ Formatos -----------------------------------
+# ------------------------------ Formatos tablas ----------------------------
 
 def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
     fecha = extract_latest_dolar_date(d)
@@ -497,27 +502,43 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
         rows.append(f"<pre>{l}</pre>")
     return "\n".join([lines[0], lines[1]] + rows)
 
-def format_returns_table(title: str, symbols: List[str], retmap: Dict[str, Dict[str, Optional[float]]], fecha: Optional[str]) -> str:
+def format_top3_columns(title: str, fecha: Optional[str],
+                        top1m: List[Tuple[str, float]], top3m: List[Tuple[str, float]], top6m: List[Tuple[str, float]]) -> str:
+    # Armamos tabla con filas = ranking (1..3) y columnas = 1M | 3M | 6M
     head = f"<b>{title}</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
-    lines = [head, "<pre>Ticker         1M         3M         6M</pre>"]
+    lines = [head, "<pre>Rank       1M                 3M                 6M</pre>"]
+    def cell(item: Optional[Tuple[str,float]]) -> str:
+        if not item: return "—"
+        sym, val = item
+        return f"{sym} {pct(val,2)}"
+    # completar a 3
+    top1m = top1m + [None]*(3-len(top1m))
+    top3m = top3m + [None]*(3-len(top3m))
+    top6m = top6m + [None]*(3-len(top6m))
     rows = []
-    for sym in symbols:
-        d = retmap.get(sym, {})
-        p1 = pct(d.get("1m"), 2) if d.get("1m") is not None else "—"
-        p3 = pct(d.get("3m"), 2) if d.get("3m") is not None else "—"
-        p6 = pct(d.get("6m"), 2) if d.get("6m") is not None else "—"
-        l = f"{sym:<12}{p1:>10}{p3:>11}{p6:>11}"
+    for i in range(3):
+        c1 = f"{cell(top1m[i]):<18}"
+        c2 = f"{cell(top3m[i]):<18}"
+        c3 = f"{cell(top6m[i]):<18}"
+        l = f"{i+1:<4}   {c1}   {c2}   {c3}"
         rows.append(f"<pre>{l}</pre>")
     return "\n".join([lines[0], lines[1]] + rows)
 
-def format_proj_block(title: str, rows: List[Tuple[str, float, float, float]]) -> str:
-    lines = [f"<u>{title}</u>"]
+def format_ranking_table(title: str, fecha: Optional[str], rows: List[Tuple[str, float, float, float]]) -> str:
+    # Tabla de 5 filas (Top 5 por 6M), columnas 1M/3M/6M
+    head = f"<b>{title}</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
+    lines = [head, "<pre>Rank  Ticker         1M         3M         6M</pre>"]
+    out_rows = []
     if not rows:
-        lines.append("—")
-        return "\n".join(lines)
-    for sym, r6, r3, r1 in rows:
-        lines.append(f"• {anchor(f'https://finance.yahoo.com/quote/{sym}', sym)} 6m {pct(r6,2)} · 3m {pct(r3,2)} · 1m {pct(r1,2)}")
-    return "\n".join(lines)
+        out_rows.append("<pre>—</pre>")
+    else:
+        for idx, (sym, r6, r3, r1) in enumerate(rows[:5], start=1):
+            p1 = pct(r1,2) if r1 is not None else "—"
+            p3 = pct(r3,2) if r3 is not None else "—"
+            p6 = pct(r6,2) if r6 is not None else "—"
+            l = f"{idx:<4} {sym:<12}{p1:>10}{p3:>11}{p6:>11}"
+            out_rows.append(f"<pre>{l}</pre>")
+    return "\n".join([lines[0], lines[1]] + out_rows)
 
 # ------------------------------ Handlers -----------------------------------
 
@@ -534,7 +555,10 @@ async def cmd_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.TimeoutError:
             rets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in ACCIONES_BA}, None)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-    msg = format_returns_table("📈 Acciones BYMA (.BA)", ACCIONES_BA, rets, fecha)
+    t1 = top_n_by_window(rets, "1m", 3)
+    t3 = top_n_by_window(rets, "3m", 3)
+    t6 = top_n_by_window(rets, "6m", 3)
+    msg = format_top3_columns("📈 Acciones BYMA (.BA)", fecha, t1, t3, t6)
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -544,7 +568,10 @@ async def cmd_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.TimeoutError:
             rets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in CEDEARS_BA}, None)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-    msg = format_returns_table("🌎 CEDEARs (.BA)", CEDEARS_BA, rets, fecha)
+    t1 = top_n_by_window(rets, "1m", 3)
+    t3 = top_n_by_window(rets, "3m", 3)
+    t6 = top_n_by_window(rets, "6m", 3)
+    msg = format_top3_columns("🌎 CEDEARs (.BA)", fecha, t1, t3, t6)
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_rankings_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -555,9 +582,9 @@ async def cmd_rankings_acciones(update: Update, context: ContextTypes.DEFAULT_TY
             acc, acc_ts = {}, None
     fecha = datetime.fromtimestamp(acc_ts, TZ).strftime("%d/%m/%Y") if acc_ts else None
     acc_top = rank_projection(acc, 5) if acc else []
-    head = f"<b>🏁 Acciones – Top 5 (proyección ~ momentum 6m)</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
-    lines = [head, format_proj_block("Top 5", acc_top)]
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    head = "🏁 Acciones – Top 5 (base 6M)"
+    msg = format_ranking_table(head, fecha, acc_top)
+    await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_rankings_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
@@ -567,9 +594,9 @@ async def cmd_rankings_cedears(update: Update, context: ContextTypes.DEFAULT_TYP
             ced, ced_ts = {}, None
     fecha = datetime.fromtimestamp(ced_ts, TZ).strftime("%d/%m/%Y") if ced_ts else None
     ced_top = rank_projection(ced, 5) if ced else []
-    head = f"<b>🏁 CEDEARs – Top 5 (proyección ~ momentum 6m)</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
-    lines = [head, format_proj_block("Top 5", ced_top)]
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    head = "🏁 CEDEARs – Top 5 (base 6M)"
+    msg = format_ranking_table(head, fecha, ced_top)
+    await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
@@ -587,7 +614,7 @@ async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tup is None:
         txt = "No pude obtener inflación ahora."
     else:
-        val, fecha = tup  # fecha dd/mm/aaaa
+        val, fecha = tup
         val_str = str(round(val, 1)).replace(".", ",")
         txt = f"<b>📉 Inflación mensual</b>{f'  <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>"
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
@@ -611,7 +638,7 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
         inflac_t  = await get_inflacion_mensual(session)
         news      = await fetch_rss_entries(session, limit=5)
 
-    blocks = [f"<b>🗞️ Resumen diario</b>"]  # sin hora
+    blocks = [f"<b>🗞️ Resumen diario</b>"]
 
     if dolares:
         blocks.append(format_dolar_message(dolares))
@@ -711,13 +738,13 @@ async def on_startup(app: web.Application):
     await application.initialize()
     await application.start()
     await application.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=["message"], drop_pending_updates=True)
-    # Menú de comandos (sin /start y sin /rankings combinado)
+    # Menú (sin /start ni /rankings combinado)
     cmds = [
         BotCommand("dolar", "Tipos de cambio (compra/venta + fecha)"),
-        BotCommand("acciones", "Tabla 1M/3M/6M (con fecha)"),
-        BotCommand("cedears", "Tabla 1M/3M/6M (con fecha)"),
-        BotCommand("rankings_acciones", "Top 5 acciones"),
-        BotCommand("rankings_cedears", "Top 5 CEDEARs"),
+        BotCommand("acciones", "Top 3 por columna 1M/3M/6M"),
+        BotCommand("cedears", "Top 3 por columna 1M/3M/6M"),
+        BotCommand("rankings_acciones", "Top 5 acciones (tabla)"),
+        BotCommand("rankings_cedears", "Top 5 CEDEARs (tabla)"),
         BotCommand("reservas", "Reservas BCRA (con fecha)"),
         BotCommand("inflacion", "Inflación mensual (con fecha)"),
         BotCommand("riesgo", "Riesgo país (con fecha)"),
