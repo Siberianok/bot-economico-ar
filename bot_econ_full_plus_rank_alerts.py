@@ -99,6 +99,9 @@ def pct(n: Optional[float], nd: int = 2) -> str:
     except Exception:
         return "—"
 
+def anchor(href: str, text: str) -> str:
+    return f'<a href="{href}">{text}</a>'
+
 def fmt_fecha_ddmmyyyy_from_iso(s: Optional[str]) -> Optional[str]:
     if not s: return None
     try:
@@ -226,7 +229,7 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
         j = await arg_datos_get(session, "/riesgo-pais")
         if isinstance(j, list) and j:
             last = j[-1]
-            val = last.get("valor"); f = last.get("fecha") or last.get("periodo")
+            val = last.get("valor"); f = last.get("fecha") or j.get("periodo")
             try: return (int(float(val)), f) if val is not None else None
             except Exception: return None
     if isinstance(j, dict):
@@ -355,22 +358,23 @@ def top_n_by_window(retmap: Dict[str, Dict[str, Optional[float]]], window: str, 
     return pairs[:n]
 
 def composite_score(d: Dict[str, Optional[float]]) -> float:
+    # Proyección simple por momentum (6–12M): 0.6*6M + 0.3*3M + 0.1*1M
     w6, w3, w1 = 0.6, 0.3, 0.1
     r6 = d.get("6m"); r3 = d.get("3m"); r1 = d.get("1m")
-    # Si falta algún retorno, se considera muy bajo para no favorecerlo
     s = 0.0
     s += (r6 if r6 is not None else -1e6) * w6
     s += (r3 if r3 is not None else -1e6) * w3
     s += (r1 if r1 is not None else -1e6) * w1
     return s
 
-def rank_projection(retmap: Dict[str, Dict[str, Optional[float]]], n=5) -> List[Tuple[str, float, float, float]]:
+def rank_projection_rows(retmap: Dict[str, Dict[str, Optional[float]]], n=5) -> List[Tuple[str, float]]:
     syms = list(retmap.keys())
     syms.sort(key=lambda s: -composite_score(retmap[s]))
     out = []
     for s in syms:
-        if retmap[s]["6m"] is None: continue
-        out.append((s, retmap[s]["6m"], retmap[s]["3m"], retmap[s]["1m"]))
+        if retmap[s]["6m"] is None:  # sin 6M omitimos
+            continue
+        out.append((s, composite_score(retmap[s])))
         if len(out) >= n: break
     return out
 
@@ -503,13 +507,13 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
         rows.append(f"<pre>{l}</pre>")
     return "\n".join([lines[0], lines[1]] + rows)
 
-def format_subset_table(title: str, fecha: Optional[str],
-                        symbols: List[str],
-                        retmap: Dict[str, Dict[str, Optional[float]]]) -> str:
+def format_top3_single_table(title: str, fecha: Optional[str],
+                             rows_syms: List[str],
+                             retmap: Dict[str, Dict[str, Optional[float]]]) -> str:
     head = f"<b>{title}</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
     lines = [head, "<pre>Rank  Ticker         1M         3M         6M</pre>"]
     rows = []
-    for idx, sym in enumerate(symbols[:3], start=1):
+    for idx, sym in enumerate(rows_syms[:3], start=1):
         d = retmap.get(sym, {})
         p1 = pct(d.get("1m"), 2) if d.get("1m") is not None else "—"
         p3 = pct(d.get("3m"), 2) if d.get("3m") is not None else "—"
@@ -520,19 +524,17 @@ def format_subset_table(title: str, fecha: Optional[str],
         rows.append("<pre>—</pre>")
     return "\n".join([lines[0], lines[1]] + rows)
 
-def format_ranking_table(title: str, fecha: Optional[str], rows: List[Tuple[str, float, float, float]]) -> str:
+def format_ranking_projection_table(title: str, fecha: Optional[str], rows: List[Tuple[str, float]]) -> str:
     head = f"<b>{title}</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
-    sub  = "<i>Ordenado por momentum (0,6·6M + 0,3·3M + 0,1·1M)</i>"
-    lines = [head, sub, "<pre>Rank  Ticker         1M         3M         6M</pre>"]
+    sub  = "<i>Proy. 6–12M (momentum = 0,6·6M + 0,3·3M + 0,1·1M)</i>"
+    lines = [head, sub, "<pre>Rank  Ticker            Proy. 6–12M</pre>"]
     out_rows = []
     if not rows:
         out_rows.append("<pre>—</pre>")
     else:
-        for idx, (sym, r6, r3, r1) in enumerate(rows[:5], start=1):
-            p1 = pct(r1,2) if r1 is not None else "—"
-            p3 = pct(r3,2) if r3 is not None else "—"
-            p6 = pct(r6,2) if r6 is not None else "—"
-            l = f"{idx:<4} {sym:<12}{p1:>10}{p3:>11}{p6:>11}"
+        for idx, (sym, proj) in enumerate(rows[:5], start=1):
+            p = pct(proj, 1) if proj is not None else "—"
+            l = f"{idx:<4} {sym:<14}{p:>12}"
             out_rows.append(f"<pre>{l}</pre>")
     return "\n".join(lines + out_rows)
 
@@ -551,15 +553,9 @@ async def cmd_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.TimeoutError:
             rets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in ACCIONES_BA}, None)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-    t1 = [sym for sym,_ in top_n_by_window(rets, "1m", 3)]
-    t3 = [sym for sym,_ in top_n_by_window(rets, "3m", 3)]
-    t6 = [sym for sym,_ in top_n_by_window(rets, "6m", 3)]
-    blocks = [
-        format_subset_table("📈 Acciones Top 1M (Top 3)", fecha, t1, rets),
-        format_subset_table("📈 Acciones Top 3M (Top 3)", fecha, t3, rets),
-        format_subset_table("📈 Acciones Top 6M (Top 3)", fecha, t6, rets),
-    ]
-    await update.effective_message.reply_text("\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    top6 = [sym for sym,_ in top_n_by_window(rets, "6m", 3)]
+    msg = format_top3_single_table("📈 Acciones BYMA (.BA) – Top 3 por 6M", fecha, top6, rets)
+    await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
@@ -568,15 +564,9 @@ async def cmd_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.TimeoutError:
             rets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in CEDEARS_BA}, None)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-    t1 = [sym for sym,_ in top_n_by_window(rets, "1m", 3)]
-    t3 = [sym for sym,_ in top_n_by_window(rets, "3m", 3)]
-    t6 = [sym for sym,_ in top_n_by_window(rets, "6m", 3)]
-    blocks = [
-        format_subset_table("🌎 CEDEARs Top 1M (Top 3)", fecha, t1, rets),
-        format_subset_table("🌎 CEDEARs Top 3M (Top 3)", fecha, t3, rets),
-        format_subset_table("🌎 CEDEARs Top 6M (Top 3)", fecha, t6, rets),
-    ]
-    await update.effective_message.reply_text("\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    top6 = [sym for sym,_ in top_n_by_window(rets, "6m", 3)]
+    msg = format_top3_single_table("🌎 CEDEARs (.BA) – Top 3 por 6M", fecha, top6, rets)
+    await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_rankings_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
@@ -585,8 +575,8 @@ async def cmd_rankings_acciones(update: Update, context: ContextTypes.DEFAULT_TY
         except asyncio.TimeoutError:
             acc, acc_ts = {}, None
     fecha = datetime.fromtimestamp(acc_ts, TZ).strftime("%d/%m/%Y") if acc_ts else None
-    acc_top = rank_projection(acc, 5) if acc else []
-    msg = format_ranking_table("🏁 Acciones – Top 5 (proyección compuesta)", fecha, acc_top)
+    rows = rank_projection_rows(acc, 5) if acc else []
+    msg = format_ranking_projection_table("🏁 Acciones – Top 5 (Proyección)", fecha, rows)
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_rankings_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -596,8 +586,8 @@ async def cmd_rankings_cedears(update: Update, context: ContextTypes.DEFAULT_TYP
         except asyncio.TimeoutError:
             ced, ced_ts = {}, None
     fecha = datetime.fromtimestamp(ced_ts, TZ).strftime("%d/%m/%Y") if ced_ts else None
-    ced_top = rank_projection(ced, 5) if ced else []
-    msg = format_ranking_table("🏁 CEDEARs – Top 5 (proyección compuesta)", fecha, ced_top)
+    rows = rank_projection_rows(ced, 5) if ced else []
+    msg = format_ranking_projection_table("🏁 CEDEARs – Top 5 (Proyección)", fecha, rows)
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -742,10 +732,10 @@ async def on_startup(app: web.Application):
     await application.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=["message"], drop_pending_updates=True)
     cmds = [
         BotCommand("dolar", "Tipos de cambio (compra/venta + fecha)"),
-        BotCommand("acciones", "Top 1M/3M/6M (tablas)"),
-        BotCommand("cedears", "Top 1M/3M/6M (tablas)"),
-        BotCommand("rankings_acciones", "Top 5 acciones (proyección)"),
-        BotCommand("rankings_cedears", "Top 5 CEDEARs (proyección)"),
+        BotCommand("acciones", "Top 3 por 6M (tabla 1M/3M/6M)"),
+        BotCommand("cedears", "Top 3 por 6M (tabla 1M/3M/6M)"),
+        BotCommand("rankings_acciones", "Top 5 (proyección 6–12M)"),
+        BotCommand("rankings_cedears", "Top 5 (proyección 6–12M)"),
         BotCommand("reservas", "Reservas BCRA (con fecha)"),
         BotCommand("inflacion", "Inflación mensual (con fecha)"),
         BotCommand("riesgo", "Riesgo país (con fecha)"),
