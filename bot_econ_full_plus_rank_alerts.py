@@ -326,7 +326,7 @@ def _stddev(x: List[float]) -> Optional[float]:
     var = sum((xi-mu)**2 for xi in x)/(n-1)
     return sqrt(var)
 
-def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[float]]]:
+def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[float]]]]:
     try:
         ts = res["timestamp"]
         closes_raw = res["indicators"]["adjclose"][0]["adjclose"]
@@ -417,7 +417,7 @@ async def _yf_metrics_1y(session: ClientSession, symbol: str) -> Dict[str, Optio
                 break
     return out
 
-async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tuple[Dict[str, Dict[str, Optional[float]]]], Optional[int]:
+async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tuple[Dict[str, Dict[str, Optional[float]]], Optional[int]]:
     out = {s: {"6m": None, "3m": None, "1m": None, "last_ts": None,
                "vol_ann": None, "dd6m": None, "hi52": None,
                "slope50": None, "trend_flag": None} for s in symbols}
