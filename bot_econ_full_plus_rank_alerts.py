@@ -10,7 +10,8 @@
 #   /reservas /inflacion /riesgo /resumen_diario
 #   /alertas /alertas_add /alertas_clear
 #
-# Fuentes: CriptoYa, DolarAPI, ArgentinaDatos, Yahoo Finance (v8 chart), RSS (Ámbito, iProfesional, Infobae, Perfil, BAE, Télam)
+# Fuentes: CriptoYa, DolarAPI, ArgentinaDatos, Yahoo Finance (v8 chart),
+#          RSS (Ámbito, iProfesional, Infobae, Perfil, BAE, Télam)
 #
 # requirements.txt:
 #   python-telegram-bot>=21.5
@@ -304,21 +305,6 @@ async def _yf_chart_1y(session: ClientSession, symbol: str, interval: str) -> Op
             continue
     return None
 
-def _rolling_sma(vals: List[Optional[float]], window: int) -> List[Optional[float]]:
-    out = [None]*len(vals)
-    s = 0.0
-    q = []
-    for i, v in enumerate(vals):
-        if v is None:
-            q.append(0.0)
-        else:
-            q.append(v); s += v
-        if len(q) > window:
-            s -= q.pop(0)
-        if len(q) == window:
-            out[i] = s / window
-    return out
-
 def _stddev(x: List[float]) -> Optional[float]:
     n = len(x)
     if n < 2: return None
@@ -363,9 +349,10 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         look = 60 if len(rets_d) >= 60 else max(10, len(rets_d)-1)
         vol_ann = None
         if len(rets_d) >= 10:
-            sd = _stddev(rets_d[-look:])
-            if sd is not None:
-                vol_ann = sd*sqrt(252)*100.0
+            # desv. estándar
+            mu = sum(rets_d[-look:]) / len(rets_d[-look:])
+            var = sum((x-mu)**2 for x in rets_d[-look:]) / (len(rets_d[-look:]) - 1)
+            vol_ann = sqrt(var)*sqrt(252)*100.0
 
         # Máx drawdown 6M
         idx_cut = next((i for i,t in enumerate(ts) if t >= t6), 0)
@@ -380,7 +367,7 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         # Proximidad a máx 52s
         hi52 = (last/max(closes) - 1.0)*100.0
 
-        # SMAs y pendiente
+        # SMAs (pendiente 50)
         def _sma(vals, w):
             out, s, q = [None]*len(vals), 0.0, []
             for i, v in enumerate(vals):
@@ -482,35 +469,70 @@ def _score_title(title: str) -> int:
             score += 1
     return score
 
+def _xml_text(el: Optional[ElementTree.Element]) -> Optional[str]:
+    if el is None: return None
+    txt = el.text or ""
+    return txt.strip() or None
+
+def _find_any(el: ElementTree.Element, names: List[str]) -> Optional[ElementTree.Element]:
+    for n in names:
+        found = el.find(n)
+        if found is not None:
+            return found
+        # namespaced wildcard
+        found = el.find(f".//{{*}}{n}")
+        if found is not None:
+            return found
+    return None
+
 async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tuple[str, str]]:
-    entries = []
+    entries: List[Tuple[str,str]] = []
     for url in RSS_FEEDS:
         xml = await fetch_text(session, url)
-        if not xml: continue
+        if not xml:
+            continue
         try:
             root = ElementTree.fromstring(xml)
+
+            # --- RSS 2.0 (items) ---
             for item in root.findall(".//item"):
-                t_el, l_el = item.find("title"), item.find("link")
-                t = t_el.text.strip() if t_el is not None and t_el.text else None
-                l = l_el.text.strip() if l_el is not None and l_el.text else None
-                if t and l: entries.append((t, l))
+                t = _xml_text(_find_any(item, ["title"]))
+                lnode = _find_any(item, ["link"])
+                l = None
+                if lnode is not None:
+                    # Algunos RSS tienen <link>texto</link>, otros usan atributo
+                    l = (lnode.get("href") or lnode.text or "").strip() or None
+                if t and l:
+                    entries.append((t, l))
+
+            # --- Atom (entries) ---
+            for entry in root.findall(".//{http://www.w3.org/2005/Atom}entry") + root.findall(".//entry"):
+                t = _xml_text(_find_any(entry, ["title"]))
+                lnode = _find_any(entry, ["link"])
+                l = None
+                if lnode is not None:
+                    l = (lnode.get("href") or lnode.text or "").strip() or None
+                if t and l:
+                    entries.append((t, l))
+
         except Exception as e:
             log.warning("RSS parse %s: %s", url, e)
 
     # únicos por link
-    uniq = {}
+    uniq: Dict[str,str] = {}
     for t, l in entries:
-        if l not in uniq:
+        if l and l not in uniq:
             uniq[l] = t
 
     # orden por score y selección balanceada por dominio
     scored = sorted([(t,l,_score_title(t), domain_of(l)) for l,t in uniq.items()],
                     key=lambda x: x[2], reverse=True)
 
-    picked, count_by_domain = [], {}
-    # 1) preferir no-paywall y max 2 por dominio
+    picked: List[Tuple[str,str]] = []
+    count_by_domain: Dict[str,int] = {}
+    # 1) preferir no-paywall y máx 2 por dominio
     for t,l,_,dom in scored:
-        if dom in AVOID_DOMAINS:
+        if dom in AVOID_DOMAINS:  # evitar paywalls conocidos
             continue
         if count_by_domain.get(dom,0) >= 2:
             continue
@@ -518,7 +540,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         if len(picked) >= limit:
             return picked
 
-    # 2) si faltan, completar con cualquiera
+    # 2) completar si faltan
     for t,l,_,dom in scored:
         if (t,l) in picked:
             continue
@@ -531,10 +553,11 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     return picked[:limit]
 
 def format_news_block(news: List[Tuple[str, str]]) -> str:
+    title = "<u>Top 5 noticias</u>"
     if not news:
-        return "<u>Top 5 noticias</u>\n—"
+        return title + "\n—"
     body = "\n\n".join([f"{i}. {anchor(l, t)}" for i,(t,l) in enumerate(news, 1)])
-    return "<u>Top 5 noticias</u>\n" + body
+    return title + "\n" + body
 
 # ------------------------------ Alertas (memoria) --------------------------
 
@@ -544,10 +567,11 @@ def parse_alert_add(args: List[str]) -> Optional[Tuple[str, str, float]]:
     if len(args) != 3: return None
     tipo, op = args[0].lower(), args[1]
     raw = args[2].strip()
-    # soporta "1.500,25" (ES) y "1500.25" (US)
-    s = raw.replace(".", "").replace(",", ".")
-    try: val = float(s)
-    except Exception: return None
+    s = raw.replace(".", "").replace(",", ".")  # 1.500,25 -> 1500.25
+    try:
+        val = float(s)
+    except Exception:
+        return None
     if tipo not in {"blue","mep","ccl","riesgo","inflacion","reservas"}: return None
     if op not in {">","<"}: return None
     return (tipo, op, val)
@@ -778,8 +802,8 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
         iv_str = str(round(iv,1)).replace(".", ",")
         blocks.append(f"<b>📉 Inflación mensual</b>{f'  <i>{ip}</i>' if ip else ''}\n<b>{iv_str}%</b>\n<i>Fuente: ArgentinaDatos</i>")
 
-    if news:
-        blocks.append(format_news_block(news))
+    # SIEMPRE mostrar el bloque de noticias (aunque esté vacío)
+    blocks.append(format_news_block(news or []))
 
     await update.effective_message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
@@ -803,7 +827,7 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif t=="riesgo": val = f"{v:.0f} pb"
             elif t=="reservas": val = f"{fmt_number(v,0)} MUS$"
             else: val = f"{str(round(v,1)).replace('.',',')}%"
-            lines.append(f"• {t.upper()} {op} {val}")
+            lines.append(f"• {t.UPPER()} {op} {val}" if hasattr(str, "UPPER") else f"• {t.upper()} {op} {val}")
         lines.append("\nPara borrar: /alertas_clear [tipo]")
         txt = "\n".join(lines)
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
@@ -879,8 +903,13 @@ async def keepalive_loop(app: Application):
 async def on_startup(app: web.Application):
     await application.initialize()
     await application.start()
-    await application.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=["message"], drop_pending_updates=True)
-    # Nombres cortos del menú (sin paréntesis)
+    # ampliamos allowed_updates por si el usuario ejecuta comandos en canales
+    await application.bot.set_webhook(
+        url=WEBHOOK_URL,
+        allowed_updates=["message","edited_message","channel_post","edited_channel_post","callback_query"],
+        drop_pending_updates=True
+    )
+    # Nombres cortos del menú
     cmds = [
         BotCommand("dolar", "Tipos de cambio"),
         BotCommand("acciones", "Top 3 acciones"),
@@ -926,32 +955,4 @@ def build_web_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", handle_root)
     app.router.add_post(WEBHOOK_PATH, handle_webhook)
-    app.on_startup.append(on_startup)
-    app.on_cleanup.append(on_cleanup)
-    return app
-
-# ------------------------------ PTB App ------------------------------------
-
-defaults = Defaults(parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True), tzinfo=TZ)
-application = Application.builder().token(TELEGRAM_TOKEN).defaults(defaults).updater(None).build()
-
-# Handlers
-application.add_handler(CommandHandler("dolar", cmd_dolar))
-application.add_handler(CommandHandler("acciones", cmd_acciones))
-application.add_handler(CommandHandler("cedears", cmd_cedears))
-application.add_handler(CommandHandler("rankings_acciones", cmd_rankings_acciones))
-application.add_handler(CommandHandler("rankings_cedears", cmd_rankings_cedears))
-application.add_handler(CommandHandler("reservas", cmd_reservas))
-application.add_handler(CommandHandler("inflacion", cmd_inflacion))
-application.add_handler(CommandHandler("riesgo", cmd_riesgo))
-application.add_handler(CommandHandler("resumen_diario", cmd_resumen_diario))
-application.add_handler(CommandHandler("alertas", cmd_alertas_list))
-application.add_handler(CommandHandler("alertas_add", cmd_alertas_add))
-application.add_handler(CommandHandler("alertas_clear", cmd_alertas_clear))
-
-# ------------------------------ Main ---------------------------------------
-
-if __name__ == "__main__":
-    log.info("Iniciando bot Económico AR (Render webhook)")
-    app = build_web_app()
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    app.on_start
