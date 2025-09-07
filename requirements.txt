@@ -1,5 +1,5 @@
 python-telegram-bot[job-queue,webhooks]==20.8
 httpx==0.26.*
+aiohttp>=3.9,<4
 certifi
 tzdata
-
