@@ -23,7 +23,7 @@ import asyncio
 import logging
 import re
 from time import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -57,7 +57,10 @@ ARG_DATOS_BASES = [
 LAMACRO_RESERVAS_URL = "https://www.lamacro.ar/variables/1"
 
 # Yahoo Finance v8 chart
-YF_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+YF_URLS = [
+    "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+    "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}",  # fallback
+]
 YF_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # Noticias (RSS)
@@ -78,14 +81,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("bot-econ-ar")
 
 # ------------------------------ Utils --------------------------------------
-
-def now_ar() -> datetime:
-    return datetime.now(TZ)
-
-def fmt_dt(dt: Optional[datetime] = None) -> str:
-    if dt is None:
-        dt = now_ar()
-    return dt.strftime("%d/%m/%Y %H:%M")
 
 def fmt_number(n: Optional[float], nd=2) -> str:
     try:
@@ -113,6 +108,16 @@ def fmt_periodo(fecha: Optional[str]) -> Optional[str]:
     if not fecha or len(fecha) < 7: return None
     y = fecha[0:4]; m = fecha[5:7]
     return f"{MES_ES.get(m, m)}-{y}"
+
+def fmt_fecha_ddmmyyyy(s: Optional[str]) -> Optional[str]:
+    """Intenta formatear YYYY-MM-DD -> dd/mm/YYYY; si no, devuelve s tal cual."""
+    if not s: return None
+    try:
+        if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+            return datetime.strptime(s[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+    except Exception:
+        pass
+    return s
 
 # ------------------------------ HTTP helpers --------------------------------
 
@@ -178,16 +183,17 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
         "tarjeta": "/dolares/tarjeta",
         "cripto": "/ambito/dolares/cripto",
     }
+    # Nota: decidimos no mostrar fecha en /dolar para evitar mezclar fuentes con timestamps distintos.
     for k, path in mapping.items():
         if k not in data or (data[k].get("compra") is None and data[k].get("venta") is None):
-            c,v,fecha = await dolarapi(path)
+            c,v,_fecha = await dolarapi(path)
             if c is not None or v is not None:
-                data[k] = {"compra": c, "venta": v, "fuente": "DolarAPI", "fecha": fecha}
+                data[k] = {"compra": c, "venta": v, "fuente": "DolarAPI"}
     return data
 
 # ------------------------------ ArgentinaDatos -----------------------------
 
-async def arg_datos_get(session: ClientSession, suffix: str) -> Optional[Dict[str, Any]]:
+async def arg_datos_get(session: ClientSession, suffix: str) -> Optional[Any]:
     for base in ARG_DATOS_BASES:
         for u in (f"{base}{suffix}", f"{base}{suffix}/"):
             j = await fetch_json(session, u)
@@ -195,7 +201,7 @@ async def arg_datos_get(session: ClientSession, suffix: str) -> Optional[Dict[st
     return None
 
 async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str]]]:
-    """Devuelve (valor_pb, fecha 'YYYY-MM-DD' o similar)."""
+    """Devuelve (valor_pb, fecha)"""
     j = await arg_datos_get(session, "/riesgo-pais/ultimo")
     if not j:
         j = await arg_datos_get(session, "/riesgo-pais")
@@ -211,11 +217,19 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
     return None
 
 async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
-    """Usa /v1/finanzas/indices/inflacion (lista) y toma el último."""
+    """Prueba múltiples endpoints y formas; devuelve (valor_%, periodo/fecha)."""
+    # 1) lista 'inflacion' (moderna)
     j = await arg_datos_get(session, "/inflacion")
-    # si el doc cambia de path, probar también índice plural (compat)
+    # 2) mensual (legacy)
     if not j:
-        j = await arg_datos_get(session, "/inflacion/mensual")  # compat
+        j = await arg_datos_get(session, "/inflacion/mensual/ultimo")
+    if not j:
+        j = await arg_datos_get(session, "/inflacion/mensual")
+    # 3) catch-all: si trae 'serie'
+    if isinstance(j, dict) and "serie" in j and isinstance(j["serie"], list) and j["serie"]:
+        j = j["serie"]
+
+    # Normalización
     if isinstance(j, list) and j:
         last = j[-1]
         val = last.get("valor")
@@ -236,12 +250,12 @@ async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float,
 # ------------------------------ Reservas (LaMacro) -------------------------
 
 async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
-    """Devuelve (valor_en_MUS$, fecha_str). MUS$ = millones de USD."""
+    """Devuelve (valor_en_MUS$, fecha_str dd/mm/aaaa). MUS$ = millones de USD."""
     html = await fetch_text(session, LAMACRO_RESERVAS_URL)
     if not html: return None
-    # Valor
+    # Valor (acepta "Último dato" o "Valor actual")
     m_val = re.search(r"(?:Último dato|Valor actual)\s*:\s*([0-9\.\,]+)", html)
-    # Fecha: capturá el primer dd/mm/aaaa que aparezca
+    # Fecha (primer dd/mm/aaaa que aparezca)
     m_date = re.search(r"([0-3]\d/[0-1]\d/\d{4})", html)
     fecha = m_date.group(1) if m_date else None
     if m_val:
@@ -252,37 +266,40 @@ async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, 
 
 # ------------------------------ Yahoo retornos (ultra-rápido) --------------
 
-# Caché
-RET_CACHE_1Y: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}  # symbol -> (ts, payload_result)
+RET_CACHE_1Y: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}  # key: f"{host}|{symbol}|{interval}"
 RET_TTL = 600  # 10 minutos
 
 async def _yf_chart_1y(session: ClientSession, symbol: str, interval: str) -> Optional[Dict[str, Any]]:
-    """Trae 1 año de data con interval 1d o 1wk (según parámetro)."""
-    now_ts = time()
-    cache_key = f"{symbol}|{interval}"
-    ts_val = RET_CACHE_1Y.get(cache_key)
-    if ts_val and now_ts - ts_val[0] < RET_TTL:
-        return ts_val[1]
-    params = {"range": "1y", "interval": interval, "events": "div,split"}
-    j = await fetch_json(session, YF_CHART_URL.format(symbol=symbol), headers=YF_HEADERS, params=params)
-    try:
-        res = j.get("chart", {}).get("result", [])[0]
-        RET_CACHE_1Y[cache_key] = (now_ts, res)
-        return res
-    except Exception:
-        RET_CACHE_1Y[cache_key] = (now_ts, None)
-        return None
+    """Intenta query1 y luego query2; cachea resultado."""
+    for base in YF_URLS:
+        host = base.split("/")[2]
+        cache_key = f"{host}|{symbol}|{interval}"
+        now_ts = time()
+        if cache_key in RET_CACHE_1Y:
+            ts, res = RET_CACHE_1Y[cache_key]
+            if now_ts - ts < RET_TTL:
+                return res
+        params = {"range": "1y", "interval": interval, "events": "div,split"}
+        j = await fetch_json(session, base.format(symbol=symbol), headers=YF_HEADERS, params=params)
+        try:
+            res = j.get("chart", {}).get("result", [])[0]
+            RET_CACHE_1Y[cache_key] = (now_ts, res)
+            return res
+        except Exception:
+            RET_CACHE_1Y[cache_key] = (now_ts, None)
+            continue
+    return None
 
 def _returns_from_1y(res: Dict[str, Any]) -> Optional[Tuple[float, float, float]]:
     """Calcula 6m/3m/1m a partir de la serie 1y."""
     try:
         ts = res["timestamp"]
         closes = res["indicators"]["adjclose"][0]["adjclose"]
-        # ult valor válido
+        # último valor válido
         idx_last = max(i for i,v in enumerate(closes) if v is not None)
         last = closes[idx_last]
         t_last = ts[idx_last]
-        # límites de tiempo
+        # límites
         t6 = t_last - 180*24*3600
         t3 = t_last - 90*24*3600
         t1 = t_last - 30*24*3600
@@ -292,7 +309,7 @@ def _returns_from_1y(res: Dict[str, Any]) -> Optional[Tuple[float, float, float]
                     continue
                 if t >= tcut:
                     return closes[i]
-            # si no hay, usar primer válido
+            # fallback primer válido
             for i, v in enumerate(closes):
                 if v is not None: return v
             return None
@@ -307,24 +324,19 @@ def _returns_from_1y(res: Dict[str, Any]) -> Optional[Tuple[float, float, float]
 
 async def yf_returns_6_3_1(session: ClientSession, symbol: str) -> Dict[str, Optional[float]]:
     """1 llamada por símbolo (1y). Fallback a semanal si hace falta."""
-    res = await _yf_chart_1y(session, symbol, "1d")
     out = {"6m": None, "3m": None, "1m": None}
-    if res:
-        trio = _returns_from_1y(res)
-        if trio:
-            out["6m"], out["3m"], out["1m"] = trio
-            return out
-    # fallback semanal
-    res = await _yf_chart_1y(session, symbol, "1wk")
-    if res:
-        trio = _returns_from_1y(res)
-        if trio:
-            out["6m"], out["3m"], out["1m"] = trio
+    for interval in ("1d", "1wk"):
+        res = await _yf_chart_1y(session, symbol, interval)
+        if res:
+            trio = _returns_from_1y(res)
+            if trio:
+                out["6m"], out["3m"], out["1m"] = trio
+                break
     return out
 
 async def returns_for_symbols(session: ClientSession, symbols: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
     out = {s: {"6m": None, "3m": None, "1m": None} for s in symbols}
-    sem = asyncio.Semaphore(5)  # cuidadoso con 429
+    sem = asyncio.Semaphore(6)  # cuidadoso con 429
     async def work(sym: str):
         async with sem:
             out[sym] = await yf_returns_6_3_1(session, sym)
@@ -354,6 +366,24 @@ def rank_projection(retmap: Dict[str, Dict[str, Optional[float]]], n=5) -> List[
 
 from xml.etree import ElementTree
 
+KEYWORDS = [
+    "inflación","ipc","índice de precios","devalu", "dólar", "ccl", "mep", "blue",
+    "bcra","reservas","tasas","lebac","pases","fmi","deuda","riesgo país",
+    "cepo","importaciones","exportaciones","merval","acciones","bonos","brecha","costo de vida"
+]
+
+def _score_title(title: str) -> int:
+    t = title.lower()
+    score = 0
+    for kw in KEYWORDS:
+        if kw in t:
+            score += 3
+    # pesos extra por palabras fuertes
+    for kw in ("sube", "baja", "récord", "acelera", "cae", "acuerdo", "medida", "ley", "resolución", "emergencia"):
+        if kw in t:
+            score += 1
+    return score
+
 async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tuple[str, str]]:
     entries = []
     for url in RSS_FEEDS:
@@ -368,11 +398,13 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
                 if t and l: entries.append((t, l))
         except Exception as e:
             log.warning("RSS parse %s: %s", url, e)
-    seen, uniq = set(), []
-    for t,l in entries:
-        if l not in seen:
-            uniq.append((t,l)); seen.add(l)
-    return uniq[:limit]
+    # dedup y ranking por score
+    uniq_map = {}
+    for t, l in entries:
+        if l not in uniq_map:
+            uniq_map[l] = t
+    scored = sorted([(t,l,_score_title(t)) for l,t in uniq_map.items()], key=lambda x: x[2], reverse=True)
+    return [(t,l) for (t,l,_) in scored[:limit]]
 
 # ------------------------------ Alertas ------------------------------------
 
@@ -418,7 +450,7 @@ async def alerts_loop(app: Application):
                         ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
                         if ok: trig.append((r["type"], r["op"], r["value"], cur))
                     if trig:
-                        lines = [f"<b>🔔 Alertas</b>  <i>{fmt_dt()}</i>"]
+                        lines = [f"<b>🔔 Alertas</b>"]
                         for t,op,v,cur in trig:
                             if t in {"blue","mep","ccl"}:
                                 lines.append(f"{t.upper()}: {fmt_money_ars(cur)} ({op} {fmt_money_ars(v)})")
@@ -440,7 +472,7 @@ async def alerts_loop(app: Application):
 # ------------------------------ Formatos -----------------------------------
 
 def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
-    lines = [f"<b>💵 Dólar (AR)</b>  <i>{fmt_dt()}</i>"]
+    lines = [f"<b>💵 Dólar (AR)</b>"]  # SIN hora
     order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
     for k, label in order:
         row = d.get(k)
@@ -478,16 +510,15 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _top_blocks_for(symbols: List[str], title: str) -> str:
     async with ClientSession() as session:
-        # timeout corto para evitar “no muestra”
         try:
-            rets = await asyncio.wait_for(returns_for_symbols(session, symbols), timeout=10)
+            rets = await asyncio.wait_for(returns_for_symbols(session, symbols), timeout=20)
         except asyncio.TimeoutError:
             rets = {s: {"6m": None, "3m": None, "1m": None} for s in symbols}
     top6 = top_n_by_window(rets, "6m", 3)
     top3 = top_n_by_window(rets, "3m", 3)
     top1 = top_n_by_window(rets, "1m", 3)
     return "\n".join([
-        f"<b>{title}</b>  <i>{fmt_dt()}</i>",
+        f"<b>{title}</b>",
         format_top_block("Mejores 6M (Top 3)", top6),
         format_top_block("Mejores 3M (Top 3)", top3),
         format_top_block("Mejores 1M (Top 3)", top1),
@@ -505,12 +536,12 @@ async def cmd_rankings(update: Update, context: ContextTypes.DEFAULT_TYPE):
             acc, ced = await asyncio.wait_for(asyncio.gather(
                 returns_for_symbols(session, ACCIONES_BA),
                 returns_for_symbols(session, CEDEARS_BA)
-            ), timeout=12)
+            ), timeout=25)
         except asyncio.TimeoutError:
             acc, ced = {}, {}
     acc_top = rank_projection(acc, 5) if acc else []
     ced_top = rank_projection(ced, 5) if ced else []
-    lines = [f"<b>🏁 Rankings (proyección ~ momentum 6m)</b>  <i>{fmt_dt()}</i>"]
+    lines = [f"<b>🏁 Rankings (proyección ~ momentum 6m)</b>"]
     lines.append(format_proj_block("Acciones – Top 5", acc_top))
     lines.append(format_proj_block("CEDEARs – Top 5", ced_top))
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
@@ -518,21 +549,21 @@ async def cmd_rankings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_rankings_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         try:
-            acc = await asyncio.wait_for(returns_for_symbols(session, ACCIONES_BA), timeout=10)
+            acc = await asyncio.wait_for(returns_for_symbols(session, ACCIONES_BA), timeout=20)
         except asyncio.TimeoutError:
             acc = {}
     acc_top = rank_projection(acc, 5) if acc else []
-    lines = [f"<b>🏁 Acciones – Rankings</b>  <i>{fmt_dt()}</i>", format_proj_block("Top 5", acc_top)]
+    lines = [f"<b>🏁 Acciones – Rankings</b>", format_proj_block("Top 5", acc_top)]
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_rankings_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         try:
-            ced = await asyncio.wait_for(returns_for_symbols(session, CEDEARS_BA), timeout=10)
+            ced = await asyncio.wait_for(returns_for_symbols(session, CEDEARS_BA), timeout=20)
         except asyncio.TimeoutError:
             ced = {}
     ced_top = rank_projection(ced, 5) if ced else []
-    lines = [f"<b>🏁 CEDEARs – Rankings</b>  <i>{fmt_dt()}</i>", format_proj_block("Top 5", ced_top)]
+    lines = [f"<b>🏁 CEDEARs – Rankings</b>", format_proj_block("Top 5", ced_top)]
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -563,14 +594,7 @@ async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = "No pude obtener riesgo país ahora."
     else:
         rp, f = tup
-        f_str = None
-        if f and len(f) >= 10 and f[4] == "-" and f[7] == "-":
-            try:
-                f_str = datetime.strptime(f[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
-            except Exception:
-                f_str = f
-        else:
-            f_str = f
+        f_str = fmt_fecha_ddmmyyyy(f)
         txt = f"<b>📈 Riesgo país</b>{f'  <i>{f_str}</i>' if f_str else ''}\n<b>{rp} pb</b>"
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
@@ -582,19 +606,14 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
         inflac_t  = await get_inflacion_mensual(session) # (valor, periodo)
         news      = await fetch_rss_entries(session, limit=5)
 
-    blocks = [f"<b>🗞️ Resumen diario</b>  <i>{fmt_dt()}</i>"]
+    blocks = [f"<b>🗞️ Resumen diario</b>"]  # SIN hora
 
     if dolares:
         blocks.append(format_dolar_message(dolares))
 
     if riesgo_t:
         rp, f = riesgo_t
-        f_str = None
-        if f and len(f) >= 10 and f[4] == "-" and f[7] == "-":
-            try: f_str = datetime.strptime(f[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
-            except Exception: f_str = f
-        else:
-            f_str = f
+        f_str = fmt_fecha_ddmmyyyy(f)
         blocks.append(f"<b>📈 Riesgo país</b>{f'  <i>{f_str}</i>' if f_str else ''}\n<b>{rp} pb</b>")
     else:
         blocks.append("<b>📈 Riesgo país</b>\n—")
@@ -620,6 +639,8 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.effective_message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 # ---------- Alert commands ----------
+
+ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 
 async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -724,7 +745,7 @@ def build_web_app() -> web.Application:
 defaults = Defaults(parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True), tzinfo=TZ)
 application = Application.builder().token(TELEGRAM_TOKEN).defaults(defaults).updater(None).build()
 
-# Handlers (¡sin /start!)
+# Handlers (sin /start)
 application.add_handler(CommandHandler("dolar", cmd_dolar))
 application.add_handler(CommandHandler("acciones", cmd_acciones))
 application.add_handler(CommandHandler("cedears", cmd_cedears))
