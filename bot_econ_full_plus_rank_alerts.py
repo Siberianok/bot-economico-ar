@@ -99,9 +99,6 @@ def pct(n: Optional[float], nd: int = 2) -> str:
     except Exception:
         return "—"
 
-def anchor(href: str, text: str) -> str:
-    return f'<a href="{href}">{text}</a>'
-
 def fmt_fecha_ddmmyyyy_from_iso(s: Optional[str]) -> Optional[str]:
     if not s: return None
     try:
@@ -128,7 +125,7 @@ def parse_period_to_ddmmyyyy(per: Optional[str]) -> Optional[str]:
         return fmt_fecha_ddmmyyyy_from_iso(per)
     if re.match(r"^\d{4}-\d{2}$", per):
         return last_day_of_month_str(per)
-    return per  # última chance: ya viene en dd/mm/aaaa o texto legible
+    return per
 
 # ------------------------------ HTTP helpers --------------------------------
 
@@ -174,7 +171,7 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
             if c is not None or v is not None:
                 data[k] = {"compra": c, "venta": v, "fuente": "CriptoYa"}
 
-    # DolarAPI (completa fechas)
+    # DolarAPI (para fechas)
     async def dolarapi(path: str):
         j = await fetch_json(session, f"{DOLARAPI_BASE}{path}")
         if not j: return (None, None, None)
@@ -239,7 +236,6 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
     return None
 
 async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
-    """Devuelve (valor %, fecha dd/mm/aaaa)."""
     j = await arg_datos_get(session, "/inflacion")
     if not j: j = await arg_datos_get(session, "/inflacion/mensual/ultimo")
     if not j: j = await arg_datos_get(session, "/inflacion/mensual")
@@ -264,7 +260,6 @@ async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float,
 # ------------------------------ Reservas (LaMacro) -------------------------
 
 async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
-    """Devuelve (valor_en_MUS$, fecha_str dd/mm/aaaa). MUS$ = millones de USD."""
     html = await fetch_text(session, LAMACRO_RESERVAS_URL)
     if not html: return None
     m_val = re.search(r"(?:Último dato|Valor actual)\s*:\s*([0-9\.\,]+)", html)
@@ -359,13 +354,19 @@ def top_n_by_window(retmap: Dict[str, Dict[str, Optional[float]]], window: str, 
     pairs.sort(key=lambda x: x[1], reverse=True)
     return pairs[:n]
 
+def composite_score(d: Dict[str, Optional[float]]) -> float:
+    w6, w3, w1 = 0.6, 0.3, 0.1
+    r6 = d.get("6m"); r3 = d.get("3m"); r1 = d.get("1m")
+    # Si falta algún retorno, se considera muy bajo para no favorecerlo
+    s = 0.0
+    s += (r6 if r6 is not None else -1e6) * w6
+    s += (r3 if r3 is not None else -1e6) * w3
+    s += (r1 if r1 is not None else -1e6) * w1
+    return s
+
 def rank_projection(retmap: Dict[str, Dict[str, Optional[float]]], n=5) -> List[Tuple[str, float, float, float]]:
     syms = list(retmap.keys())
-    syms.sort(key=lambda s: (
-        -(retmap[s]["6m"] if retmap[s]["6m"] is not None else -1e9),
-        -(retmap[s]["3m"] if retmap[s]["3m"] is not None else -1e9),
-        -(retmap[s]["1m"] if retmap[s]["1m"] is not None else -1e9),
-    ))
+    syms.sort(key=lambda s: -composite_score(retmap[s]))
     out = []
     for s in syms:
         if retmap[s]["6m"] is None: continue
@@ -419,7 +420,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
 def format_news_block(news: List[Tuple[str, str]]) -> str:
     if not news:
         return "<u>Top 5 noticias</u>\n—"
-    body = "\n\n".join([f"{i}. {anchor(l, t)}" for i,(t,l) in enumerate(news, 1)])
+    body = "\n\n".join([f"{i}. <a href=\"{l}\">{t}</a>" for i,(t,l) in enumerate(news, 1)])
     return "<u>Top 5 noticias</u>\n" + body
 
 # ------------------------------ Alertas ------------------------------------
@@ -502,32 +503,27 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
         rows.append(f"<pre>{l}</pre>")
     return "\n".join([lines[0], lines[1]] + rows)
 
-def format_top3_columns(title: str, fecha: Optional[str],
-                        top1m: List[Tuple[str, float]], top3m: List[Tuple[str, float]], top6m: List[Tuple[str, float]]) -> str:
-    # Armamos tabla con filas = ranking (1..3) y columnas = 1M | 3M | 6M
+def format_subset_table(title: str, fecha: Optional[str],
+                        symbols: List[str],
+                        retmap: Dict[str, Dict[str, Optional[float]]]) -> str:
     head = f"<b>{title}</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
-    lines = [head, "<pre>Rank       1M                 3M                 6M</pre>"]
-    def cell(item: Optional[Tuple[str,float]]) -> str:
-        if not item: return "—"
-        sym, val = item
-        return f"{sym} {pct(val,2)}"
-    # completar a 3
-    top1m = top1m + [None]*(3-len(top1m))
-    top3m = top3m + [None]*(3-len(top3m))
-    top6m = top6m + [None]*(3-len(top6m))
+    lines = [head, "<pre>Rank  Ticker         1M         3M         6M</pre>"]
     rows = []
-    for i in range(3):
-        c1 = f"{cell(top1m[i]):<18}"
-        c2 = f"{cell(top3m[i]):<18}"
-        c3 = f"{cell(top6m[i]):<18}"
-        l = f"{i+1:<4}   {c1}   {c2}   {c3}"
+    for idx, sym in enumerate(symbols[:3], start=1):
+        d = retmap.get(sym, {})
+        p1 = pct(d.get("1m"), 2) if d.get("1m") is not None else "—"
+        p3 = pct(d.get("3m"), 2) if d.get("3m") is not None else "—"
+        p6 = pct(d.get("6m"), 2) if d.get("6m") is not None else "—"
+        l = f"{idx:<4} {sym:<12}{p1:>10}{p3:>11}{p6:>11}"
         rows.append(f"<pre>{l}</pre>")
+    if not rows:
+        rows.append("<pre>—</pre>")
     return "\n".join([lines[0], lines[1]] + rows)
 
 def format_ranking_table(title: str, fecha: Optional[str], rows: List[Tuple[str, float, float, float]]) -> str:
-    # Tabla de 5 filas (Top 5 por 6M), columnas 1M/3M/6M
     head = f"<b>{title}</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
-    lines = [head, "<pre>Rank  Ticker         1M         3M         6M</pre>"]
+    sub  = "<i>Ordenado por momentum (0,6·6M + 0,3·3M + 0,1·1M)</i>"
+    lines = [head, sub, "<pre>Rank  Ticker         1M         3M         6M</pre>"]
     out_rows = []
     if not rows:
         out_rows.append("<pre>—</pre>")
@@ -538,7 +534,7 @@ def format_ranking_table(title: str, fecha: Optional[str], rows: List[Tuple[str,
             p6 = pct(r6,2) if r6 is not None else "—"
             l = f"{idx:<4} {sym:<12}{p1:>10}{p3:>11}{p6:>11}"
             out_rows.append(f"<pre>{l}</pre>")
-    return "\n".join([lines[0], lines[1]] + out_rows)
+    return "\n".join(lines + out_rows)
 
 # ------------------------------ Handlers -----------------------------------
 
@@ -555,11 +551,15 @@ async def cmd_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.TimeoutError:
             rets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in ACCIONES_BA}, None)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-    t1 = top_n_by_window(rets, "1m", 3)
-    t3 = top_n_by_window(rets, "3m", 3)
-    t6 = top_n_by_window(rets, "6m", 3)
-    msg = format_top3_columns("📈 Acciones BYMA (.BA)", fecha, t1, t3, t6)
-    await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    t1 = [sym for sym,_ in top_n_by_window(rets, "1m", 3)]
+    t3 = [sym for sym,_ in top_n_by_window(rets, "3m", 3)]
+    t6 = [sym for sym,_ in top_n_by_window(rets, "6m", 3)]
+    blocks = [
+        format_subset_table("📈 Acciones Top 1M (Top 3)", fecha, t1, rets),
+        format_subset_table("📈 Acciones Top 3M (Top 3)", fecha, t3, rets),
+        format_subset_table("📈 Acciones Top 6M (Top 3)", fecha, t6, rets),
+    ]
+    await update.effective_message.reply_text("\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
@@ -568,11 +568,15 @@ async def cmd_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.TimeoutError:
             rets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in CEDEARS_BA}, None)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-    t1 = top_n_by_window(rets, "1m", 3)
-    t3 = top_n_by_window(rets, "3m", 3)
-    t6 = top_n_by_window(rets, "6m", 3)
-    msg = format_top3_columns("🌎 CEDEARs (.BA)", fecha, t1, t3, t6)
-    await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    t1 = [sym for sym,_ in top_n_by_window(rets, "1m", 3)]
+    t3 = [sym for sym,_ in top_n_by_window(rets, "3m", 3)]
+    t6 = [sym for sym,_ in top_n_by_window(rets, "6m", 3)]
+    blocks = [
+        format_subset_table("🌎 CEDEARs Top 1M (Top 3)", fecha, t1, rets),
+        format_subset_table("🌎 CEDEARs Top 3M (Top 3)", fecha, t3, rets),
+        format_subset_table("🌎 CEDEARs Top 6M (Top 3)", fecha, t6, rets),
+    ]
+    await update.effective_message.reply_text("\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_rankings_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
@@ -582,8 +586,7 @@ async def cmd_rankings_acciones(update: Update, context: ContextTypes.DEFAULT_TY
             acc, acc_ts = {}, None
     fecha = datetime.fromtimestamp(acc_ts, TZ).strftime("%d/%m/%Y") if acc_ts else None
     acc_top = rank_projection(acc, 5) if acc else []
-    head = "🏁 Acciones – Top 5 (base 6M)"
-    msg = format_ranking_table(head, fecha, acc_top)
+    msg = format_ranking_table("🏁 Acciones – Top 5 (proyección compuesta)", fecha, acc_top)
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_rankings_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -594,8 +597,7 @@ async def cmd_rankings_cedears(update: Update, context: ContextTypes.DEFAULT_TYP
             ced, ced_ts = {}, None
     fecha = datetime.fromtimestamp(ced_ts, TZ).strftime("%d/%m/%Y") if ced_ts else None
     ced_top = rank_projection(ced, 5) if ced else []
-    head = "🏁 CEDEARs – Top 5 (base 6M)"
-    msg = format_ranking_table(head, fecha, ced_top)
+    msg = format_ranking_table("🏁 CEDEARs – Top 5 (proyección compuesta)", fecha, ced_top)
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -738,13 +740,12 @@ async def on_startup(app: web.Application):
     await application.initialize()
     await application.start()
     await application.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=["message"], drop_pending_updates=True)
-    # Menú (sin /start ni /rankings combinado)
     cmds = [
         BotCommand("dolar", "Tipos de cambio (compra/venta + fecha)"),
-        BotCommand("acciones", "Top 3 por columna 1M/3M/6M"),
-        BotCommand("cedears", "Top 3 por columna 1M/3M/6M"),
-        BotCommand("rankings_acciones", "Top 5 acciones (tabla)"),
-        BotCommand("rankings_cedears", "Top 5 CEDEARs (tabla)"),
+        BotCommand("acciones", "Top 1M/3M/6M (tablas)"),
+        BotCommand("cedears", "Top 1M/3M/6M (tablas)"),
+        BotCommand("rankings_acciones", "Top 5 acciones (proyección)"),
+        BotCommand("rankings_cedears", "Top 5 CEDEARs (proyección)"),
         BotCommand("reservas", "Reservas BCRA (con fecha)"),
         BotCommand("inflacion", "Inflación mensual (con fecha)"),
         BotCommand("riesgo", "Riesgo país (con fecha)"),
