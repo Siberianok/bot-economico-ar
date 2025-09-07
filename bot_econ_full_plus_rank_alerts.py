@@ -326,7 +326,7 @@ def _stddev(x: List[float]) -> Optional[float]:
     var = sum((xi-mu)**2 for xi in x)/(n-1)
     return sqrt(var)
 
-def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[float]]]]:
+def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[float]]]:
     try:
         ts = res["timestamp"]
         closes_raw = res["indicators"]["adjclose"][0]["adjclose"]
