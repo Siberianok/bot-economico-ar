@@ -6,7 +6,7 @@
 # - Webhook en "/<WEBHOOK_SECRET>" (POST)
 # - Comandos:
 #   /dolar /acciones /cedears
-#   /rankings /rankings_acciones /rankings_cedears
+#   /rankings_acciones /rankings_cedears
 #   /reservas /inflacion /riesgo /resumen_diario
 #   /alertas /alertas_add /alertas_clear
 #
@@ -101,8 +101,6 @@ def pct(n: Optional[float], nd: int = 2) -> str:
 
 def anchor(href: str, text: str) -> str:
     return f'<a href="{href}">{text}</a>'
-
-MES_ES = {"01":"ene","02":"feb","03":"mar","04":"abr","05":"may","06":"jun","07":"jul","08":"ago","09":"sep","10":"oct","11":"nov","12":"dic"}
 
 def fmt_fecha_ddmmyyyy_from_iso(s: Optional[str]) -> Optional[str]:
     if not s: return None
@@ -199,11 +197,10 @@ def extract_latest_dolar_date(d: Dict[str, Dict[str, Any]]) -> Optional[str]:
     dates = []
     for row in d.values():
         f = row.get("fecha")
-        if f: 
+        if f:
             dd = fmt_fecha_ddmmyyyy_from_iso(f)
             if dd: dates.append(dd)
     if not dates: return None
-    # devolver la más reciente por orden cronológico (parseo dd/mm/yyyy)
     try:
         dates_sorted = sorted(dates, key=lambda s: datetime.strptime(s, "%d/%m/%Y"))
         return dates_sorted[-1]
@@ -236,14 +233,11 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
 
 async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
     """Devuelve (valor %, fecha dd/mm/aaaa). Usa varios endpoints por compat."""
-    # 1) moderna
     j = await arg_datos_get(session, "/inflacion")
-    # 2) legacy
     if not j:
         j = await arg_datos_get(session, "/inflacion/mensual/ultimo")
     if not j:
         j = await arg_datos_get(session, "/inflacion/mensual")
-    # 3) 'serie'
     if isinstance(j, dict) and "serie" in j and isinstance(j["serie"], list) and j["serie"]:
         j = j["serie"]
 
@@ -257,9 +251,7 @@ async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float,
 
     if val is None: return None
 
-    # fecha: si viene YYYY-MM => convertir a último día del mes; si viene YYYY-MM-DD => dd/mm/yyyy
-    if per and len(per) >= 7 and per[4] == "-" and per[7-1] == "-":
-        # YYYY-MM
+    if per and len(per) >= 7 and per[4] == "-" and per[6] == "-":
         fecha = last_day_of_month_str(per[:7])
     else:
         fecha = fmt_fecha_ddmmyyyy_from_iso(per)
@@ -284,7 +276,7 @@ async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, 
         except Exception: return None
     return None
 
-# ------------------------------ Yahoo retornos (c/ fecha) ------------------
+# ------------------------------ Yahoo retornos (con fecha) -----------------
 
 RET_CACHE_1Y: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}  # key: f"{host}|{symbol}|{interval}"
 RET_TTL = 600  # 10 minutos
@@ -355,18 +347,12 @@ async def returns_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
         async with sem:
             out[sym] = await yf_returns_6_3_1(session, sym)
     await asyncio.gather(*(work(s) for s in symbols))
-    # última fecha global (máxima)
     last_ts = None
     for d in out.values():
         ts = d.get("last_ts")
         if ts:
             last_ts = ts if last_ts is None else max(last_ts, ts)
     return out, last_ts
-
-def top_n_by_window(retmap: Dict[str, Dict[str, Optional[float]]], window: str, n=3) -> List[Tuple[str, float]]:
-    pairs = [(sym, float(v)) for sym,d in retmap.items() if (v:=d.get(window)) is not None]
-    pairs.sort(key=lambda x: x[1], reverse=True)
-    return pairs[:n]
 
 def rank_projection(retmap: Dict[str, Dict[str, Optional[float]]], n=5) -> List[Tuple[str, float, float, float]]:
     syms = list(retmap.keys())
@@ -424,6 +410,12 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             uniq[l] = t
     scored = sorted([(t,l,_score_title(t)) for l,t in uniq.items()], key=lambda x: x[2], reverse=True)
     return [(t,l) for (t,l,_) in scored[:limit]]
+
+def format_news_block(news: List[Tuple[str, str]]) -> str:
+    if not news:
+        return "<u>Top 5 noticias</u>\n—"
+    body = "\n\n".join([f"{i}. {anchor(l, t)}" for i,(t,l) in enumerate(news, 1)])
+    return "<u>Top 5 noticias</u>\n" + body
 
 # ------------------------------ Alertas ------------------------------------
 
@@ -493,7 +485,6 @@ async def alerts_loop(app: Application):
 def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
     fecha = extract_latest_dolar_date(d)
     header = "<b>💵 Dólar (AR)</b>" + (f"  <i>Actualizado: {fecha}</i>" if fecha else "")
-    # columnas monoespaciadas
     lines = [header, "<pre>Tipo        Compra         Venta</pre>"]
     rows = []
     order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
@@ -502,19 +493,22 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
         if not row: continue
         compra = fmt_money_ars(row.get("compra")) if row.get("compra") is not None else "—"
         venta  = fmt_money_ars(row.get("venta"))  if row.get("venta")  is not None else "—"
-        # armo línea en monospace
         l = f"{label:<11}{compra:>12}    {venta:>12}"
         rows.append(f"<pre>{l}</pre>")
     return "\n".join([lines[0], lines[1]] + rows)
 
-def format_top_block(title: str, items: List[Tuple[str, float]]) -> str:
-    lines = [f"<u>{title}</u>"]
-    if not items:
-        lines.append("—")
-        return "\n".join(lines)
-    for sym, val in items:
-        lines.append(f"• {anchor(f'https://finance.yahoo.com/quote/{sym}', sym)} {pct(val, 2)}")
-    return "\n".join(lines)
+def format_returns_table(title: str, symbols: List[str], retmap: Dict[str, Dict[str, Optional[float]]], fecha: Optional[str]) -> str:
+    head = f"<b>{title}</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
+    lines = [head, "<pre>Ticker         1M         3M         6M</pre>"]
+    rows = []
+    for sym in symbols:
+        d = retmap.get(sym, {})
+        p1 = pct(d.get("1m"), 2) if d.get("1m") is not None else "—"
+        p3 = pct(d.get("3m"), 2) if d.get("3m") is not None else "—"
+        p6 = pct(d.get("6m"), 2) if d.get("6m") is not None else "—"
+        l = f"{sym:<12}{p1:>10}{p3:>11}{p6:>11}"
+        rows.append(f"<pre>{l}</pre>")
+    return "\n".join([lines[0], lines[1]] + rows)
 
 def format_proj_block(title: str, rows: List[Tuple[str, float, float, float]]) -> str:
     lines = [f"<u>{title}</u>"]
@@ -533,48 +527,25 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = format_dolar_message(data) if data else "No pude obtener cotizaciones ahora."
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
-async def _top_blocks_for(symbols: List[str], title: str) -> str:
+async def cmd_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         try:
-            rets, last_ts = await asyncio.wait_for(returns_for_symbols(session, symbols), timeout=20)
+            rets, last_ts = await asyncio.wait_for(returns_for_symbols(session, ACCIONES_BA), timeout=20)
         except asyncio.TimeoutError:
-            rets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in symbols}, None)
+            rets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in ACCIONES_BA}, None)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-    top6 = top_n_by_window(rets, "6m", 3)
-    top3 = top_n_by_window(rets, "3m", 3)
-    top1 = top_n_by_window(rets, "1m", 3)
-    head = f"<b>{title}</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
-    return "\n".join([
-        head,
-        format_top_block("Mejores 6M (Top 3)", top6),
-        format_top_block("Mejores 3M (Top 3)", top3),
-        format_top_block("Mejores 1M (Top 3)", top1),
-    ])
-
-async def cmd_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(await _top_blocks_for(ACCIONES_BA, "📈 Acciones BYMA (.BA)"), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    msg = format_returns_table("📈 Acciones BYMA (.BA)", ACCIONES_BA, rets, fecha)
+    await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(await _top_blocks_for(CEDEARS_BA, "🌎 CEDEARs (.BA)"), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-
-async def cmd_rankings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         try:
-            (acc, acc_ts), (ced, ced_ts) = await asyncio.wait_for(asyncio.gather(
-                returns_for_symbols(session, ACCIONES_BA),
-                returns_for_symbols(session, CEDEARS_BA)
-            ), timeout=25)
+            rets, last_ts = await asyncio.wait_for(returns_for_symbols(session, CEDEARS_BA), timeout=20)
         except asyncio.TimeoutError:
-            acc, ced, acc_ts, ced_ts = {}, {}, None, None
-    fecha_ts = None
-    for ts in (acc_ts, ced_ts):
-        if ts: fecha_ts = ts if fecha_ts is None else max(fecha_ts, ts)
-    fecha = datetime.fromtimestamp(fecha_ts, TZ).strftime("%d/%m/%Y") if fecha_ts else None
-    acc_top = rank_projection(acc, 5) if acc else []
-    ced_top = rank_projection(ced, 5) if ced else []
-    head = f"<b>🏁 Rankings (proyección ~ momentum 6m)</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
-    lines = [head, format_proj_block("Acciones – Top 5", acc_top), format_proj_block("CEDEARs – Top 5", ced_top)]
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+            rets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in CEDEARS_BA}, None)
+    fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
+    msg = format_returns_table("🌎 CEDEARs (.BA)", CEDEARS_BA, rets, fecha)
+    await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_rankings_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
@@ -584,7 +555,7 @@ async def cmd_rankings_acciones(update: Update, context: ContextTypes.DEFAULT_TY
             acc, acc_ts = {}, None
     fecha = datetime.fromtimestamp(acc_ts, TZ).strftime("%d/%m/%Y") if acc_ts else None
     acc_top = rank_projection(acc, 5) if acc else []
-    head = f"<b>🏁 Acciones – Rankings</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
+    head = f"<b>🏁 Acciones – Top 5 (proyección ~ momentum 6m)</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
     lines = [head, format_proj_block("Top 5", acc_top)]
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
@@ -596,7 +567,7 @@ async def cmd_rankings_cedears(update: Update, context: ContextTypes.DEFAULT_TYP
             ced, ced_ts = {}, None
     fecha = datetime.fromtimestamp(ced_ts, TZ).strftime("%d/%m/%Y") if ced_ts else None
     ced_top = rank_projection(ced, 5) if ced else []
-    head = f"<b>🏁 CEDEARs – Rankings</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
+    head = f"<b>🏁 CEDEARs – Top 5 (proyección ~ momentum 6m)</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
     lines = [head, format_proj_block("Top 5", ced_top)]
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
@@ -616,7 +587,7 @@ async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tup is None:
         txt = "No pude obtener inflación ahora."
     else:
-        val, fecha = tup  # fecha ya en dd/mm/aaaa
+        val, fecha = tup  # fecha dd/mm/aaaa
         val_str = str(round(val, 1)).replace(".", ",")
         txt = f"<b>📉 Inflación mensual</b>{f'  <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>"
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
@@ -635,9 +606,9 @@ async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         dolares = await get_dolares(session)
-        riesgo_t  = await get_riesgo_pais(session)       # (valor, fecha)
-        reservas  = await get_reservas_lamacro(session)  # (valor, fecha dd/mm/aaaa)
-        inflac_t  = await get_inflacion_mensual(session) # (valor, fecha dd/mm/aaaa)
+        riesgo_t  = await get_riesgo_pais(session)
+        reservas  = await get_reservas_lamacro(session)
+        inflac_t  = await get_inflacion_mensual(session)
         news      = await fetch_rss_entries(session, limit=5)
 
     blocks = [f"<b>🗞️ Resumen diario</b>"]  # sin hora
@@ -666,9 +637,7 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
         blocks.append("<b>📉 Inflación mensual</b>\n—")
 
     if news:
-        lines = ["<u>Top 5 noticias</u>"]
-        lines += [f"• {anchor(l, t)}" for t,l in news]
-        blocks.append("\n".join(lines))
+        blocks.append(format_news_block(news))
 
     await update.effective_message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
@@ -690,15 +659,6 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"• {t.upper()} {op} {val}")
         txt = "\n".join(lines)
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-
-def parse_alert_add(args: List[str]) -> Optional[Tuple[str, str, float]]:
-    if len(args) != 3: return None
-    tipo, op = args[0].lower(), args[1]
-    try: val = float(args[2].replace(",", "."))
-    except Exception: return None
-    if tipo not in {"blue","mep","ccl","riesgo","inflacion","reservas"}: return None
-    if op not in {">","<"}: return None
-    return (tipo, op, val)
 
 async def cmd_alertas_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parsed = parse_alert_add(context.args)
@@ -751,12 +711,11 @@ async def on_startup(app: web.Application):
     await application.initialize()
     await application.start()
     await application.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=["message"], drop_pending_updates=True)
-    # Menú de comandos (sin /start)
+    # Menú de comandos (sin /start y sin /rankings combinado)
     cmds = [
         BotCommand("dolar", "Tipos de cambio (compra/venta + fecha)"),
-        BotCommand("acciones", "Top 3 por 6m/3m/1m (con fecha)"),
-        BotCommand("cedears", "Top 3 por 6m/3m/1m (con fecha)"),
-        BotCommand("rankings", "Top 5 acciones y CEDEARs"),
+        BotCommand("acciones", "Tabla 1M/3M/6M (con fecha)"),
+        BotCommand("cedears", "Tabla 1M/3M/6M (con fecha)"),
         BotCommand("rankings_acciones", "Top 5 acciones"),
         BotCommand("rankings_cedears", "Top 5 CEDEARs"),
         BotCommand("reservas", "Reservas BCRA (con fecha)"),
@@ -807,11 +766,10 @@ def build_web_app() -> web.Application:
 defaults = Defaults(parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True), tzinfo=TZ)
 application = Application.builder().token(TELEGRAM_TOKEN).defaults(defaults).updater(None).build()
 
-# Handlers (sin /start)
+# Handlers
 application.add_handler(CommandHandler("dolar", cmd_dolar))
 application.add_handler(CommandHandler("acciones", cmd_acciones))
 application.add_handler(CommandHandler("cedears", cmd_cedears))
-application.add_handler(CommandHandler("rankings", cmd_rankings))
 application.add_handler(CommandHandler("rankings_acciones", cmd_rankings_acciones))
 application.add_handler(CommandHandler("rankings_cedears", cmd_rankings_cedears))
 application.add_handler(CommandHandler("reservas", cmd_reservas))
