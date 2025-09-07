@@ -104,6 +104,19 @@ def pct(n: Optional[float]) -> str:
     except Exception:
         return "—"
 
+def anchor(href: str, text: str) -> str:
+    return f'<a href="{href}">{text}</a>'
+
+# fechas legibles (para inflación/riesgo)
+MES_ES = {"01":"ene","02":"feb","03":"mar","04":"abr","05":"may","06":"jun","07":"jul","08":"ago","09":"sep","10":"oct","11":"nov","12":"dic"}
+def fmt_periodo(fecha: Optional[str]) -> Optional[str]:
+    """Acepta 'YYYY-MM' o 'YYYY-MM-DD' y devuelve 'mmm-YYYY' (esp)."""
+    if not fecha or len(fecha) < 7: return None
+    y = fecha[0:4]; m = fecha[5:7]
+    return f"{MES_ES.get(m, m)}-{y}"
+
+# ------------------------------ HTTP helpers --------------------------------
+
 async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dict[str, Any]]:
     try:
         timeout = kwargs.pop("timeout", ClientTimeout(total=20))
@@ -125,9 +138,6 @@ async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str
     except Exception as e:
         log.warning("fetch_text error %s: %s", url, e)
     return None
-
-def anchor(href: str, text: str) -> str:
-    return f'<a href="{href}">{text}</a>'
 
 # ------------------------------ Dólares ------------------------------------
 
@@ -154,7 +164,7 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
     async def dolarapi(path: str):
         j = await fetch_json(session, f"{DOLARAPI_BASE}{path}")
         if not j: return (None, None, None)
-        c,v,fecha = j.get("compra"), j.get("venta"), j.get("fechaActualizacion")
+        c,v,fecha = j.get("compra"), j.get("venta"), j.get("fechaActualizacion") or j.get("fecha")
         try:
             return (float(c) if c is not None else None, float(v) if v is not None else None, fecha)
         except Exception:
@@ -185,30 +195,50 @@ async def arg_datos_get(session: ClientSession, suffix: str) -> Optional[Dict[st
             if j: return j
     return None
 
-async def get_riesgo_pais(session: ClientSession) -> Optional[int]:
+async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str]]]:
+    """Devuelve (valor_pb, fecha 'YYYY-MM-DD' o similar)."""
     j = await arg_datos_get(session, "/riesgo-pais/ultimo")
     if not j:
         j = await arg_datos_get(session, "/riesgo-pais")
     if j:
-        if isinstance(j, dict) and "valor" in j:
-            try: return int(float(j["valor"]))
-            except Exception: return None
+        if isinstance(j, dict):
+            val = j.get("valor")
+            fecha = j.get("fecha") or j.get("periodo")
+            try:
+                return (int(float(val)), fecha) if val is not None else None
+            except Exception:
+                return None
         if isinstance(j, list) and j:
-            try: return int(float(j[-1].get("valor")))
-            except Exception: return None
+            last = j[-1]
+            val = last.get("valor")
+            fecha = last.get("fecha") or last.get("periodo")
+            try:
+                return (int(float(val)), fecha) if val is not None else None
+            except Exception:
+                return None
     return None
 
-async def get_inflacion_mensual(session: ClientSession) -> Optional[float]:
+async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
+    """Devuelve (valor_%, periodo 'YYYY-MM' o fecha)."""
     j = await arg_datos_get(session, "/inflacion/mensual/ultimo")
     if not j:
         j = await arg_datos_get(session, "/inflacion/mensual")
     if j:
-        if isinstance(j, dict) and "valor" in j:
-            try: return float(j["valor"])
-            except Exception: return None
+        if isinstance(j, dict):
+            val = j.get("valor")
+            per = j.get("periodo") or j.get("fecha")
+            try:
+                return (float(val), per) if val is not None else None
+            except Exception:
+                return None
         if isinstance(j, list) and j:
-            try: return float(j[-1].get("valor"))
-            except Exception: return None
+            last = j[-1]
+            val = last.get("valor")
+            per = last.get("periodo") or last.get("fecha")
+            try:
+                return (float(val), per) if val is not None else None
+            except Exception:
+                return None
     return None
 
 # ------------------------------ Reservas (LaMacro) -------------------------
@@ -234,6 +264,7 @@ RET_CACHE: Dict[Tuple[str,str], Tuple[float, Optional[float]]] = {}  # {(symbol,
 RET_TTL = 600  # 10 minutos
 
 async def yf_ret_pct(session: ClientSession, symbol: str, range_: str) -> Optional[float]:
+    """Retorno % entre primer y último adjclose del rango. Fallback de interval 1d -> 1wk."""
     key = (symbol, range_)
     now_ts = time()
     if key in RET_CACHE:
@@ -242,6 +273,7 @@ async def yf_ret_pct(session: ClientSession, symbol: str, range_: str) -> Option
             return val
     params = {"range": range_, "interval": "1d", "events": "div,split"}
     j = await fetch_json(session, YF_CHART_URL.format(symbol=symbol), headers=YF_HEADERS, params=params)
+    val = None
     try:
         res = j.get("chart", {}).get("result", [])[0]
         closes = res["indicators"]["adjclose"][0]["adjclose"]
@@ -249,13 +281,23 @@ async def yf_ret_pct(session: ClientSession, symbol: str, range_: str) -> Option
         if len(series) >= 2:
             first, last = series[0], series[-1]
             val = (last - first) / first * 100.0
-            RET_CACHE[key] = (now_ts, val)
-            return val
     except Exception:
-        RET_CACHE[key] = (now_ts, None)
-        return None
-    RET_CACHE[key] = (now_ts, None)
-    return None
+        val = None
+    # Fallback: interval semanal
+    if val is None:
+        params = {"range": range_, "interval": "1wk", "events": "div,split"}
+        j = await fetch_json(session, YF_CHART_URL.format(symbol=symbol), headers=YF_HEADERS, params=params)
+        try:
+            res = j.get("chart", {}).get("result", [])[0]
+            closes = res["indicators"]["adjclose"][0]["adjclose"]
+            series = [c for c in closes if c is not None]
+            if len(series) >= 2:
+                first, last = series[0], series[-1]
+                val = (last - first) / first * 100.0
+        except Exception:
+            val = None
+    RET_CACHE[key] = (now_ts, val)
+    return val
 
 async def returns_for_symbols(session: ClientSession, symbols: List[str]) -> Dict[str, Dict[str, Optional[float]]]:
     out = {s: {"6m": None, "3m": None, "1m": None} for s in symbols}
@@ -330,8 +372,9 @@ async def read_metrics_for_alerts(session: ClientSession) -> Dict[str, Optional[
         if d.get(k) and d[k].get("venta") is not None:
             out[k] = float(d[k]["venta"])
     rp = await get_riesgo_pais(session)
-    out["riesgo"] = float(rp) if rp is not None else None
-    out["inflacion"] = await get_inflacion_mensual(session)
+    out["riesgo"] = float(rp[0]) if rp is not None else None
+    infl = await get_inflacion_mensual(session)
+    out["inflacion"] = float(infl[0]) if infl is not None else None
     rv = await get_reservas_lamacro(session)
     if rv: out["reservas"] = rv[0]
     return out
@@ -430,7 +473,11 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _top_blocks_for(symbols: List[str], title: str) -> str:
     async with ClientSession() as session:
-        rets = await returns_for_symbols(session, symbols)
+        # timeout global para no colgar la respuesta
+        try:
+            rets = await asyncio.wait_for(returns_for_symbols(session, symbols), timeout=20)
+        except asyncio.TimeoutError:
+            rets = {s: {"6m": None, "3m": None, "1m": None} for s in symbols}
     top6 = top_n_by_window(rets, "6m", 3)
     top3 = top_n_by_window(rets, "3m", 3)
     top1 = top_n_by_window(rets, "1m", 3)
@@ -449,27 +496,39 @@ async def cmd_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_rankings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
-        acc = await returns_for_symbols(session, ACCIONES_BA)
-        ced = await returns_for_symbols(session, CEDEARS_BA)
-    acc_top = rank_projection(acc, 5)
-    ced_top = rank_projection(ced, 5)
+        try:
+            acc, ced = await asyncio.wait_for(asyncio.gather(
+                returns_for_symbols(session, ACCIONES_BA),
+                returns_for_symbols(session, CEDEARS_BA)
+            ), timeout=25)
+        except asyncio.TimeoutError:
+            acc, ced = {}, {}
+    acc_top = rank_projection(acc, 5) if acc else []
+    ced_top = rank_projection(ced, 5) if ced else []
     lines = [f"<b>🏁 Rankings (proyección ~ momentum 6m)</b>  <i>{fmt_dt()}</i>"]
     if acc_top: lines.append(format_proj_block("Acciones – Top 5", acc_top))
+    else: lines.append(format_proj_block("Acciones – Top 5", []))
     if ced_top: lines.append(format_proj_block("CEDEARs – Top 5", ced_top))
-    if not (acc_top or ced_top): lines.append("No hay datos suficientes para el ranking ahora.")
+    else: lines.append(format_proj_block("CEDEARs – Top 5", []))
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_rankings_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
-        acc = await returns_for_symbols(session, ACCIONES_BA)
-    acc_top = rank_projection(acc, 5)
+        try:
+            acc = await asyncio.wait_for(returns_for_symbols(session, ACCIONES_BA), timeout=20)
+        except asyncio.TimeoutError:
+            acc = {}
+    acc_top = rank_projection(acc, 5) if acc else []
     lines = [f"<b>🏁 Acciones – Rankings</b>  <i>{fmt_dt()}</i>", format_proj_block("Top 5", acc_top)]
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_rankings_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
-        ced = await returns_for_symbols(session, CEDEARS_BA)
-    ced_top = rank_projection(ced, 5)
+        try:
+            ced = await asyncio.wait_for(returns_for_symbols(session, CEDEARS_BA), timeout=20)
+        except asyncio.TimeoutError:
+            ced = {}
+    ced_top = rank_projection(ced, 5) if ced else []
     lines = [f"<b>🏁 CEDEARs – Rankings</b>  <i>{fmt_dt()}</i>", format_proj_block("Top 5", ced_top)]
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
@@ -485,22 +544,41 @@ async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
-        val = await get_inflacion_mensual(session)
-    txt = f"<b>📉 Inflación mensual</b>\n<b>{val:.2f}%</b>" if val is not None else "No pude obtener inflación ahora."
+        tup = await get_inflacion_mensual(session)
+    if tup is None:
+        txt = "No pude obtener inflación ahora."
+    else:
+        val, per = tup
+        per_s = fmt_periodo(per) or per or ""
+        txt = f"<b>📉 Inflación mensual</b>{f'  <i>{per_s}</i>' if per_s else ''}\n<b>{val:.2f}%</b>"
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
-        rp = await get_riesgo_pais(session)
-    txt = f"<b>📈 Riesgo país</b>\n<b>{rp} pb</b>" if rp is not None else "No pude obtener riesgo país ahora."
+        tup = await get_riesgo_pais(session)
+    if tup is None:
+        txt = "No pude obtener riesgo país ahora."
+    else:
+        rp, f = tup
+        # mostrar fecha como dd/mm/yyyy si viene YYYY-MM-DD
+        f_str = None
+        if f and len(f) >= 10 and f[4] == "-" and f[7] == "-":
+            try:
+                f_str = datetime.strptime(f[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+            except Exception:
+                f_str = f
+        else:
+            f_str = f
+        txt = f"<b>📈 Riesgo país</b>{f'  <i>{f_str}</i>' if f_str else ''}\n<b>{rp} pb</b>"
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         dolares = await get_dolares(session)
-        riesgo  = await get_riesgo_pais(session)
-        reservas= await get_reservas_lamacro(session)
-        inflac  = await get_inflacion_mensual(session)
+        riesgo_t  = await get_riesgo_pais(session)     # (valor, fecha)
+        reservas  = await get_reservas_lamacro(session) # (valor, fecha dd/mm/aaaa)
+        inflac_t  = await get_inflacion_mensual(session) # (valor, periodo)
+
         news    = await fetch_rss_entries(session, limit=5)
 
     blocks = [f"<b>🗞️ Resumen diario</b>  <i>{fmt_dt()}</i>"]
@@ -510,17 +588,32 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
         blocks.append(format_dolar_message(dolares))
 
     # Riesgo país
-    blocks.append(f"<b>📈 Riesgo país</b>\n<b>{riesgo} pb</b>" if riesgo is not None else "<b>📈 Riesgo país</b>\n—")
+    if riesgo_t:
+        rp, f = riesgo_t
+        f_str = None
+        if f and len(f) >= 10 and f[4] == "-" and f[7] == "-":
+            try: f_str = datetime.strptime(f[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+            except Exception: f_str = f
+        else:
+            f_str = f
+        blocks.append(f"<b>📈 Riesgo país</b>{f'  <i>{f_str}</i>' if f_str else ''}\n<b>{rp} pb</b>")
+    else:
+        blocks.append("<b>📈 Riesgo país</b>\n—")
 
     # Reservas
     if reservas:
         rv, rf = reservas
-        blocks.append(f"<b>🏦 Reservas BCRA</b>\n<b>{fmt_number(rv,0)} MUS$</b>{f' (Últ. act: {rf})' if rf else ''}")
+        blocks.append(f"<b>🏦 Reservas BCRA</b>{f'  <i>Últ. act: {rf}</i>' if rf else ''}\n<b>{fmt_number(rv,0)} MUS$</b>")
     else:
         blocks.append("<b>🏦 Reservas BCRA</b>\n—")
 
     # Inflación
-    blocks.append(f"<b>📉 Inflación mensual</b>\n<b>{inflac:.2f}%</b>" if inflac is not None else "<b>📉 Inflación mensual</b>\n—")
+    if inflac_t:
+        iv, ip = inflac_t
+        ip_s = fmt_periodo(ip) or ip or ""
+        blocks.append(f"<b>📉 Inflación mensual</b>{f'  <i>{ip_s}</i>' if ip_s else ''}\n<b>{iv:.2f}%</b>")
+    else:
+        blocks.append("<b>📉 Inflación mensual</b>\n—")
 
     # Noticias
     if news:
@@ -531,6 +624,8 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.effective_message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 # ---------- Alert commands ----------
+
+ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 
 async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
