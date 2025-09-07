@@ -23,6 +23,7 @@ import asyncio
 import logging
 import re
 from time import time
+from math import sqrt
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional
@@ -39,7 +40,7 @@ TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "tgwebhook").strip().strip("/")
 PORT = int(os.getenv("PORT", "10000"))
-BASE_URL = os.getenv("BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "https://bot-economico-ar.onrender.com")).rstrip("/")
+BASE_URL = os.getenv("BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "https://bot-económico-ar.onrender.com".replace("ó","o"))).rstrip("/")
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN no configurado.")
@@ -229,7 +230,7 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
         j = await arg_datos_get(session, "/riesgo-pais")
         if isinstance(j, list) and j:
             last = j[-1]
-            val = last.get("valor"); f = last.get("fecha") or j.get("periodo")
+            val = last.get("valor"); f = last.get("fecha") or last.get("periodo")
             try: return (int(float(val)), f) if val is not None else None
             except Exception: return None
     if isinstance(j, dict):
@@ -274,7 +275,7 @@ async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, 
         except Exception: return None
     return None
 
-# ------------------------------ Yahoo retornos -----------------------------
+# ------------------------------ Yahoo métricas 1Y --------------------------
 
 RET_CACHE_1Y: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}  # key: f"{host}|{symbol}|{interval}"
 RET_TTL = 600  # 10 minutos
@@ -285,9 +286,9 @@ async def _yf_chart_1y(session: ClientSession, symbol: str, interval: str) -> Op
         cache_key = f"{host}|{symbol}|{interval}"
         now_ts = time()
         if cache_key in RET_CACHE_1Y:
-            ts, res = RET_CACHE_1Y[cache_key]
-            if now_ts - ts < RET_TTL:
-                return res
+            ts_cache, res_cache = RET_CACHE_1Y[cache_key]
+            if now_ts - ts_cache < RET_TTL:
+                return res_cache
         params = {"range": "1y", "interval": interval, "events": "div,split"}
         j = await fetch_json(session, base.format(symbol=symbol), headers=YF_HEADERS, params=params)
         try:
@@ -299,51 +300,126 @@ async def _yf_chart_1y(session: ClientSession, symbol: str, interval: str) -> Op
             continue
     return None
 
-def _returns_from_1y_with_last(res: Dict[str, Any]) -> Optional[Tuple[float, float, float, Optional[int]]]:
+def _rolling_sma(vals: List[Optional[float]], window: int) -> List[Optional[float]]:
+    out = [None]*len(vals)
+    s = 0.0
+    q = []
+    for i, v in enumerate(vals):
+        if v is None:
+            q.append(0.0);  # ocupa lugar pero no suma
+        else:
+            q.append(v); s += v
+        if len(q) > window:
+            s -= q.pop(0)
+        if len(q) == window:
+            out[i] = s / window
+    return out
+
+def _stddev(x: List[float]) -> Optional[float]:
+    n = len(x)
+    if n < 2: return None
+    mu = sum(x)/n
+    var = sum((xi-mu)**2 for xi in x)/(n-1)
+    return sqrt(var)
+
+def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[float]]]:
     try:
         ts = res["timestamp"]
-        closes = res["indicators"]["adjclose"][0]["adjclose"]
-        idx_last = max(i for i,v in enumerate(closes) if v is not None)
+        closes_raw = res["indicators"]["adjclose"][0]["adjclose"]
+        # Limpiar None
+        pairs = [(t,c) for t,c in zip(ts, closes_raw) if (t is not None and c is not None)]
+        if len(pairs) < 30:
+            return None
+        ts = [p[0] for p in pairs]
+        closes = [p[1] for p in pairs]
+        idx_last = len(closes) - 1
         last = closes[idx_last]
         t_last = ts[idx_last]
+
+        # Retornos a 1/3/6M (calendario aprox)
+        def first_on_or_after(tcut):
+            for i, t in enumerate(ts):
+                if t >= tcut:
+                    return closes[i]
+            return closes[0]
         t6 = t_last - 180*24*3600
         t3 = t_last - 90*24*3600
         t1 = t_last - 30*24*3600
-        def first_on_or_after(tcut):
-            for i, t in enumerate(ts):
-                if t is None or closes[i] is None: 
-                    continue
-                if t >= tcut:
-                    return closes[i]
-            for i, v in enumerate(closes):
-                if v is not None: return v
-            return None
-        c6 = first_on_or_after(t6)
-        c3 = first_on_or_after(t3)
-        c1 = first_on_or_after(t1)
-        def r(base):
-            return (last - base) / base * 100.0 if base else None
-        return (r(c6), r(c3), r(c1), int(t_last))
+        base6 = first_on_or_after(t6)
+        base3 = first_on_or_after(t3)
+        base1 = first_on_or_after(t1)
+        ret6 = (last/base6 - 1.0)*100.0 if base6 else None
+        ret3 = (last/base3 - 1.0)*100.0 if base3 else None
+        ret1 = (last/base1 - 1.0)*100.0 if base1 else None
+
+        # Volatilidad anualizada (60 ruedas si hay; si no, usa N-1)
+        rets_d = []
+        for i in range(1, len(closes)):
+            if closes[i-1] and closes[i]:
+                rets_d.append(closes[i]/closes[i-1]-1.0)
+        look = 60 if len(rets_d) >= 60 else max(10, len(rets_d)-1)
+        vol_ann = None
+        if len(rets_d) >= 10:
+            sd = _stddev(rets_d[-look:])
+            if sd is not None:
+                vol_ann = sd*sqrt(252)*100.0  # %
+
+        # Máx drawdown en últimos 6M
+        dd6 = None
+        idx_cut = 0
+        for i, t in enumerate(ts):
+            if t >= t6:
+                idx_cut = i; break
+        peak = closes[idx_cut]
+        dd_min = 0.0
+        for v in closes[idx_cut:]:
+            if v > peak: peak = v
+            dd = v/peak - 1.0
+            if dd < dd_min: dd_min = dd
+        dd6 = abs(dd_min)*100.0 if dd_min < 0 else 0.0
+
+        # Máximo 52s (1y) y proximity
+        max52 = max(closes)
+        hi52 = (last/max52 - 1.0)*100.0 if max52 else None
+
+        # SMAs 50 y 200 + pend. SMA50
+        sma50  = _rolling_sma(closes, 50)
+        sma200 = _rolling_sma(closes, 200)
+        s50_last = sma50[idx_last] if idx_last < len(sma50) else None
+        s50_prev = sma50[idx_last-20] if idx_last-20 >= 0 else None
+        slope50 = ((s50_last/s50_prev - 1.0)*100.0) if (s50_last and s50_prev) else 0.0
+        s200_last = sma200[idx_last] if idx_last < len(sma200) else None
+        trend_flag = 1 if (s200_last and last > s200_last) else (-1 if s200_last else 0)
+
+        return {
+            "1m": ret1, "3m": ret3, "6m": ret6, "last_ts": int(t_last),
+            "vol_ann": vol_ann, "dd6m": dd6, "hi52": hi52,
+            "slope50": slope50, "trend_flag": float(trend_flag),
+        }
     except Exception:
         return None
 
-async def yf_returns_6_3_1(session: ClientSession, symbol: str) -> Dict[str, Optional[float]]:
-    out = {"6m": None, "3m": None, "1m": None, "last_ts": None}
+async def _yf_metrics_1y(session: ClientSession, symbol: str) -> Dict[str, Optional[float]]:
+    out = {"6m": None, "3m": None, "1m": None, "last_ts": None,
+           "vol_ann": None, "dd6m": None, "hi52": None,
+           "slope50": None, "trend_flag": None}
     for interval in ("1d", "1wk"):
         res = await _yf_chart_1y(session, symbol, interval)
         if res:
-            trio = _returns_from_1y_with_last(res)
-            if trio:
-                out["6m"], out["3m"], out["1m"], out["last_ts"] = trio
+            m = _metrics_from_chart(res)
+            if m:
+                out.update(m)
                 break
     return out
 
-async def returns_for_symbols(session: ClientSession, symbols: List[str]) -> Tuple[Dict[str, Dict[str, Optional[float]]], Optional[int]]:
-    out = {s: {"6m": None, "3m": None, "1m": None, "last_ts": None} for s in symbols}
+async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tuple[Dict[str, Dict[str, Optional[float]]], Optional[int]]:
+    out = {s: {"6m": None, "3m": None, "1m": None, "last_ts": None,
+               "vol_ann": None, "dd6m": None, "hi52": None,
+               "slope50": None, "trend_flag": None} for s in symbols}
     sem = asyncio.Semaphore(6)
     async def work(sym: str):
         async with sem:
-            out[sym] = await yf_returns_6_3_1(session, sym)
+            out[sym] = await _yf_metrics_1y(session, sym)
     await asyncio.gather(*(work(s) for s in symbols))
     last_ts = None
     for d in out.values():
@@ -352,31 +428,25 @@ async def returns_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
             last_ts = ts if last_ts is None else max(last_ts, ts)
     return out, last_ts
 
-def top_n_by_window(retmap: Dict[str, Dict[str, Optional[float]]], window: str, n=3) -> List[Tuple[str, float]]:
-    pairs = [(sym, float(v)) for sym,d in retmap.items() if (v:=d.get(window)) is not None]
-    pairs.sort(key=lambda x: x[1], reverse=True)
-    return pairs[:n]
+def _nz(x: Optional[float], fallback: float) -> float:
+    return float(x) if x is not None else fallback
 
-def composite_score(d: Dict[str, Optional[float]]) -> float:
-    # Proyección simple por momentum (6–12M): 0.6*6M + 0.3*3M + 0.1*1M
-    w6, w3, w1 = 0.6, 0.3, 0.1
-    r6 = d.get("6m"); r3 = d.get("3m"); r1 = d.get("1m")
-    s = 0.0
-    s += (r6 if r6 is not None else -1e6) * w6
-    s += (r3 if r3 is not None else -1e6) * w3
-    s += (r1 if r1 is not None else -1e6) * w1
-    return s
-
-def rank_projection_rows(retmap: Dict[str, Dict[str, Optional[float]]], n=5) -> List[Tuple[str, float]]:
-    syms = list(retmap.keys())
-    syms.sort(key=lambda s: -composite_score(retmap[s]))
-    out = []
-    for s in syms:
-        if retmap[s]["6m"] is None:  # sin 6M omitimos
-            continue
-        out.append((s, composite_score(retmap[s])))
-        if len(out) >= n: break
-    return out
+def projection_pct(m: Dict[str, Optional[float]]) -> float:
+    # Momentum
+    ret6 = _nz(m.get("6m"), -100.0)
+    ret3 = _nz(m.get("3m"), -50.0)
+    ret1 = _nz(m.get("1m"), -20.0)
+    momentum = 0.5*ret6 + 0.3*ret3 + 0.2*ret1
+    # Calidad tendencia
+    hi52   = _nz(m.get("hi52"), 0.0)       # puede ser negativo si lejos del máx
+    slope  = _nz(m.get("slope50"), 0.0)
+    trend  = _nz(m.get("trend_flag"), 0.0) # +1/-1/0
+    # Riesgo
+    vol    = _nz(m.get("vol_ann"), 40.0)
+    dd6    = _nz(m.get("dd6m"), 30.0)
+    # Proyección compuesta
+    proj = 0.5*momentum + 0.2*hi52 + 0.2*slope - 0.05*vol - 0.05*dd6 + 3.0*trend
+    return proj
 
 # ------------------------------ Noticias -----------------------------------
 
@@ -424,7 +494,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
 def format_news_block(news: List[Tuple[str, str]]) -> str:
     if not news:
         return "<u>Top 5 noticias</u>\n—"
-    body = "\n\n".join([f"{i}. <a href=\"{l}\">{t}</a>" for i,(t,l) in enumerate(news, 1)])
+    body = "\n\n".join([f"{i}. {anchor(l, t)}" for i,(t,l) in enumerate(news, 1)])
     return "<u>Top 5 noticias</u>\n" + body
 
 # ------------------------------ Alertas ------------------------------------
@@ -526,7 +596,7 @@ def format_top3_single_table(title: str, fecha: Optional[str],
 
 def format_ranking_projection_table(title: str, fecha: Optional[str], rows: List[Tuple[str, float]]) -> str:
     head = f"<b>{title}</b>" + (f"  <i>Últ. dato: {fecha}</i>" if fecha else "")
-    sub  = "<i>Proy. 6–12M (momentum = 0,6·6M + 0,3·3M + 0,1·1M)</i>"
+    sub  = "<i>Proy. 6–12M robusta (momentum + tendencia − riesgo)</i>"
     lines = [head, sub, "<pre>Rank  Ticker            Proy. 6–12M</pre>"]
     out_rows = []
     if not rows:
@@ -549,45 +619,61 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         try:
-            rets, last_ts = await asyncio.wait_for(returns_for_symbols(session, ACCIONES_BA), timeout=20)
+            mets, last_ts = await asyncio.wait_for(metrics_for_symbols(session, ACCIONES_BA), timeout=25)
         except asyncio.TimeoutError:
-            rets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in ACCIONES_BA}, None)
+            mets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in ACCIONES_BA}, None)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-    top6 = [sym for sym,_ in top_n_by_window(rets, "6m", 3)]
-    msg = format_top3_single_table("📈 Acciones BYMA (.BA) – Top 3 por 6M", fecha, top6, rets)
+    # Top 3 por 6M
+    pairs = [(sym, m["6m"]) for sym,m in mets.items() if m.get("6m") is not None]
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    top6_syms = [sym for sym,_ in pairs[:3]]
+    msg = format_top3_single_table("📈 Acciones BYMA (.BA) – Top 3 por 6M", fecha, top6_syms, mets)
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         try:
-            rets, last_ts = await asyncio.wait_for(returns_for_symbols(session, CEDEARS_BA), timeout=20)
+            mets, last_ts = await asyncio.wait_for(metrics_for_symbols(session, CEDEARS_BA), timeout=25)
         except asyncio.TimeoutError:
-            rets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in CEDEARS_BA}, None)
+            mets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in CEDEARS_BA}, None)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-    top6 = [sym for sym,_ in top_n_by_window(rets, "6m", 3)]
-    msg = format_top3_single_table("🌎 CEDEARs (.BA) – Top 3 por 6M", fecha, top6, rets)
+    pairs = [(sym, m["6m"]) for sym,m in mets.items() if m.get("6m") is not None]
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    top6_syms = [sym for sym,_ in pairs[:3]]
+    msg = format_top3_single_table("🌎 CEDEARs (.BA) – Top 3 por 6M", fecha, top6_syms, mets)
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+def rank_projection_rows(metmap: Dict[str, Dict[str, Optional[float]]], n=5) -> List[Tuple[str, float]]:
+    pairs = []
+    for sym, m in metmap.items():
+        # necesita al menos retorno 6M para entrar al ranking
+        if m.get("6m") is None: 
+            continue
+        proj = projection_pct(m)
+        pairs.append((sym, proj))
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    return pairs[:n]
 
 async def cmd_rankings_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         try:
-            acc, acc_ts = await asyncio.wait_for(returns_for_symbols(session, ACCIONES_BA), timeout=20)
+            metmap, last_ts = await asyncio.wait_for(metrics_for_symbols(session, ACCIONES_BA), timeout=25)
         except asyncio.TimeoutError:
-            acc, acc_ts = {}, None
-    fecha = datetime.fromtimestamp(acc_ts, TZ).strftime("%d/%m/%Y") if acc_ts else None
-    rows = rank_projection_rows(acc, 5) if acc else []
-    msg = format_ranking_projection_table("🏁 Acciones – Top 5 (Proyección)", fecha, rows)
+            metmap, last_ts = ({}, None)
+    fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
+    rows = rank_projection_rows(metmap, 5) if metmap else []
+    msg = format_ranking_projection_table("🏁 Acciones – Top 5 (Proyección robusta 6–12M)", fecha, rows)
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_rankings_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         try:
-            ced, ced_ts = await asyncio.wait_for(returns_for_symbols(session, CEDEARS_BA), timeout=20)
+            metmap, last_ts = await asyncio.wait_for(metrics_for_symbols(session, CEDEARS_BA), timeout=25)
         except asyncio.TimeoutError:
-            ced, ced_ts = {}, None
-    fecha = datetime.fromtimestamp(ced_ts, TZ).strftime("%d/%m/%Y") if ced_ts else None
-    rows = rank_projection_rows(ced, 5) if ced else []
-    msg = format_ranking_projection_table("🏁 CEDEARs – Top 5 (Proyección)", fecha, rows)
+            metmap, last_ts = ({}, None)
+    fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
+    rows = rank_projection_rows(metmap, 5) if metmap else []
+    msg = format_ranking_projection_table("🏁 CEDEARs – Top 5 (Proyección robusta 6–12M)", fecha, rows)
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -734,8 +820,8 @@ async def on_startup(app: web.Application):
         BotCommand("dolar", "Tipos de cambio (compra/venta + fecha)"),
         BotCommand("acciones", "Top 3 por 6M (tabla 1M/3M/6M)"),
         BotCommand("cedears", "Top 3 por 6M (tabla 1M/3M/6M)"),
-        BotCommand("rankings_acciones", "Top 5 (proyección 6–12M)"),
-        BotCommand("rankings_cedears", "Top 5 (proyección 6–12M)"),
+        BotCommand("rankings_acciones", "Top 5 (proyección robusta 6–12M)"),
+        BotCommand("rankings_cedears", "Top 5 (proyección robusta 6–12M)"),
         BotCommand("reservas", "Reservas BCRA (con fecha)"),
         BotCommand("inflacion", "Inflación mensual (con fecha)"),
         BotCommand("riesgo", "Riesgo país (con fecha)"),
