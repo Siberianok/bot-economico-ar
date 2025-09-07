@@ -70,7 +70,7 @@ RSS_FEEDS = [
 
 # Listas base
 ACCIONES_BA = ["GGAL.BA","YPFD.BA","PAMP.BA","CEPU.BA","ALUA.BA","TXAR.BA","TGSU2.BA","BYMA.BA","SUPV.BA","BMA.BA"]
-CEDEARS_BA = ["AAPL.BA","MSFT.BA","NVDA.BA","AMZN.BA","GOOGL.BA","TSLA.BA","META.BA","JNJ.BA","KO.BA","NFLX.BA"]
+CEDEARS_BA  = ["AAPL.BA","MSFT.BA","NVDA.BA","AMZN.BA","GOOGL.BA","TSLA.BA","META.BA","JNJ.BA","KO.BA","NFLX.BA"]
 
 # ------------------------------ Logging ------------------------------------
 
@@ -147,7 +147,7 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
                 return (None, None)
         for k in ["oficial","mayorista","blue","mep","ccl","cripto","tarjeta"]:
             c,v = _safe(cj.get(k,{}))
-            if c or v:
+            if c is not None or v is not None:
                 data[k] = {"compra": c, "venta": v, "fuente": "CriptoYa"}
 
     # DolarAPI
@@ -480,7 +480,7 @@ async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = "No pude obtener reservas ahora."
     else:
         val, fecha = res
-        txt = f"<b>🏦 Reservas BCRA</b>  <i>{'Últ. act: '+fecha if fecha else ''}</i>\n<b>{fmt_number(val,0)} MUS$</b> (MUS$ = millones de USD)"
+        txt = f"<b>🏦 Reservas BCRA</b>{f'  <i>Últ. act: {fecha}</i>' if fecha else ''}\n<b>{fmt_number(val,0)} MUS$</b> (MUS$ = millones de USD)"
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -529,6 +529,57 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
         blocks.append("\n".join(lines))
 
     await update.effective_message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+# ---------- Alert commands ----------
+
+async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    rules = ALERTS.get(chat_id, [])
+    if not rules:
+        txt = "No tenés alertas. Usá: /alertas_add <tipo> <op> <valor>"
+    else:
+        lines = ["<b>🔔 Alertas configuradas</b>"]
+        for r in rules:
+            t,op,v = r["type"], r["op"], r["value"]
+            if t in {"blue","mep","ccl"}: val = fmt_money_ars(v)
+            elif t=="riesgo": val = f"{v:.0f} pb"
+            elif t=="reservas": val = f"{fmt_number(v,0)} MUS$"
+            else: val = f"{v:.2f}%"
+            lines.append(f"• {t.upper()} {op} {val}")
+        txt = "\n".join(lines)
+    await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+async def cmd_alertas_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parsed = parse_alert_add(context.args)
+    if not parsed:
+        await update.effective_message.reply_text(
+            "Formato: /alertas_add <tipo> <op> <valor>\n"
+            "  tipos: blue, mep, ccl, riesgo, inflacion, reservas\n"
+            "  op: > o <\n"
+            "Ej.: /alertas_add blue > 1350",
+            parse_mode=ParseMode.HTML,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+        return
+    tipo, op, val = parsed
+    chat_id = update.effective_chat.id
+    ALERTS.setdefault(chat_id, []).append({"type": tipo, "op": op, "value": val})
+    await update.effective_message.reply_text("Listo. Alerta agregada ✅", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    tipo = (context.args[0].lower() if context.args else None)
+    if not ALERTS.get(chat_id):
+        await update.effective_message.reply_text("No hay alertas para borrar.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+        return
+    if tipo:
+        before = len(ALERTS[chat_id])
+        ALERTS[chat_id] = [r for r in ALERTS[chat_id] if r["type"] != tipo]
+        after = len(ALERTS[chat_id])
+        await update.effective_message.reply_text(f"Eliminadas {before-after} alertas de tipo {tipo.upper()}.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    else:
+        ALERTS[chat_id] = []
+        await update.effective_message.reply_text("Todas las alertas fueron eliminadas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 # ------------------------------ AIOHTTP + Webhook --------------------------
 
@@ -596,42 +647,9 @@ application.add_handler(CommandHandler("reservas", cmd_reservas))
 application.add_handler(CommandHandler("inflacion", cmd_inflacion))
 application.add_handler(CommandHandler("riesgo", cmd_riesgo))
 application.add_handler(CommandHandler("resumen_diario", cmd_resumen_diario))
-# Alertas
-async def cmd_alertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    rules = ALERTS.get(chat_id, [])
-    if not rules:
-        txt = "No tenés alertas. Usá: /alertas_add <tipo> <op> <valor>"
-    else:
-        lines = ["<b>🔔 Alertas configuradas</b>"]
-        for r in rules:
-            t,op,v = r["type"], r["op"], r["value"]
-            if t in {"blue","mep","ccl"}: val = fmt_money_ars(v)
-            elif t=="riesgo": val = f"{v:.0f} pb"
-            elif t=="reservas": val = f"{fmt_number(v,0)} MUS$"
-            else: val = f"{v:.2f}%"
-            lines.append(f"• {t.upper()} {op} {val}")
-        txt = "\n".join(lines)
-    await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-application.add_handler(CommandHandler("alertas", cmd_alertas))
-application.add_handler(CommandHandler("alertas_add", lambda u,c: (ALERTS.setdefault(u.effective_chat.id,[]), (lambda parsed: (ALERTS[u.effective_chat.id].append({"type": parsed[0],"op": parsed[1],"value": parsed[2]}), u.effective_message.reply_text("Listo. Alerta agregada ✅", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True)))[1] if parsed else u.effective_message.reply_text(
-    "Formato: /alertas_add <tipo> <op> <valor>\n  tipos: blue, mep, ccl, riesgo, inflacion, reservas\n  op: > o <\nEj.: /alertas_add blue > 1350",
-    parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))) (parse_alert_add(c.args))))
-async def _alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    tipo = (context.args[0].lower() if context.args else None)
-    if not ALERTS.get(chat_id):
-        await update.effective_message.reply_text("No hay alertas para borrar.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-        return
-    if tipo:
-        before = len(ALERTS[chat_id])
-        ALERTS[chat_id] = [r for r in ALERTS[chat_id] if r["type"] != tipo]
-        after = len(ALERTS[chat_id])
-        await update.effective_message.reply_text(f"Eliminadas {before-after} alertas de tipo {tipo.upper()}.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-    else:
-        ALERTS[chat_id] = []
-        await update.effective_message.reply_text("Todas las alertas fueron eliminadas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-application.add_handler(CommandHandler("alertas_clear", _alertas_clear))
+application.add_handler(CommandHandler("alertas", cmd_alertas_list))
+application.add_handler(CommandHandler("alertas_add", cmd_alertas_add))
+application.add_handler(CommandHandler("alertas_clear", cmd_alertas_clear))
 
 # ------------------------------ Main ---------------------------------------
 
