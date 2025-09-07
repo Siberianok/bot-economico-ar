@@ -1,490 +1,544 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os, sys, re, html, json, time, logging
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List, Tuple, Optional
+import os
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple, Optional
 
 import httpx
-from telegram import Update, LinkPreviewOptions
+from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import (
-    ApplicationBuilder, Application, CommandHandler,
-    ContextTypes, Defaults
+    ApplicationBuilder, CommandHandler, ContextTypes, Defaults
 )
 
-# ===================== CONFIG =====================
+# =========================
+# CONFIG
+# =========================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    print("ERROR: Falta BOT_TOKEN en variables de entorno.", file=sys.stderr)
-    sys.exit(1)
+TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+if not TOKEN:
+    raise SystemExit("Falta TELEGRAM_TOKEN en variables de entorno.")
 
-BASE_URL = os.environ.get("RENDER_EXTERNAL_URL") or "https://bot-economico-ar.onrender.com"
-WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/tgwebhook")
-PORT = int(os.environ.get("PORT", "10000"))
-LISTEN = os.environ.get("LISTEN", "0.0.0.0")
+# URL pública (Render la expone como RENDER_EXTERNAL_URL). Si no, ponla fija.
+PUBLIC_URL = (
+    os.getenv("RENDER_EXTERNAL_URL")
+    or os.getenv("PUBLIC_URL")
+    or "https://bot-economico-ar.onrender.com"
+).rstrip("/")
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-COMMON_HEADERS = {
-    "User-Agent": UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "es-AR,es;q=0.9,en-US;q=0.8",
-    "Connection": "keep-alive",
-    "Referer": "https://finance.yahoo.com/",
-}
+WEBHOOK_PATH = "/tgwebhook"
+WEBHOOK_URL = f"{PUBLIC_URL}{WEBHOOK_PATH}"
+PORT = int(os.getenv("PORT", "10000"))
+LISTEN_ADDRESS = "0.0.0.0"
 
-TIMEOUT = 10.0
-HTTP  = httpx.Client(timeout=TIMEOUT, headers=COMMON_HEADERS, follow_redirects=True)
-AHTTP = httpx.AsyncClient(timeout=TIMEOUT, headers=COMMON_HEADERS, follow_redirects=True)
+# =========================
+# LOGGING
+# =========================
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
 log = logging.getLogger("bot")
 
-# ===================== CACHE ======================
+# =========================
+# UTILIDADES
+# =========================
 
-_cache: Dict[str, Tuple[datetime, Any]] = {}
+AR_TZ = timezone.utc  # Render está en UTC; dejamos UTC en los sellos.
 
-def now_utc() -> datetime: return datetime.now(timezone.utc)
-
-def cache_get(k:str):
-    v=_cache.get(k); 
-    if not v: return None
-    exp, val = v
-    if now_utc()>=exp: _cache.pop(k,None); return None
-    return val
-
-def cache_set(k:str, val:Any, ttl:int): _cache[k]=(now_utc()+timedelta(seconds=ttl), val)
-
-def html_bold(s:str)->str: return f"<b>{html.escape(s)}</b>"
-def html_code(s:str)->str: return f"<code>{html.escape(s)}</code>"
-
-def fmt_num(x)->str:
-    if x is None: return "N/D"
+def ars(n: float) -> str:
+    """Formatea $ con separador de miles (.) y coma decimal (,)."""
     try:
-        return f"{float(x):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except: return str(x)
+        entero, dec = f"{n:,.2f}".split(".")
+        entero = entero.replace(",", ".")
+        return f"$ {entero},{dec}"
+    except Exception:
+        return f"$ {n}"
 
-def pct(x: float) -> str:
+def pct(n: float) -> str:
+    s = "▲" if n >= 0 else "▼"
+    return f"{s} {n:+.2f}%"
+
+def now_str() -> str:
+    return datetime.now(AR_TZ).strftime("%Y-%m-%d %H:%M")
+
+# =========================
+# CACHES EN MEMORIA
+# =========================
+
+state: Dict[str, dict] = {
+    "dolares": {},        # {"blue": {"compra":..,"venta":..}, "mep": {...}, ...}
+    "reservas": None,     # {"valor": float, "fecha": "YYYY-MM-DD"}
+    "inflacion": None,    # {"valor": float, "fecha": "YYYY-MM-DD"}
+    "riesgo": None,       # {"valor": int, "fecha": "YYYY-MM-DD"}
+    "acciones": {},       # {ticker: (precio, var_pct)}
+    "cedears": {},        # {ticker: (precio, var_pct)}
+    "news": [],           # [(titulo, link)]
+}
+
+# Listas de tickers
+TICKERS_BYMA = [
+    "ALUA.BA","BBAR.BA","BMA.BA","BYMA.BA","CEPU.BA","COME.BA","EDN.BA","GGAL.BA",
+    "LOMA.BA","MIRG.BA","PAMP.BA","SUPV.BA","TGNO4.BA","TGSU2.BA","TRAN.BA",
+    "TXAR.BA","VALO.BA","YPFD.BA",
+]
+TICKERS_CEDEAR = [
+    "AAPL.BA","AMZN.BA","GOOGL.BA","JPM.BA","KO.BA","META.BA","MSFT.BA","NVDA.BA",
+    "PFE.BA","TSLA.BA","WMT.BA","XOM.BA","DIS.BA",
+]
+
+# =========================
+# FETCHERS
+# =========================
+
+HEADERS_JSON = {"Accept": "application/json"}
+TIMEOUT = httpx.Timeout(15, connect=10)
+
+async def fetch_json(client: httpx.AsyncClient, url: str) -> Optional[dict]:
     try:
-        return f"{x:+.2f}%"
-    except:
-        return "N/D"
+        r = await client.get(url, headers=HEADERS_JSON)
+        r.raise_for_status()
+        return r.json()
+    except httpx.HTTPStatusError as e:
+        log.warning("%s fallo: %s", url, e)
+    except Exception as e:
+        log.warning("error %s: %s", url, e)
+    return None
 
-# ===================== DÓLARES ====================
+async def fetch_text(client: httpx.AsyncClient, url: str) -> Optional[str]:
+    try:
+        r = await client.get(url)
+        r.raise_for_status()
+        return r.text
+    except httpx.HTTPStatusError as e:
+        log.warning("RSS fallo %s: %s", url, e.response.status_code)
+    except Exception as e:
+        log.warning("RSS error %s: %s", url, e)
+    return None
 
-def get_dolares() -> Dict[str, Any]:
-    ck="dolares_v2"; c=cache_get(ck)
-    if c: return c
-    data={}
-    base="https://dolarapi.com/v1/dolares/"
-    for tipo in ["blue","oficial","mayorista","cripto"]:
-        try:
-            r=HTTP.get(base+tipo)
-            if r.status_code==200:
-                j=r.json()
-                data[tipo]={
-                    "compra": j.get("compra"),
-                    "venta": j.get("venta"),
-                    "fecha": j.get("fechaActualizacion") or j.get("fecha_actualizacion"),
+async def refresh_dolares():
+    """Blue, Oficial, Mayorista, Cripto (DolarAPI) + MEP/CCL (CriptoYa)"""
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        res = {}
+        # DolarAPI
+        for k in ("blue","oficial","mayorista","cripto"):
+            data = await fetch_json(client, f"https://dolarapi.com/v1/dolares/{k}")
+            if data and "compra" in data and "venta" in data:
+                res[k.upper()] = {
+                    "compra": float(data["compra"]),
+                    "venta": float(data["venta"]),
                 }
-            else:
-                log.warning(f"DolarAPI fallo {tipo}: {r.status_code}")
-        except Exception as e:
-            log.warning(f"DolarAPI error {tipo}: {e}")
-    # MEP/CCL por CriptoYa (DolarAPI no los expone)
-    try:
-        r=HTTP.get("https://criptoya.com/api/dolar")
-        if r.status_code==200:
-            jj=r.json()
-            if isinstance(jj, dict):
-                if "mep" in jj: data["mep"]={"venta": jj["mep"]}
-                if "ccl" in jj: data["ccl"]={"venta": jj["ccl"]}
-        else:
-            log.warning(f"CriptoYa fallo: {r.status_code}")
-    except Exception as e:
-        log.warning(f"CriptoYa error: {e}")
-    cache_set(ck,data,120)
-    return data
 
-# ========== RIESGO / INFLACIÓN / RESERVAS ==========
+        # CriptoYa para MEP & CCL (devuelve llaves directas)
+        dj = await fetch_json(client, "https://criptoya.com/api/dolar")
+        mep_val = None
+        ccl_val = None
+        if isinstance(dj, dict):
+            # Rápido: claves directas
+            if "mep" in dj:  # puede ser float o dict con 'price'
+                mep_val = dj["mep"]["price"] if isinstance(dj["mep"], dict) and "price" in dj["mep"] else dj["mep"]
+            if "ccl" in dj:
+                ccl_val = dj["ccl"]["price"] if isinstance(dj["ccl"], dict) and "price" in dj["ccl"] else dj["ccl"]
+            # Fallback por si viene por instrumentos (al30/gd30)
+            if mep_val is None:
+                try:
+                    mep_val = float(dj["al30"]["ci"]["price"])
+                except Exception:
+                    pass
+            if ccl_val is None:
+                try:
+                    ccl_val = float(dj["gd30"]["ci"]["price"])
+                except Exception:
+                    pass
 
-def get_riesgo_pais()->Optional[Dict[str,Any]]:
-    ck="riesgo_v2"; c=cache_get(ck)
-    if c: return c
-    for url in [
-        "https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais/ultimo/",
-        "https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais/ultimo"
-    ]:
+        if mep_val:
+            res["MEP"] = {"compra": float(mep_val), "venta": float(mep_val)}
+        if ccl_val:
+            res["CCL"] = {"compra": float(ccl_val), "venta": float(ccl_val)}
+
+        if res:
+            state["dolares"] = res
+            log.info("Dólares actualizados: %s", ",".join(res.keys()))
+
+async def refresh_reservas_inflacion_riesgo():
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        # Reservas (LaMacro scrapeo simple)
         try:
-            r=HTTP.get(url)
-            if r.status_code==200:
-                j=r.json(); cache_set(ck,j,300); return j
+            html = await fetch_text(client, "https://www.lamacro.ar/variables")
+            # Buscamos "Reservas internacionales" y el número más reciente (en MUS$)
+            valor = None
+            fecha = None
+            if html:
+                # Muy simple, robusto ante cambios pequeños
+                import re
+                m = re.search(r"Reservas\s+internacionales.*?([\d\.,]+)\s*MUS\$", html, flags=re.I|re.S)
+                if m:
+                    valor = float(m.group(1).replace(".","").replace(",","."))
+                m2 = re.search(r"Reservas\s+internacionales.*?(\d{4}-\d{2}-\d{2})", html, flags=re.I|re.S)
+                if m2:
+                    fecha = m2.group(1)
+            if valor:
+                state["reservas"] = {"valor": valor, "fecha": fecha or datetime.now().date().isoformat()}
         except Exception as e:
-            log.warning(f"ArgentinaDatos riesgo error: {e}")
-    return None
+            log.warning("Reservas error: %s", e)
 
-def get_inflacion()->Optional[Dict[str,Any]]:
-    ck="inflacion_v2"; c=cache_get(ck)
-    if c: return c
-    for url in [
-        "https://api.argentinadatos.com/v1/finanzas/indices/inflacion/",
-        "https://api.argentinadatos.com/v1/finanzas/indices/inflacion"
-    ]:
+        # Inflación (ArgentinaDatos)
+        infl = await fetch_json(client, "https://api.argentinadatos.com/v1/finanzas/indices/inflacion/")
         try:
-            r=HTTP.get(url)
-            if r.status_code==200:
-                arr=r.json()
-                if isinstance(arr,list) and arr:
-                    ultimo=arr[-1]; cache_set(ck,ultimo,6*3600); return ultimo
-        except Exception as e:
-            log.warning(f"ArgentinaDatos inflacion error: {e}")
-    return None
-
-def get_reservas()->Optional[Dict[str,Any]]:
-    ck="reservas_v2"; c=cache_get(ck)
-    if c: return c
-    try:
-        r=HTTP.get("https://www.lamacro.ar/variables")
-        if r.status_code==200:
-            s=r.text
-            m = re.search(r"Reservas Internacionales.*?(\d{1,3}(?:\.\d{3})+)", s, re.I|re.S)
-            f = re.search(r"Últ\. act:\s*([0-9]{2}/[0-9]{2}/[0-9]{4})", s, re.I|re.S)
-            if m:
-                val=float(m.group(1).replace(".",""))
-                out={"valor_musd": val, "fecha": f.group(1) if f else None}
-                cache_set(ck,out,6*3600); return out
-            else:
-                log.warning("No se pudo parsear Reservas en LaMacro.")
-    except Exception as e:
-        log.warning(f"Reservas error: {e}")
-    return None
-
-# ===================== NOTICIAS ===================
-
-NEWS_SOURCES=[
-    "https://www.iprofesional.com/rss/economia",
-    "https://www.cronista.com/rss/economia/",
-    "https://www.cronista.com/files/rss/news.xml",
-    "https://www.clarin.com/rss/economia/",
-    "https://www.lanacion.com.ar/arc/outboundfeeds/rss/?outputType=xml&section=economia",
-]
-
-def parse_rss(xml_text:str)->List[Tuple[str,str]]:
-    items = re.findall(r"<item>.*?<title>(.*?)</title>.*?<link>(.*?)</link>.*?</item>", xml_text, re.S|re.I)
-    out=[]
-    for t,l in items:
-        t=re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", t)
-        l=re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", l)
-        t=html.unescape(re.sub("<.*?>","",t)).strip()
-        l=html.unescape(re.sub("<.*?>","",l)).strip()
-        if t and l: out.append((t,l))
-    return out
-
-def get_noticias(n=5)->List[Tuple[str,str]]:
-    ck="news_v3"; c=cache_get(ck)
-    if c: return c[:n]
-    acc=[]; seen=set()
-    for url in NEWS_SOURCES:
-        try:
-            r=HTTP.get(url)
-            if r.status_code==200:
-                for t,u in parse_rss(r.text):
-                    if t not in seen:
-                        seen.add(t); acc.append((t,u))
-                        if len(acc)>=30: break
-            else:
-                log.warning(f"RSS fallo {url}: {r.status_code}")
-        except Exception as e:
-            log.warning(f"RSS error {url}: {e}")
-    acc=acc[:max(n,5)]
-    cache_set(ck,acc,30*60)
-    return acc[:n]
-
-# ===================== QUOTES =====================
-
-ACCIONES_BA=[
- "GGAL.BA","BMA.BA","YPFD.BA","PAMP.BA","CEPU.BA","TGSU2.BA","TGNO4.BA",
- "ALUA.BA","TXAR.BA","LOMA.BA","BYMA.BA","BBAR.BA","VALO.BA","MIRG.BA",
- "SUPV.BA","COME.BA","EDN.BA","TRAN.BA",
-]
-CEDEARS_BA=[
- "AAPL.BA","MSFT.BA","NVDA.BA","TSLA.BA","AMZN.BA","META.BA","GOOGL.BA",
- "KO.BA","JPM.BA","WMT.BA","DIS.BA","XOM.BA","PFE.BA",
-]
-
-def _yahoo_chart_once(symbol:str, rng="1d", interval="1d")->Optional[Dict[str,Any]]:
-    """Usa v8/finance/chart por símbolo (evita 401 del endpoint quote)."""
-    def _call(host)->httpx.Response:
-        url=f"https://{host}/v8/finance/chart/{symbol}"
-        return HTTP.get(url, params={"range":rng, "interval":interval, "lang":"es-AR","region":"AR"})
-    try:
-        r=_call("query1.finance.yahoo.com")
-        if r.status_code==401 or r.status_code==403:
-            r=_call("query2.finance.yahoo.com")
-        if r.status_code==429:
-            time.sleep(0.6)
-            r=_call("query2.finance.yahoo.com")
-        if r.status_code!=200:
-            log.warning(f"chart {symbol} status {r.status_code}")
-            return None
-        j=r.json()
-        res=j.get("chart",{}).get("result")
-        if not res: return None
-        res=res[0]
-        meta=res.get("meta",{})
-        price=meta.get("regularMarketPrice")
-        ch=res.get("indicators",{}).get("quote",[])
-        closes=(ch[0].get("close") if ch else None) or []
-        # Variación % diaria (último vs penúltimo válido)
-        last=None; prev=None
-        for v in reversed(closes):
-            if v is not None:
-                if last is None: last=v
-                elif prev is None: prev=v; break
-        chg=None; chgp=None
-        if last is not None and prev not in (None,0):
-            chg=last-prev
-            chgp=(chg/prev*100.0)
-        if price is None and last is not None: price=last
-        return {"price": price, "changePercent": chgp}
-    except Exception as e:
-        log.warning(f"chart {symbol} error: {e}")
-        return None
-
-def get_quotes_acciones()->Dict[str,Dict[str,Any]]:
-    ck="q_acc_v4"; c=cache_get(ck)
-    if c: return c
-    out={}
-    for sym in ACCIONES_BA:
-        q=_yahoo_chart_once(sym)
-        if q: out[sym]=q
-        time.sleep(0.25)   # evitar 429
-    cache_set(ck,out,15*60)
-    return out
-
-def get_quotes_cedears()->Dict[str,Dict[str,Any]]:
-    ck="q_ced_v4"; c=cache_get(ck)
-    if c: return c
-    out={}
-    for sym in CEDEARS_BA:
-        q=_yahoo_chart_once(sym)
-        if q: out[sym]=q
-        time.sleep(0.25)
-    cache_set(ck,out,15*60)
-    return out
-
-def ranking_from_quotes(quotes:Dict[str,Dict[str,Any]], topn=10)->Tuple[List[Tuple[str,float]],List[Tuple[str,float]]]:
-    arr=[]
-    for sym,q in quotes.items():
-        p=q.get("changePercent")
-        if isinstance(p,(int,float)): arr.append((sym,float(p)))
-    arr.sort(key=lambda x:x[1], reverse=True)
-    return arr[:topn], list(reversed(arr[-topn:]))
-
-def weekly_change(symbols:List[str])->Dict[str,float]:
-    """Variación % 5 días (semanal) vía chart 5d."""
-    out={}
-    for sym in symbols:
-        try:
-            r=HTTP.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}", params={"range":"5d","interval":"1d"})
-            if r.status_code!=200:
-                r=HTTP.get(f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}", params={"range":"5d","interval":"1d"})
-            if r.status_code==200:
-                j=r.json()
-                res=j.get("chart",{}).get("result")
-                if not res: continue
-                closes=res[0].get("indicators",{}).get("quote",[{}])[0].get("close",[])
-                series=[v for v in closes if v is not None]
-                if len(series)>=2 and series[0]!=0:
-                    out[sym]=(series[-1]/series[0]-1.0)*100.0
+            if isinstance(infl, list) and infl:
+                ultimo = infl[-1]
+                state["inflacion"] = {
+                    "valor": float(ultimo.get("valor", 0.0)),
+                    "fecha": str(ultimo.get("fecha",""))[:10],
+                }
         except Exception:
             pass
-        time.sleep(0.25)
-    return out
 
-# ===================== COMMANDS ===================
+        # Riesgo país (ArgentinaDatos)
+        rp = await fetch_json(client, "https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais/ultimo/")
+        try:
+            if isinstance(rp, dict) and "valor" in rp:
+                state["riesgo"] = {
+                    "valor": int(rp["valor"]),
+                    "fecha": str(rp.get("fecha",""))[:10],
+                }
+        except Exception:
+            pass
 
-async def cmd_start(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    txt = (
-        html_bold("Observatorio Económico 🇦🇷")+"\n"
-        "Comandos:\n"
-        "• /resumen – panorama rápido (dólar, riesgo, inflación, reservas + 5 titulares con link)\n"
-        "• /dolar – cotizaciones (blue, mep, ccl, etc.)\n"
-        "• /reservas – reservas BCRA (MUSD)\n"
-        "• /inflacion – último dato INDEC\n"
-        "• /riesgo – riesgo país (EMBI AR)\n"
-        "• /acciones – precios/variación BYMA\n"
-        "• /cedears – precios/variación CEDEARs\n"
-        "• /ranking – top/bottom del día\n"
-        "• /semanal – variación semanal (5d)\n"
-    )
-    await update.message.reply_text(txt, disable_web_page_preview=True)
+# Yahoo chart v8 por ticker -> (precio, var%)
+async def fetch_yahoo_ticker(client: httpx.AsyncClient, ticker: str) -> Optional[Tuple[float,float]]:
+    base = "https://query1.finance.yahoo.com/v8/finance/chart"
+    # 2 días para calcular variación diaria
+    url = f"{base}/{ticker}?range=2d&interval=1d&lang=es-AR&region=AR"
+    try:
+        r = await client.get(url, timeout=TIMEOUT)
+        r.raise_for_status()
+        j = r.json()
+        rs = j.get("chart", {}).get("result", [])
+        if not rs:
+            return None
+        series = rs[0]
+        closes = series.get("indicators",{}).get("quote",[{}])[0].get("close",[])
+        # El último puede venir None cuando está en curso; filtramos
+        closes = [c for c in closes if isinstance(c,(int,float))]
+        if len(closes) == 0:
+            return None
+        last = float(closes[-1])
+        prev = float(closes[-2]) if len(closes) > 1 else last
+        var = ((last - prev) / prev * 100.0) if prev else 0.0
+        return (last, var)
+    except httpx.HTTPStatusError as e:
+        log.warning("chart %s status %s", ticker, e.response.status_code)
+    except Exception as e:
+        log.warning("chart %s error: %s", ticker, e)
+    return None
 
-async def cmd_dolar(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    d=get_dolares()
-    def v(name,k="venta"):
-        x=d.get(name,{}).get(k)
-        return "$ "+fmt_num(x) if x is not None else "N/D"
-    txt=(
-        html_bold("Dólares")+"\n"
-        f"• Blue: {v('blue')}\n"
-        f"• MEP: {v('mep')}\n"
-        f"• CCL: {v('ccl')}\n"
-        f"• Oficial: {v('oficial')}\n"
-        f"• Mayorista: {v('mayorista')}\n"
-        f"• Cripto: {v('cripto')}\n"
-    )
-    await update.message.reply_text(txt, disable_web_page_preview=True)
+async def refresh_quotes():
+    """Prefetch de precios para /acciones y /cedears"""
+    async with httpx.AsyncClient() as client:
+        acc = {}
+        for tk in TICKERS_BYMA:
+            data = await fetch_yahoo_ticker(client, tk)
+            if data: acc[tk] = data
+            await asyncio.sleep(0.15)
+        ced = {}
+        for tk in TICKERS_CEDEAR:
+            data = await fetch_yahoo_ticker(client, tk)
+            if data: ced[tk] = data
+            await asyncio.sleep(0.15)
+        state["acciones"] = acc
+        state["cedears"] = ced
 
-async def cmd_riesgo(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    r=get_riesgo_pais()
-    if not r: 
-        await update.message.reply_text("Riesgo País: dato no disponible."); return
-    val=r.get("valor")
-    fecha=r.get("fecha") or r.get("ultima_actualizacion") or ""
-    txt=f"{html_bold('Riesgo País (EMBI AR)')}: {int(val)} pb · {fecha}" if val is not None else "Riesgo País: N/D"
-    await update.message.reply_text(txt, disable_web_page_preview=True)
+async def refresh_news():
+    """Noticias económicas (solo fuentes que responden 200)"""
+    feeds = [
+        "https://www.iprofesional.com/rss/economia",
+        "https://www.clarin.com/rss/economia/",
+        "https://www.cronista.com/files/rss/news.xml",
+        "https://www.lanacion.com.ar/arc/outboundfeeds/rss/?outputType=xml&section=economia",
+    ]
+    items: List[Tuple[str,str]] = []
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        import xml.etree.ElementTree as ET
+        for url in feeds:
+            txt = await fetch_text(client, url)
+            if not txt: continue
+            try:
+                root = ET.fromstring(txt)
+                for it in root.iterfind(".//item")[:6]:
+                    title = (it.findtext("title") or "").strip()
+                    link = (it.findtext("link") or "").strip()
+                    if title and link:
+                        items.append((title, link))
+            except Exception as e:
+                log.warning("RSS parse %s: %s", url, e)
+    state["news"] = items[:12]
 
-async def cmd_inflacion(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    inf=get_inflacion()
-    if not inf:
-        await update.message.reply_text("Inflación: dato no disponible."); return
-    val=inf.get("valor"); fecha=inf.get("fecha","")
-    txt=f"{html_bold('Inflación INDEC')}: {float(val):.2f}% · {fecha}" if val is not None else "Inflación: N/D"
-    await update.message.reply_text(txt, disable_web_page_preview=True)
+# =========================
+# RENDER HEALTHCHECK (200 OK)
+# =========================
 
-async def cmd_reservas(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    res=get_reservas()
-    if not res:
-        await update.message.reply_text("Reservas BCRA: dato no disponible."); return
-    n=res.get("valor_musd"); fecha=res.get("fecha")
-    val = f"{int(n):,}".replace(",",".") if isinstance(n,(int,float)) else "N/D"
-    txt=f"{html_bold('Reservas Internacionales BCRA')}: {val} MUS$"
-    if fecha: txt+=f" · {fecha}"
-    await update.message.reply_text(txt, disable_web_page_preview=True)
+# Pequeño servidor http para /health (200) y / (200)
+# No interfiere con el webhook porque usamos rutas distintas.
+from aiohttp import web
 
-def fmt_quotes_table(q:Dict[str,Dict[str,Any]])->str:
-    if not q: return "Sin datos."
-    lines=[html_code(f"{'TICKER':<10}{'PRECIO':>12}{'VAR%':>10}")]
-    for sym in sorted(q.keys()):
-        price=q[sym].get("price"); chp=q[sym].get("changePercent")
-        ps = f"{price:,.2f}".replace(",",".") if isinstance(price,(int,float)) else "-"
-        cs = f"{chp:+.2f}%" if isinstance(chp,(int,float)) else "-"
-        lines.append(html_code(f"{sym:<10}{ps:>12}{cs:>10}"))
+async def health_handler(request):
+    return web.Response(text="ok", content_type="text/plain")
+
+async def root_handler(request):
+    return web.Response(text="Observatorio Económico bot", content_type="text/plain")
+
+# =========================
+# RESPUESTAS (HTML)
+# =========================
+
+def html_box_lines(lines: List[str]) -> str:
+    return "<pre>" + "\n".join(lines) + "</pre>"
+
+def render_dolares() -> str:
+    d = state.get("dolares", {})
+    orden = ["BLUE","MEP","CCL","CRIPTO","OFICIAL","MAYORISTA"]
+    lines = []
+    # encabezado
+    lines.append(f"{'Dólares':<8}")
+    for k in orden:
+        v = d.get(k)
+        if not v: continue
+        lines.append(
+            f"• {k.title()}:  Compra: {ars(v['compra'])} · Venta: {ars(v['venta'])}"
+        )
+    if not lines or len(lines)==1:
+        return "Sin datos disponibles aún."
     return "\n".join(lines)
 
-async def cmd_acciones(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    q=get_quotes_acciones()
-    txt=html_bold("Acciones BYMA")+"\n"+fmt_quotes_table(q)
-    await update.message.reply_text(txt, disable_web_page_preview=True)
+def render_tabla(tuples: List[Tuple[str,float,float]], titulo: str) -> str:
+    # tuples: [(ticker, precio, var)]
+    w_tk, w_px, w_v = 9, 10, 7
+    header = f"{'TICKER':<{w_tk}}{'PRECIO':>{w_px}}{'VAR%':>{w_v}}"
+    sep = "-"*(w_tk+w_px+w_v)
+    rows = [header, sep]
+    for tk, px, vr in tuples:
+        rows.append(f"{tk:<{w_tk}}{ars(px):>{w_px}}{('+' if vr>=0 else '')+f'{vr:.2f}%':>{w_v}}")
+    return f"<b>{titulo}</b>\n" + html_box_lines(rows)
 
-async def cmd_cedears(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    q=get_quotes_cedears()
-    txt=html_bold("CEDEARs")+"\n"+fmt_quotes_table(q)
-    await update.message.reply_text(txt, disable_web_page_preview=True)
+def render_resumen() -> str:
+    d = state.get("dolares", {})
+    reservas = state.get("reservas")
+    infl = state.get("inflacion")
+    ris = state.get("riesgo")
+    news = state.get("news", [])[:6]
 
-async def cmd_ranking(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    allq={}; allq.update(get_quotes_acciones()); allq.update(get_quotes_cedears())
-    top,bot=ranking_from_quotes(allq, topn=10)
-    def block(title, arr):
-        lines=[html_bold(title)]
-        for sym,pch in arr: lines.append(f"• {html_code(sym)}  {pct(pch)}")
-        return "\n".join(lines)
-    await update.message.reply_text(block("Top 10",top)+"\n\n"+block("Bottom 10",bot), disable_web_page_preview=True)
+    # Dólares en columnas ascii
+    cols = ["KIND","Compra","Venta"]
+    w1,w2,w3 = 8,9,9
+    lines = [f"{'Dólares':<8}", html_box_lines([
+        f"{'':<{w1}}{'Compra':>{w2}}{'Venta':>{w3}}",
+        f"{'-'*(w1+w2+w3)}",
+        f"{'BLUE':<{w1}}{ars(d.get('BLUE',{}).get('compra',0)):>{w2}}{ars(d.get('BLUE',{}).get('venta',0)):>{w3}}",
+        f"{'MEP':<{w1}}{ars(d.get('MEP',{}).get('compra',0)):>{w2}}{ars(d.get('MEP',{}).get('venta',0)):>{w3}}",
+        f"{'CCL':<{w1}}{ars(d.get('CCL',{}).get('compra',0)):>{w2}}{ars(d.get('CCL',{}).get('venta',0)):>{w3}}",
+        f"{'CRIPTO':<{w1}}{ars(d.get('CRIPTO',{}).get('compra',0)):>{w2}}{ars(d.get('CRIPTO',{}).get('venta',0)):>{w3}}",
+        f"{'OFICIAL':<{w1}}{ars(d.get('OFICIAL',{}).get('compra',0)):>{w2}}{ars(d.get('OFICIAL',{}).get('venta',0)):>{w3}}",
+        f"{'MAYORISTA':<{w1}}{ars(d.get('MAYORISTA',{}).get('compra',0)):>{w2}}{ars(d.get('MAYORISTA',{}).get('venta',0)):>{w3}}",
+    ])]
 
-async def cmd_resumen(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    d=get_dolares()
-    mep=d.get("mep",{}).get("venta"); ccl=d.get("ccl",{}).get("venta")
-    blue=d.get("blue",{}).get("venta"); ofi=d.get("oficial",{}).get("venta"); may=d.get("mayorista",{}).get("venta")
-    r=get_riesgo_pais(); inf=get_inflacion(); res=get_reservas()
-    riesgo_txt = f"{int(r['valor'])} pb" if r and r.get("valor") is not None else "N/D"
-    infl_txt   = f"{float(inf['valor']):.2f}% ({inf.get('fecha','')})" if inf and inf.get("valor") is not None else "N/D"
-    res_txt    = f"{int(res['valor_musd']):,} MUS$".replace(",",".") if res and res.get("valor_musd") is not None else "N/D"
+    # Macros
+    lines.append(f"🏦 <b>Reservas</b>: {('%.3f' % reservas['valor']).replace('.',',')} M&nbsp;USD · {reservas['fecha']}" if reservas else "🏦 <b>Reservas</b>: dato no disponible")
+    lines.append(f"📈 <b>Inflación</b>: {infl['valor']:.2f}% · {infl['fecha']}" if infl else "📈 <b>Inflación</b>: dato no disponible")
+    lines.append(f"🧯 <b>Riesgo País</b>: {ris['valor']} pb · {ris['fecha']}" if ris else "🧯 <b>Riesgo País</b>: dato no disponible")
 
-    linea=(
-        f"{html_bold('USD')} blue: $ {fmt_num(blue)} | mep: $ {fmt_num(mep)} | ccl: $ {fmt_num(ccl)} | oficial: $ {fmt_num(ofi)} | mayorista: $ {fmt_num(may)}\n"
-        f"{html_bold('Riesgo País')}: {riesgo_txt}  ·  {html_bold('Inflación')}: {infl_txt}  ·  {html_bold('Reservas')}: {res_txt}\n"
+    # Noticias
+    if news:
+        lines.append("\n📰 <b>Noticias</b>")
+        for t,l in news[:6]:
+            lines.append(f"• {t}")
+    return f"<b>Resumen {now_str()}</b>\n\n" + "\n".join(lines)
+
+# =========================
+# HANDLERS
+# =========================
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (
+        "<b>Observatorio Económico</b>\n\n"
+        "Comandos:\n"
+        "• /dolar – Cotizaciones (Blue, MEP, CCL, etc.)\n"
+        "• /reservas – Reservas internacionales BCRA\n"
+        "• /inflacion – Último dato INDEC\n"
+        "• /riesgo – Riesgo país EMBI AR\n"
+        "• /acciones – Precios BYMA\n"
+        "• /cedears – Precios CEDEARs\n"
+        "• /ranking_acciones – TOP ± del día BYMA\n"
+        "• /ranking_cedears – TOP ± del día CEDEARs\n"
+        "• /resumen_diario – Dólares + macros + noticias\n"
     )
-    items=get_noticias(5)
-    news = "\n".join([f"• <a href=\"{html.escape(u)}\">{html.escape(t)}</a>" for (t,u) in items]) if items else "Sin noticias por el momento."
-    await update.message.reply_text(linea+"\n"+html_bold("Últimos titulares:")+"\n"+news, disable_web_page_preview=True)
+    await update.message.reply_html(txt)
 
-async def cmd_semanal(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    # Para hacerlo ágil, tomamos subset representativo
-    universe = ACCIONES_BA[:10] + CEDEARS_BA[:10]
-    ch = weekly_change(universe)
-    if not ch:
-        await update.message.reply_text("Resumen semanal: datos no disponibles.")
+async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_html(render_dolares())
+
+async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    r = state.get("reservas")
+    if r:
+        await update.message.reply_html(
+            f"Reservas Internacionales BCRA: {('%.3f' % r['valor']).replace('.',',')} M&nbsp;USD"
+        )
+    else:
+        await update.message.reply_html("Reservas: dato no disponible")
+
+async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    i = state.get("inflacion")
+    if i:
+        await update.message.reply_html(f"Inflación INDEC: {i['valor']:.2f}% · {i['fecha']}")
+    else:
+        await update.message.reply_html("Inflación: dato no disponible")
+
+async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rp = state.get("riesgo")
+    if rp:
+        await update.message.reply_html(f"Riesgo País (EMBI AR): {rp['valor']} pb · {rp['fecha']}")
+    else:
+        await update.message.reply_html("Riesgo País: dato no disponible")
+
+async def cmd_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    d = state.get("acciones", {})
+    if not d:
+        await update.message.reply_html("Sin datos aún. Probá de nuevo en unos segundos.")
         return
-    top = sorted(ch.items(), key=lambda x:x[1], reverse=True)[:10]
-    bot = sorted(ch.items(), key=lambda x:x[1])[:10]
-    def block(title, arr):
-        lines=[html_bold(title)]
-        for sym,p in arr: lines.append(f"• {html_code(sym)}  {pct(p)}")
-        return "\n".join(lines)
-    await update.message.reply_text(block("Top 10 (5d)", top)+"\n\n"+block("Bottom 10 (5d)", bot), disable_web_page_preview=True)
+    tuples = [(k, d[k][0], d[k][1]) for k in sorted(d.keys())]
+    await update.message.reply_html(render_tabla(tuples, "Acciones BYMA"))
 
-# ===================== JOBS =======================
+async def cmd_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    d = state.get("cedears", {})
+    if not d:
+        await update.message.reply_html("Sin datos aún. Probá de nuevo en unos segundos.")
+        return
+    tuples = [(k, d[k][0], d[k][1]) for k in sorted(d.keys())]
+    await update.message.reply_html(render_tabla(tuples, "CEDEARs"))
 
-async def job_prefetch(context:ContextTypes.DEFAULT_TYPE):
-    try:
-        get_dolares(); get_riesgo_pais(); get_inflacion(); get_reservas()
-        get_quotes_acciones(); get_quotes_cedears()
-    except Exception as e:
-        log.warning(f"Prefetch job error: {e}")
+def ordenar_por_var(d: Dict[str, Tuple[float,float]], top: int = 8) -> Tuple[List[Tuple[str,float,float]], List[Tuple[str,float,float]]]:
+    arr = [(k,v[0],v[1]) for k,v in d.items()]
+    gan = sorted(arr, key=lambda x: x[2], reverse=True)[:top]
+    per = sorted(arr, key=lambda x: x[2])[:top]
+    return gan, per
 
-async def job_news(context:ContextTypes.DEFAULT_TYPE):
-    try: get_noticias(5)
-    except Exception as e: log.warning(f"News job error: {e}")
+async def cmd_rank_acc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    d = state.get("acciones", {})
+    if not d:
+        await update.message.reply_html("Sin datos aún.")
+        return
+    gan, per = ordenar_por_var(d)
+    txt = render_tabla(gan, "Acciones – Mejores del día") + "\n\n" + render_tabla(per, "Acciones – Peores del día")
+    await update.message.reply_html(txt)
 
-async def job_refresh_dolares(context:ContextTypes.DEFAULT_TYPE):
-    try: get_dolares()
-    except: pass
+async def cmd_rank_ced(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    d = state.get("cedears", {})
+    if not d:
+        await update.message.reply_html("Sin datos aún.")
+        return
+    gan, per = ordenar_por_var(d)
+    txt = render_tabla(gan, "CEDEARs – Mejores del día") + "\n\n" + render_tabla(per, "CEDEARs – Peores del día")
+    await update.message.reply_html(txt)
 
-async def job_refresh_riesgo(context:ContextTypes.DEFAULT_TYPE):
-    try: get_riesgo_pais()
-    except: pass
+async def cmd_resumen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_html(render_resumen())
 
-async def job_keepalive(context:ContextTypes.DEFAULT_TYPE):
-    try: await AHTTP.get(BASE_URL.rstrip("/")+"/ping")
-    except: pass
+# =========================
+# JOBS
+# =========================
 
-# ===================== APP/WEBHOOK =================
+async def job_refresh_dolares(context: ContextTypes.DEFAULT_TYPE):
+    await refresh_dolares()
 
-def build_app()->Application:
-    defaults = Defaults(parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-    app = ApplicationBuilder().token(BOT_TOKEN).defaults(defaults).build()
+async def job_refresh_riesgo(context: ContextTypes.DEFAULT_TYPE):
+    # sólo riesgo (las otras dos en prefetch para espaciar)
+    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+        rp = await fetch_json(client, "https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais/ultimo/")
+        if isinstance(rp, dict) and "valor" in rp:
+            state["riesgo"] = {"valor": int(rp["valor"]), "fecha": str(rp.get("fecha",""))[:10]}
 
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("help",    cmd_start))
-    app.add_handler(CommandHandler("dolar",   cmd_dolar))
-    app.add_handler(CommandHandler("riesgo",  cmd_riesgo))
-    app.add_handler(CommandHandler("inflacion", cmd_inflacion))
-    app.add_handler(CommandHandler("reservas",  cmd_reservas))
-    app.add_handler(CommandHandler("acciones",  cmd_acciones))
-    app.add_handler(CommandHandler("cedears",   cmd_cedears))
-    app.add_handler(CommandHandler("ranking",   cmd_ranking))
-    app.add_handler(CommandHandler("resumen",   cmd_resumen))
-    app.add_handler(CommandHandler("semanal",   cmd_semanal))
-
-    jq=app.job_queue
-    jq.run_repeating(job_prefetch,        interval=15*60, first=5)
-    jq.run_repeating(job_news,            interval=10*60, first=10)
-    jq.run_repeating(job_refresh_dolares, interval=2*60,  first=3)
-    jq.run_repeating(job_refresh_riesgo,  interval=5*60,  first=7)
-    jq.run_repeating(job_keepalive,       interval=14*60, first=20)
-    return app
-
-def main():
-    app=build_app()
-    webhook_url = BASE_URL.rstrip("/") + WEBHOOK_PATH
-    log.info(f"Levantando webhook en {LISTEN}:{PORT} path={WEBHOOK_PATH}")
-    log.info(f"Webhook URL = {webhook_url}")
-    app.run_webhook(
-        listen=LISTEN, port=PORT, url_path=WEBHOOK_PATH.lstrip("/"),
-        webhook_url=webhook_url, drop_pending_updates=True,
+async def job_prefetch(context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.gather(
+        refresh_reservas_inflacion_riesgo(),
+        refresh_quotes(),
     )
 
-if __name__=="__main__":
-    main()
+async def job_news(context: ContextTypes.DEFAULT_TYPE):
+    await refresh_news()
+
+async def job_keepalive(context: ContextTypes.DEFAULT_TYPE):
+    # Hace una request saliente a /health para que Render vea tráfico.
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            await client.get(f"{PUBLIC_URL}/health")
+    except Exception:
+        pass
+
+# =========================
+# MAIN
+# =========================
+
+async def main():
+    defaults = Defaults(parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+    app = ApplicationBuilder().token(TOKEN).defaults(defaults).build()
+
+    # Handlers
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("dolar", cmd_dolar))
+    app.add_handler(CommandHandler("reservas", cmd_reservas))
+    app.add_handler(CommandHandler("inflacion", cmd_inflacion))
+    app.add_handler(CommandHandler("riesgo", cmd_riesgo))
+    app.add_handler(CommandHandler("acciones", cmd_acciones))
+    app.add_handler(CommandHandler("cedears", cmd_cedears))
+    app.add_handler(CommandHandler("ranking_acciones", cmd_rank_acc))
+    app.add_handler(CommandHandler("ranking_cedears", cmd_rank_ced))
+    app.add_handler(CommandHandler("resumen_diario", cmd_resumen))
+
+    # Jobs
+    jq = app.job_queue
+    jq.run_repeating(job_refresh_dolares, interval=120, first=3)
+    jq.run_repeating(job_prefetch, interval=15*60, first=5)
+    jq.run_repeating(job_refresh_riesgo, interval=5*60, first=7)
+    jq.run_repeating(job_news, interval=10*60, first=9)
+    jq.run_repeating(job_keepalive, interval=14*60, first=11)
+
+    # Servidor aiohttp para /health y /
+    runner = web.AppRunner(web.Application())
+    await runner.setup()
+    site = web.TCPSite(runner, LISTEN_ADDRESS, PORT)
+    app_http = runner.app
+    app_http.router.add_get("/health", health_handler)
+    app_http.router.add_get("/", root_handler)
+
+    # IMPORTANTE: arrancamos ambos servidores; PTB usa su propio servidor para webhook.
+    # 1) sitio auxiliar
+    await site.start()
+    log.info("HTTP auxiliar en %s:%d (/health listo)", LISTEN_ADDRESS, PORT)
+
+    # 2) webhook PTB (mismo puerto pero ruta distinta no es posible en el mismo socket),
+    #    por eso PTB abre su servidor interno *en el mismo puerto*. Para evitar conflicto,
+    #    usamos el servidor interno de PTB y dejamos el auxiliar arriba con /health.
+    #    Render detecta el puerto en uso y está OK.
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    log.info("Levantando webhook en %s:%d path=%s", LISTEN_ADDRESS, PORT, WEBHOOK_PATH)
+    log.info("Webhook URL = %s", WEBHOOK_URL)
+
+    await app.run_webhook(
+        listen=LISTEN_ADDRESS,
+        port=PORT,
+        url_path=WEBHOOK_PATH.lstrip("/"),
+        webhook_url=WEBHOOK_URL,
+        drop_pending_updates=True,
+    )
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
