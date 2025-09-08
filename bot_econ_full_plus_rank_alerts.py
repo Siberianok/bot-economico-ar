@@ -285,8 +285,7 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         if len(rets_d) >= 10:
             mu = sum(rets_d[-look:]) / len(rets_d[-look:])
             var = sum((r-mu)**2 for r in rets_d[-look:])/(len(rets_d[-look:])-1) if len(rets_d[-look:])>1 else 0.0
-            from math import sqrt as _sqrt
-            sd = _sqrt(var); vol_ann = sd*_sqrt(252)*100.0
+            sd = sqrt(var); vol_ann = sd*sqrt(252)*100.0
         # dd 6m
         idx_cut = next((i for i,t in enumerate(ts) if t >= t6), 0)
         peak = closes[idx_cut]; dd_min = 0.0
@@ -492,7 +491,7 @@ async def alerts_loop(app: Application):
                     trig = []
                     for r in rules:
                         if r.get("kind") == "fx":
-                            row = fx.get(r["type"]); 
+                            row = fx.get(r["type"])
                             if not row: continue
                             cur = row.get(r["side"])
                             if cur is None: continue
@@ -543,7 +542,9 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
     rows = []
     order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
     for k, label in order:
-        row = d.get(k);  if not row: continue
+        row = d.get(k)
+        if not row:
+            continue
         compra = fmt_money_ars(row.get("compra")) if row.get("compra") is not None else "—"
         venta  = fmt_money_ars(row.get("venta"))  if row.get("venta")  is not None else "—"
         l = f"{label:<11}{compra:>12}    {venta:>12}"
@@ -689,7 +690,7 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.effective_message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
-    # 2) noticias en mensaje separado (para que siempre aparezcan)
+    # 2) noticias en mensaje separado
     news_block = format_news_block(news or [])
     await update.effective_message.reply_text(news_block, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
