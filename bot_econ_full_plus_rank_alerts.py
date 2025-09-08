@@ -2,22 +2,13 @@
 # -*- coding: utf-8 -*-
 #
 # Telegram bot Económico AR para Render (webhook only, sin polling)
-# - Endpoint raíz "/" para health/keepalive (200 OK)
-# - Webhook en "/<WEBHOOK_SECRET>" (POST)
-# - Comandos:
+# Comandos:
 #   /dolar /acciones /cedears
 #   /rankings_acciones /rankings_cedears
 #   /reservas /inflacion /riesgo /resumen_diario
 #   /alertas /alertas_add /alertas_clear
 #
-# Fuentes: CriptoYa, DolarAPI, ArgentinaDatos, Yahoo Finance (v8 chart),
-#          RSS (Ámbito, iProfesional, Infobae, Perfil, BAE, Télam)
-#
-# requirements.txt:
-#   python-telegram-bot>=21.5
-#   aiohttp>=3.9
-#
-# Start (Render): python bot_econ_full_plus_rank_alerts.py
+# Fuentes: CriptoYa, DolarAPI, ArgentinaDatos, Yahoo Finance (v8 chart), RSS (Ámbito, iProfesional, Infobae, Perfil, BAE, Télam)
 #
 import os
 import asyncio
@@ -282,7 +273,7 @@ async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, 
 
 # ------------------------------ Yahoo métricas 1Y --------------------------
 
-RET_CACHE_1Y: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}  # key: f"{host}|{symbol}|{interval}"
+RET_CACHE_1Y: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
 RET_TTL = 600  # 10 minutos
 
 async def _yf_chart_1y(session: ClientSession, symbol: str, interval: str) -> Optional[Dict[str, Any]]:
@@ -349,10 +340,10 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         look = 60 if len(rets_d) >= 60 else max(10, len(rets_d)-1)
         vol_ann = None
         if len(rets_d) >= 10:
-            # desv. estándar
             mu = sum(rets_d[-look:]) / len(rets_d[-look:])
-            var = sum((x-mu)**2 for x in rets_d[-look:]) / (len(rets_d[-look:]) - 1)
-            vol_ann = sqrt(var)*sqrt(252)*100.0
+            var = sum((r-mu)**2 for r in rets_d[-look:])/(len(rets_d[-look:])-1) if len(rets_d[-look:])>1 else 0.0
+            sd = sqrt(var)
+            vol_ann = sd*sqrt(252)*100.0
 
         # Máx drawdown 6M
         idx_cut = next((i for i,t in enumerate(ts) if t >= t6), 0)
@@ -367,7 +358,7 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         # Proximidad a máx 52s
         hi52 = (last/max(closes) - 1.0)*100.0
 
-        # SMAs (pendiente 50)
+        # SMA y pendiente
         def _sma(vals, w):
             out, s, q = [None]*len(vals), 0.0, []
             for i, v in enumerate(vals):
@@ -424,25 +415,21 @@ def _nz(x: Optional[float], fallback: float) -> float:
     return float(x) if x is not None else fallback
 
 def projection_pct(m: Dict[str, Optional[float]]) -> float:
-    # Momentum
     ret6 = _nz(m.get("6m"), -100.0)
     ret3 = _nz(m.get("3m"), -50.0)
     ret1 = _nz(m.get("1m"), -20.0)
     momentum = 0.5*ret6 + 0.3*ret3 + 0.2*ret1
-    # Tendencia
     hi52   = _nz(m.get("hi52"), 0.0)
     slope  = _nz(m.get("slope50"), 0.0)
     trend  = _nz(m.get("trend_flag"), 0.0)
-    # Riesgo
     vol    = _nz(m.get("vol_ann"), 40.0)
     dd6    = _nz(m.get("dd6m"), 30.0)
-    # Proyección compuesta
     proj = 0.5*momentum + 0.2*hi52 + 0.2*slope - 0.05*vol - 0.05*dd6 + 3.0*trend
     return proj
 
 # ------------------------------ Noticias -----------------------------------
 
-from xml.etree import ElementTree
+from xml.etree import ElementTree as ET
 
 KEYWORDS = [
     "inflación","ipc","índice de precios","devalu","dólar","ccl","mep","blue",
@@ -464,75 +451,74 @@ def _score_title(title: str) -> int:
     for kw in KEYWORDS:
         if kw in t:
             score += 3
-    for kw in ("sube","baja","récord","acelera","cae","acuerdo","medida","ley","resolución","emergencia","reperfil"):
+    for kw in ("sube","baja","récord","acelera","cae","acuerdo","medida","ley","resolución","emergencia","reperfil","brecha"):
         if kw in t:
             score += 1
     return score
 
-def _xml_text(el: Optional[ElementTree.Element]) -> Optional[str]:
-    if el is None: return None
-    txt = el.text or ""
-    return txt.strip() or None
+def _parse_feed_entries(xml: str) -> List[Tuple[str, str]]:
+    """Devuelve [(title, link)] desde RSS 2.0 o Atom (maneja namespaces y <link href=...>)."""
+    out: List[Tuple[str, str]] = []
+    try:
+        root = ET.fromstring(xml)
+    except Exception:
+        return out
 
-def _find_any(el: ElementTree.Element, names: List[str]) -> Optional[ElementTree.Element]:
-    for n in names:
-        found = el.find(n)
-        if found is not None:
-            return found
-        # namespaced wildcard
-        found = el.find(f".//{{*}}{n}")
-        if found is not None:
-            return found
-    return None
+    # RSS 2.0
+    for item in root.findall(".//item"):
+        t_el = item.find("title")
+        l_el = item.find("link")
+        t = (t_el.text or "").strip() if (t_el is not None and t_el.text) else None
+        l = (l_el.text or "").strip() if (l_el is not None and l_el.text) else None
+        if t and l: out.append((t, l))
+
+    # Atom
+    for entry in root.findall(".//{*}entry"):
+        t_el = entry.find(".//{*}title")
+        link_el = entry.find(".//{*}link[@rel='alternate']") or entry.find(".//{*}link")
+        t = (t_el.text or "").strip() if (t_el is not None and t_el.text) else None
+        l = link_el.get("href").strip() if (link_el is not None and link_el.get("href")) else None
+        if (not l) and entry.find(".//{*}id") is not None:
+            l = (entry.find(".//{*}id").text or "").strip()
+        if t and l: out.append((t, l))
+
+    # Fallback super simple (por si algún feed viene raro)
+    if not out:
+        for m in re.finditer(r"<title>(.*?)</title>.*?<link>(https?://[^<]+)</link>", xml, flags=re.S|re.I):
+            t = re.sub(r"<.*?>", "", m.group(1)).strip()
+            l = m.group(2).strip()
+            if t and l: out.append((t, l))
+    return out
 
 async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tuple[str, str]]:
-    entries: List[Tuple[str,str]] = []
+    entries: List[Tuple[str, str]] = []
     for url in RSS_FEEDS:
         xml = await fetch_text(session, url)
-        if not xml:
+        if not xml: 
             continue
         try:
-            root = ElementTree.fromstring(xml)
-
-            # --- RSS 2.0 (items) ---
-            for item in root.findall(".//item"):
-                t = _xml_text(_find_any(item, ["title"]))
-                lnode = _find_any(item, ["link"])
-                l = None
-                if lnode is not None:
-                    # Algunos RSS tienen <link>texto</link>, otros usan atributo
-                    l = (lnode.get("href") or lnode.text or "").strip() or None
-                if t and l:
-                    entries.append((t, l))
-
-            # --- Atom (entries) ---
-            for entry in root.findall(".//{http://www.w3.org/2005/Atom}entry") + root.findall(".//entry"):
-                t = _xml_text(_find_any(entry, ["title"]))
-                lnode = _find_any(entry, ["link"])
-                l = None
-                if lnode is not None:
-                    l = (lnode.get("href") or lnode.text or "").strip() or None
-                if t and l:
-                    entries.append((t, l))
-
+            entries.extend(_parse_feed_entries(xml))
         except Exception as e:
             log.warning("RSS parse %s: %s", url, e)
 
     # únicos por link
-    uniq: Dict[str,str] = {}
+    uniq: Dict[str, str] = {}
     for t, l in entries:
-        if l and l not in uniq:
+        if l not in uniq and l.startswith("http"):
             uniq[l] = t
 
-    # orden por score y selección balanceada por dominio
+    if not uniq:
+        return []
+
+    # orden por relevancia y selección balanceada por dominio
     scored = sorted([(t,l,_score_title(t), domain_of(l)) for l,t in uniq.items()],
                     key=lambda x: x[2], reverse=True)
 
     picked: List[Tuple[str,str]] = []
     count_by_domain: Dict[str,int] = {}
-    # 1) preferir no-paywall y máx 2 por dominio
+    # 1) preferir no-paywall y max 2 por dominio
     for t,l,_,dom in scored:
-        if dom in AVOID_DOMAINS:  # evitar paywalls conocidos
+        if dom in AVOID_DOMAINS:
             continue
         if count_by_domain.get(dom,0) >= 2:
             continue
@@ -540,7 +526,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         if len(picked) >= limit:
             return picked
 
-    # 2) completar si faltan
+    # 2) completar con cualquiera si faltan (incluye dominios evitados)
     for t,l,_,dom in scored:
         if (t,l) in picked:
             continue
@@ -553,21 +539,23 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     return picked[:limit]
 
 def format_news_block(news: List[Tuple[str, str]]) -> str:
-    title = "<u>Top 5 noticias</u>"
     if not news:
-        return title + "\n—"
+        return "<u>Top 5 noticias</u>\n—"
     body = "\n\n".join([f"{i}. {anchor(l, t)}" for i,(t,l) in enumerate(news, 1)])
-    return title + "\n" + body
+    return "<u>Top 5 noticias</u>\n" + body
 
 # ------------------------------ Alertas (memoria) --------------------------
 
-ALERTS: Dict[int, List[Dict[str, Any]]] = {}  # {chat_id: [ {type, op, value} ]}
+ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 
 def parse_alert_add(args: List[str]) -> Optional[Tuple[str, str, float]]:
-    if len(args) != 3: return None
-    tipo, op = args[0].lower(), args[1]
-    raw = args[2].strip()
-    s = raw.replace(".", "").replace(",", ".")  # 1.500,25 -> 1500.25
+    if not args or len(args) < 3: return None
+    tipo = args[0].lower().strip()
+    op   = args[1].strip()
+    raw  = " ".join(args[2:]).strip()
+    s = raw
+    s = s.replace("pb","").replace("%","").replace("MUS$","").replace("mus$","")
+    s = s.replace(".", "").replace(",", ".")
     try:
         val = float(s)
     except Exception:
@@ -595,7 +583,8 @@ async def alerts_loop(app: Application):
     timeout = ClientTimeout(total=12)
     while True:
         try:
-            if any(ALERTS.values()):
+            has_any = any((len(v)>0) for v in ALERTS.values())
+            if has_any:
                 async with ClientSession(timeout=timeout) as session:
                     vals = await read_metrics_for_alerts(session)
                 for chat_id, rules in list(ALERTS.items()):
@@ -802,7 +791,7 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
         iv_str = str(round(iv,1)).replace(".", ",")
         blocks.append(f"<b>📉 Inflación mensual</b>{f'  <i>{ip}</i>' if ip else ''}\n<b>{iv_str}%</b>\n<i>Fuente: ArgentinaDatos</i>")
 
-    # SIEMPRE mostrar el bloque de noticias (aunque esté vacío)
+    # Noticias (siempre agrega el bloque, aunque esté vacío)
     blocks.append(format_news_block(news or []))
 
     await update.effective_message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
@@ -810,80 +799,92 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ---------- Alert commands ----------
 
 async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    rules = ALERTS.get(chat_id, [])
-    if not rules:
-        txt = ("No tenés alertas configuradas.\n\n"
-               "Agregá con:\n"
-               "/alertas_add <tipo> <op> <valor>\n"
-               "  tipos: blue, mep, ccl, riesgo, inflacion, reservas\n"
-               "  op: > o <\n"
-               "Ej.: /alertas_add blue > 1500")
-    else:
-        lines = ["<b>🔔 Alertas configuradas</b>"]
-        for r in rules:
-            t,op,v = r["type"], r["op"], r["value"]
-            if t in {"blue","mep","ccl"}: val = fmt_money_ars(v)
-            elif t=="riesgo": val = f"{v:.0f} pb"
-            elif t=="reservas": val = f"{fmt_number(v,0)} MUS$"
-            else: val = f"{str(round(v,1)).replace('.',',')}%"
-            lines.append(f"• {t.UPPER()} {op} {val}" if hasattr(str, "UPPER") else f"• {t.upper()} {op} {val}")
-        lines.append("\nPara borrar: /alertas_clear [tipo]")
-        txt = "\n".join(lines)
-    await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    try:
+        chat_id = update.effective_chat.id
+        rules = ALERTS.get(chat_id, [])
+        if not rules:
+            txt = ("No tenés alertas configuradas.\n\n"
+                   "Agregá con:\n"
+                   "/alertas_add <tipo> <op> <valor>\n"
+                   "  tipos: blue, mep, ccl, riesgo, inflacion, reservas\n"
+                   "  op: > o <\n"
+                   "Ej.: /alertas_add blue > 1500")
+        else:
+            lines = ["<b>🔔 Alertas configuradas</b>"]
+            for r in rules:
+                t,op,v = r["type"], r["op"], r["value"]
+                if t in {"blue","mep","ccl"}: val = fmt_money_ars(v)
+                elif t=="riesgo": val = f"{v:.0f} pb"
+                elif t=="reservas": val = f"{fmt_number(v,0)} MUS$"
+                else: val = f"{str(round(v,1)).replace('.',',')}%"
+                lines.append(f"• {t.upper()} {op} {val}")
+            lines.append("\nPara borrar: /alertas_clear [tipo]")
+            txt = "\n".join(lines)
+        await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    except Exception as e:
+        log.warning("/alertas error: %s", e)
+        await update.effective_message.reply_text("Error al listar alertas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_alertas_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    parsed = parse_alert_add(context.args)
-    if not parsed:
+    try:
+        parsed = parse_alert_add(context.args or [])
+        if not parsed:
+            await update.effective_message.reply_text(
+                "Formato: /alertas_add <tipo> <op> <valor>\n"
+                "  tipos: blue, mep, ccl, riesgo, inflacion, reservas\n"
+                "  op: > o <\n"
+                "Ej.: /alertas_add blue > 1500",
+                parse_mode=ParseMode.HTML,
+                link_preview_options=LinkPreviewOptions(is_disabled=True),
+            )
+            return
+        tipo, op, val = parsed
+        chat_id = update.effective_chat.id
+        ALERTS.setdefault(chat_id, []).append({"type": tipo, "op": op, "value": val})
+
+        # Chequeo inmediato del valor actual (feedback)
+        async with ClientSession() as session:
+            cur_vals = await read_metrics_for_alerts(session)
+        cur = cur_vals.get(tipo)
+        if tipo in {"blue","mep","ccl"}:
+            cur_s = fmt_money_ars(cur) if cur is not None else "—"
+            thr_s = fmt_money_ars(val)
+        elif tipo == "riesgo":
+            cur_s = f"{cur:.0f} pb" if cur is not None else "—"
+            thr_s = f"{val:.0f} pb"
+        elif tipo == "reservas":
+            cur_s = f"{fmt_number(cur,0)} MUS$" if cur is not None else "—"
+            thr_s = f"{fmt_number(val,0)} MUS$"
+        else:  # inflacion
+            cur_s = f"{str(round(cur,1)).replace('.',',')}%" if cur is not None else "—"
+            thr_s = f"{str(round(val,1)).replace('.',',')}%"
+
         await update.effective_message.reply_text(
-            "Formato: /alertas_add <tipo> <op> <valor>\n"
-            "  tipos: blue, mep, ccl, riesgo, inflacion, reservas\n"
-            "  op: > o <\n"
-            "Ej.: /alertas_add blue > 1500",
-            parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            f"Listo. Alerta agregada ✅\nAhora: {tipo.UPPER()} = {cur_s}\nSe avisará si {tipo.upper()} {op} {thr_s}",
+            parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True)
         )
-        return
-    tipo, op, val = parsed
-    chat_id = update.effective_chat.id
-    ALERTS.setdefault(chat_id, []).append({"type": tipo, "op": op, "value": val})
-
-    # Chequeo inmediato del valor actual (feedback veloz)
-    async with ClientSession() as session:
-        cur_vals = await read_metrics_for_alerts(session)
-    cur = cur_vals.get(tipo)
-    if tipo in {"blue","mep","ccl"}:
-        cur_s = fmt_money_ars(cur) if cur is not None else "—"
-        thr_s = fmt_money_ars(val)
-    elif tipo == "riesgo":
-        cur_s = f"{cur:.0f} pb" if cur is not None else "—"
-        thr_s = f"{val:.0f} pb"
-    elif tipo == "reservas":
-        cur_s = f"{fmt_number(cur,0)} MUS$" if cur is not None else "—"
-        thr_s = f"{fmt_number(val,0)} MUS$"
-    else:  # inflacion
-        cur_s = f"{str(round(cur,1)).replace('.',',')}%" if cur is not None else "—"
-        thr_s = f"{str(round(val,1)).replace('.',',')}%"
-
-    await update.effective_message.reply_text(
-        f"Listo. Alerta agregada ✅\nAhora: {tipo.upper()} = {cur_s}\nSe avisará si {tipo.upper()} {op} {thr_s}",
-        parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True)
-    )
+    except Exception as e:
+        log.warning("/alertas_add error: %s", e)
+        await update.effective_message.reply_text("Error al agregar la alerta.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    tipo = (context.args[0].lower() if context.args else None)
-    if not ALERTS.get(chat_id):
-        await update.effective_message.reply_text("No hay alertas para borrar.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-        return
-    if tipo:
-        before = len(ALERTS[chat_id])
-        ALERTS[chat_id] = [r for r in ALERTS[chat_id] if r["type"] != tipo]
-        after = len(ALERTS[chat_id])
-        await update.effective_message.reply_text(f"Eliminadas {before-after} alertas de tipo {tipo.upper()}.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-    else:
-        ALERTS[chat_id] = []
-        await update.effective_message.reply_text("Todas las alertas fueron eliminadas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    try:
+        chat_id = update.effective_chat.id
+        tipo = (context.args[0].lower() if context.args else None)
+        if not ALERTS.get(chat_id):
+            await update.effective_message.reply_text("No hay alertas para borrar.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+            return
+        if tipo:
+            before = len(ALERTS[chat_id])
+            ALERTS[chat_id] = [r for r in ALERTS[chat_id] if r["type"] != tipo]
+            after = len(ALERTS[chat_id])
+            await update.effective_message.reply_text(f"Eliminadas {before-after} alertas de tipo {tipo.upper()}.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+        else:
+            ALERTS[chat_id] = []
+            await update.effective_message.reply_text("Todas las alertas fueron eliminadas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    except Exception as e:
+        log.warning("/alertas_clear error: %s", e)
+        await update.effective_message.reply_text("Error al borrar alertas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 # ------------------------------ AIOHTTP + Webhook --------------------------
 
@@ -903,13 +904,7 @@ async def keepalive_loop(app: Application):
 async def on_startup(app: web.Application):
     await application.initialize()
     await application.start()
-    # ampliamos allowed_updates por si el usuario ejecuta comandos en canales
-    await application.bot.set_webhook(
-        url=WEBHOOK_URL,
-        allowed_updates=["message","edited_message","channel_post","edited_channel_post","callback_query"],
-        drop_pending_updates=True
-    )
-    # Nombres cortos del menú
+    await application.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=["message"], drop_pending_updates=True)
     cmds = [
         BotCommand("dolar", "Tipos de cambio"),
         BotCommand("acciones", "Top 3 acciones"),
@@ -955,4 +950,32 @@ def build_web_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", handle_root)
     app.router.add_post(WEBHOOK_PATH, handle_webhook)
-    app.on_start
+    app.on_startup.append(on_startup)
+    app.on_cleanup.append(on_cleanup)
+    return app
+
+# ------------------------------ PTB App ------------------------------------
+
+defaults = Defaults(parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True), tzinfo=TZ)
+application = Application.builder().token(TELEGRAM_TOKEN).defaults(defaults).updater(None).build()
+
+# Handlers
+application.add_handler(CommandHandler("dolar", cmd_dolar))
+application.add_handler(CommandHandler("acciones", cmd_acciones))
+application.add_handler(CommandHandler("cedears", cmd_cedears))
+application.add_handler(CommandHandler("rankings_acciones", cmd_rankings_acciones))
+application.add_handler(CommandHandler("rankings_cedears", cmd_rankings_cedears))
+application.add_handler(CommandHandler("reservas", cmd_reservas))
+application.add_handler(CommandHandler("inflacion", cmd_inflacion))
+application.add_handler(CommandHandler("riesgo", cmd_riesgo))
+application.add_handler(CommandHandler("resumen_diario", cmd_resumen_diario))
+application.add_handler(CommandHandler("alertas", cmd_alertas_list))
+application.add_handler(CommandHandler("alertas_add", cmd_alertas_add))
+application.add_handler(CommandHandler("alertas_clear", cmd_alertas_clear))
+
+# ------------------------------ Main ---------------------------------------
+
+if __name__ == "__main__":
+    log.info("Iniciando bot Económico AR (Render webhook)")
+    app = build_web_app()
+    web.run_app(app, host="0.0.0.0", port=PORT)
