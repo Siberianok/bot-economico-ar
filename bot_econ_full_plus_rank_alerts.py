@@ -14,6 +14,7 @@ import os
 import asyncio
 import logging
 import re
+import html as _html
 from time import time
 from math import sqrt
 from datetime import datetime, timedelta
@@ -97,7 +98,7 @@ def pct(n: Optional[float], nd: int = 2) -> str:
         return "—"
 
 def anchor(href: str, text: str) -> str:
-    return f'<a href="{href}">{text}</a>'
+    return f'<a href="{_html.escape(href, quote=True)}">{_html.escape(text)}</a>'
 
 def fmt_fecha_ddmmyyyy_from_iso(s: Optional[str]) -> Optional[str]:
     if not s: return None
@@ -143,6 +144,7 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
 async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str]:
     try:
         timeout = kwargs.pop("timeout", ClientTimeout(total=15))
+    # ...
         async with session.get(url, timeout=timeout, **kwargs) as resp:
             if resp.status == 200:
                 return await resp.text()
@@ -316,7 +318,6 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         last = closes[idx_last]
         t_last = ts[idx_last]
 
-        # Retornos 1/3/6M
         def first_on_or_after(tcut):
             for i, t in enumerate(ts):
                 if t >= tcut:
@@ -332,7 +333,6 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         ret3 = (last/base3 - 1.0)*100.0 if base3 else None
         ret1 = (last/base1 - 1.0)*100.0 if base1 else None
 
-        # Vol anualizada (60 ruedas)
         rets_d = []
         for i in range(1, len(closes)):
             if closes[i-1] and closes[i]:
@@ -345,7 +345,6 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
             sd = sqrt(var)
             vol_ann = sd*sqrt(252)*100.0
 
-        # Máx drawdown 6M
         idx_cut = next((i for i,t in enumerate(ts) if t >= t6), 0)
         peak = closes[idx_cut]
         dd_min = 0.0
@@ -355,10 +354,8 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
             if dd < dd_min: dd_min = dd
         dd6 = abs(dd_min)*100.0 if dd_min < 0 else 0.0
 
-        # Proximidad a máx 52s
         hi52 = (last/max(closes) - 1.0)*100.0
 
-        # SMA y pendiente
         def _sma(vals, w):
             out, s, q = [None]*len(vals), 0.0, []
             for i, v in enumerate(vals):
@@ -457,14 +454,12 @@ def _score_title(title: str) -> int:
     return score
 
 def _parse_feed_entries(xml: str) -> List[Tuple[str, str]]:
-    """Devuelve [(title, link)] desde RSS 2.0 o Atom (maneja namespaces y <link href=...>)."""
     out: List[Tuple[str, str]] = []
     try:
         root = ET.fromstring(xml)
     except Exception:
         return out
 
-    # RSS 2.0
     for item in root.findall(".//item"):
         t_el = item.find("title")
         l_el = item.find("link")
@@ -472,7 +467,6 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str]]:
         l = (l_el.text or "").strip() if (l_el is not None and l_el.text) else None
         if t and l: out.append((t, l))
 
-    # Atom
     for entry in root.findall(".//{*}entry"):
         t_el = entry.find(".//{*}title")
         link_el = entry.find(".//{*}link[@rel='alternate']") or entry.find(".//{*}link")
@@ -482,7 +476,6 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str]]:
             l = (entry.find(".//{*}id").text or "").strip()
         if t and l: out.append((t, l))
 
-    # Fallback super simple (por si algún feed viene raro)
     if not out:
         for m in re.finditer(r"<title>(.*?)</title>.*?<link>(https?://[^<]+)</link>", xml, flags=re.S|re.I):
             t = re.sub(r"<.*?>", "", m.group(1)).strip()
@@ -494,14 +487,13 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     entries: List[Tuple[str, str]] = []
     for url in RSS_FEEDS:
         xml = await fetch_text(session, url)
-        if not xml: 
+        if not xml:
             continue
         try:
             entries.extend(_parse_feed_entries(xml))
         except Exception as e:
             log.warning("RSS parse %s: %s", url, e)
 
-    # únicos por link
     uniq: Dict[str, str] = {}
     for t, l in entries:
         if l not in uniq and l.startswith("http"):
@@ -510,13 +502,11 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     if not uniq:
         return []
 
-    # orden por relevancia y selección balanceada por dominio
     scored = sorted([(t,l,_score_title(t), domain_of(l)) for l,t in uniq.items()],
                     key=lambda x: x[2], reverse=True)
 
     picked: List[Tuple[str,str]] = []
     count_by_domain: Dict[str,int] = {}
-    # 1) preferir no-paywall y max 2 por dominio
     for t,l,_,dom in scored:
         if dom in AVOID_DOMAINS:
             continue
@@ -526,7 +516,6 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         if len(picked) >= limit:
             return picked
 
-    # 2) completar con cualquiera si faltan (incluye dominios evitados)
     for t,l,_,dom in scored:
         if (t,l) in picked:
             continue
@@ -548,28 +537,74 @@ def format_news_block(news: List[Tuple[str, str]]) -> str:
 
 ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 
-def parse_alert_add(args: List[str]) -> Optional[Tuple[str, str, float]]:
-    if not args or len(args) < 3: return None
-    tipo = args[0].lower().strip()
-    op   = args[1].strip()
-    raw  = " ".join(args[2:]).strip()
-    s = raw
-    s = s.replace("pb","").replace("%","").replace("MUS$","").replace("mus$","")
+def _parse_float_user(s: str) -> Optional[float]:
+    s = s.strip()
+    s = s.replace("pb","").replace("%","").replace("MUS$","").replace("mus$","").replace("$","")
     s = s.replace(".", "").replace(",", ".")
     try:
-        val = float(s)
+        return float(s)
     except Exception:
         return None
-    if tipo not in {"blue","mep","ccl","riesgo","inflacion","reservas"}: return None
+
+def parse_alert_add(args: List[str]) -> Optional[Dict[str, Any]]:
+    """Devuelve:
+       - {"kind":"fx","type": blue|mep|ccl|oficial|mayorista|tarjeta|cripto, "side":"compra|venta","op":">|<","value":float}
+       - {"kind":"metric","type": riesgo|inflacion|reservas, "op":">|<","value":float}
+       - {"kind":"ticker","symbol":"TSLA.BA","period":"1m|3m|6m","op":">|<","value":float}
+    """
+    if not args or len(args)<3:
+        return None
+    fx_types = {"oficial","mayorista","blue","mep","ccl","tarjeta","cripto"}
+
+    a0 = args[0].lower().strip()
+
+    # FX: <tipo> [compra|venta] <op> <valor>
+    if a0 in fx_types:
+        if len(args) >= 4 and args[1].lower() in {"compra","venta"}:
+            side = args[1].lower()
+            op   = args[2]
+            val  = _parse_float_user(" ".join(args[3:]))
+        elif len(args) >= 3:
+            side = "venta"
+            op   = args[1]
+            val  = _parse_float_user(" ".join(args[2:]))
+        else:
+            return None
+        if op not in {">","<"} or val is None:
+            return None
+        return {"kind":"fx","type":a0,"side":side,"op":op,"value":val}
+
+    # Métricas simples
+    if a0 in {"riesgo","inflacion","reservas"}:
+        if len(args) < 3: return None
+        op = args[1].strip()
+        if op not in {">","<"}: return None
+        val = _parse_float_user(" ".join(args[2:]))
+        if val is None: return None
+        return {"kind":"metric","type":a0,"op":op,"value":val}
+
+    # Tickers: <TICKER>.BA <periodo> <op> <valor> | cedear|accion <TICKER>.BA <periodo> <op> <valor>
+    if re.match(r"^[A-Za-z0-9]+\.BA$", args[0], flags=re.I) and len(args)>=4:
+        symbol = args[0].upper()
+        period = args[1].lower()
+        op = args[2].strip()
+        val = _parse_float_user(" ".join(args[3:]))
+    elif a0 in {"accion","cedear"} and len(args)>=5 and re.match(r"^[A-Za-z0-9]+\.BA$", args[1], flags=re.I):
+        symbol = args[1].upper()
+        period = args[2].lower()
+        op = args[3].strip()
+        val = _parse_float_user(" ".join(args[4:]))
+    else:
+        return None
+
+    if period not in {"1m","3m","6m"}: return None
     if op not in {">","<"}: return None
-    return (tipo, op, val)
+    if val is None: return None
+    return {"kind":"ticker","symbol":symbol,"period":period,"op":op,"value":val}
 
 async def read_metrics_for_alerts(session: ClientSession) -> Dict[str, Optional[float]]:
-    out = {"blue":None,"mep":None,"ccl":None,"riesgo":None,"inflacion":None,"reservas":None}
-    d = await get_dolares(session)
-    for k in ["blue","mep","ccl"]:
-        if d.get(k) and d[k].get("venta") is not None:
-            out[k] = float(d[k]["venta"])
+    # Solo métricas no-FX (FX las leemos directo de get_dolares para soportar compra/venta)
+    out = {"riesgo":None,"inflacion":None,"reservas":None}
     rp = await get_riesgo_pais(session)
     out["riesgo"] = float(rp[0]) if rp is not None else None
     infl = await get_inflacion_mensual(session)
@@ -577,6 +612,14 @@ async def read_metrics_for_alerts(session: ClientSession) -> Dict[str, Optional[
     rv = await get_reservas_lamacro(session)
     if rv: out["reservas"] = rv[0]
     return out
+
+def _symbols_from_alerts() -> List[str]:
+    syms = set()
+    for rules in ALERTS.values():
+        for r in rules:
+            if r.get("kind") == "ticker" and r.get("symbol"):
+                syms.add(r["symbol"])
+    return sorted(syms)
 
 async def alerts_loop(app: Application):
     await asyncio.sleep(5)
@@ -586,26 +629,51 @@ async def alerts_loop(app: Application):
             has_any = any((len(v)>0) for v in ALERTS.values())
             if has_any:
                 async with ClientSession(timeout=timeout) as session:
+                    fx = await get_dolares(session)
                     vals = await read_metrics_for_alerts(session)
+                    sym_list = _symbols_from_alerts()
+                    metmap, _ = (await metrics_for_symbols(session, sym_list)) if sym_list else ({}, None)
                 for chat_id, rules in list(ALERTS.items()):
                     if not rules: continue
                     trig = []
                     for r in rules:
-                        cur = vals.get(r["type"])
-                        if cur is None: continue
-                        ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
-                        if ok: trig.append((r["type"], r["op"], r["value"], cur))
+                        if r.get("kind") == "fx":
+                            row = fx.get(r["type"])
+                            if not row: continue
+                            cur = row.get(r["side"])
+                            if cur is None: continue
+                            ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
+                            if ok: trig.append(("fx", r["type"], r["side"], r["op"], r["value"], cur))
+                        elif r.get("kind") == "metric":
+                            cur = vals.get(r["type"])
+                            if cur is None: continue
+                            ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
+                            if ok: trig.append(("metric", r["type"], r["op"], r["value"], cur))
+                        elif r.get("kind") == "ticker":
+                            sym = r["symbol"]; per = r["period"]
+                            m = metmap.get(sym, {})
+                            cur = m.get(per)
+                            if cur is None: continue
+                            ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
+                            if ok: trig.append(("ticker", sym, per, r["op"], r["value"], cur))
                     if trig:
                         lines = [f"<b>🔔 Alertas</b>"]
-                        for t,op,v,cur in trig:
-                            if t in {"blue","mep","ccl"}:
-                                lines.append(f"{t.upper()}: {fmt_money_ars(cur)} ({op} {fmt_money_ars(v)})")
-                            elif t=="riesgo":
-                                lines.append(f"Riesgo país: {cur:.0f} pb ({op} {v:.0f} pb)")
-                            elif t=="inflacion":
-                                lines.append(f"Inflación mensual: {str(round(cur,1)).replace('.',',')}% ({op} {str(round(v,1)).replace('.',',')}%)")
-                            elif t=="reservas":
-                                lines.append(f"Reservas: {fmt_number(cur,0)} MUS$ ({op} {fmt_number(v,0)} MUS$)")
+                        for t, *rest in trig:
+                            if t == "fx":
+                                tipo, side, op, v, cur = rest
+                                side_name = "compra" if side=="compra" else "venta"
+                                lines.append(f"{tipo.upper()} ({side_name}): {fmt_money_ars(cur)} ({op} {fmt_money_ars(v)})")
+                            elif t == "metric":
+                                tipo, op, v, cur = rest
+                                if tipo=="riesgo":
+                                    lines.append(f"Riesgo país: {cur:.0f} pb ({op} {v:.0f} pb)")
+                                elif tipo=="inflacion":
+                                    lines.append(f"Inflación mensual: {str(round(cur,1)).replace('.',',')}% ({op} {str(round(v,1)).replace('.',',')}%)")
+                                elif tipo=="reservas":
+                                    lines.append(f"Reservas: {fmt_number(cur,0)} MUS$ ({op} {fmt_number(v,0)} MUS$)")
+                            else:
+                                sym, per, op, v, cur = rest
+                                lines.append(f"{sym} ({per.upper()}): {pct(cur,1)} ({op} {pct(v,1)})")
                         try:
                             await app.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
                         except Exception as e:
@@ -681,8 +749,8 @@ async def cmd_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     pairs = [(sym, m["6m"]) for sym,m in mets.items() if m.get("6m") is not None]
     pairs.sort(key=lambda x: x[1], reverse=True)
-    top6_syms = [sym for sym,_ in pairs[:3]]
-    msg = format_top3_single_table("📈 Top 3 acciones (BYMA .BA)", fecha, top6_syms, mets)
+    top_syms = [sym for sym,_ in pairs[:3]]
+    msg = format_top3_single_table("📈 Top 3 acciones (BYMA .BA)", fecha, top_syms, mets)
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -694,8 +762,8 @@ async def cmd_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     pairs = [(sym, m["6m"]) for sym,m in mets.items() if m.get("6m") is not None]
     pairs.sort(key=lambda x: x[1], reverse=True)
-    top6_syms = [sym for sym,_ in pairs[:3]]
-    msg = format_top3_single_table("🌎 Top 3 CEDEARs (.BA)", fecha, top6_syms, mets)
+    top_syms = [sym for sym,_ in pairs[:3]]
+    msg = format_top3_single_table("🌎 Top 3 CEDEARs (.BA)", fecha, top_syms, mets)
     await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 def rank_projection_rows(metmap: Dict[str, Dict[str, Optional[float]]], n=5) -> List[Tuple[str, float]]:
@@ -791,7 +859,6 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
         iv_str = str(round(iv,1)).replace(".", ",")
         blocks.append(f"<b>📉 Inflación mensual</b>{f'  <i>{ip}</i>' if ip else ''}\n<b>{iv_str}%</b>\n<i>Fuente: ArgentinaDatos</i>")
 
-    # Noticias (siempre agrega el bloque, aunque esté vacío)
     blocks.append(format_news_block(news or []))
 
     await update.effective_message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
@@ -804,21 +871,30 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rules = ALERTS.get(chat_id, [])
         if not rules:
             txt = ("No tenés alertas configuradas.\n\n"
-                   "Agregá con:\n"
-                   "/alertas_add <tipo> <op> <valor>\n"
-                   "  tipos: blue, mep, ccl, riesgo, inflacion, reservas\n"
-                   "  op: > o <\n"
-                   "Ej.: /alertas_add blue > 1500")
+                   "Ejemplos (vos elegís el número):\n"
+                   "• /alertas_add blue > 1580\n"
+                   "• /alertas_add blue compra > 1520\n"
+                   "• /alertas_add riesgo < 1450\n"
+                   "• /alertas_add reservas < 25500\n"
+                   "• /alertas_add inflacion > 8.3\n"
+                   "• /alertas_add TSLA.BA 1m > 15\n"
+                   "• /alertas_add NVDA.BA 3m < -10")
         else:
             lines = ["<b>🔔 Alertas configuradas</b>"]
             for r in rules:
-                t,op,v = r["type"], r["op"], r["value"]
-                if t in {"blue","mep","ccl"}: val = fmt_money_ars(v)
-                elif t=="riesgo": val = f"{v:.0f} pb"
-                elif t=="reservas": val = f"{fmt_number(v,0)} MUS$"
-                else: val = f"{str(round(v,1)).replace('.',',')}%"
-                lines.append(f"• {t.upper()} {op} {val}")
-            lines.append("\nPara borrar: /alertas_clear [tipo]")
+                if r.get("kind") == "fx":
+                    t, side, op, v = r["type"], r["side"], r["op"], r["value"]
+                    lines.append(f"• {t.upper()} ({side}) {op} {fmt_money_ars(v)}")
+                elif r.get("kind") == "metric":
+                    t, op, v = r["type"], r["op"], r["value"]
+                    if t=="riesgo": val = f"{v:.0f} pb"
+                    elif t=="reservas": val = f"{fmt_number(v,0)} MUS$"
+                    else: val = f"{str(round(v,1)).replace('.',',')}%"
+                    lines.append(f"• {t.upper()} {op} {val}")
+                else:
+                    sym, per, op, v = r["symbol"], r["period"], r["op"], r["value"]
+                    lines.append(f"• {sym} ({per.upper()}) {op} {pct(v,1)}")
+            lines.append("\nPara borrar: /alertas_clear [tipo|TICKER.BA]")
             txt = "\n".join(lines)
         await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
     except Exception as e:
@@ -830,37 +906,57 @@ async def cmd_alertas_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parsed = parse_alert_add(context.args or [])
         if not parsed:
             await update.effective_message.reply_text(
-                "Formato: /alertas_add <tipo> <op> <valor>\n"
-                "  tipos: blue, mep, ccl, riesgo, inflacion, reservas\n"
-                "  op: > o <\n"
-                "Ej.: /alertas_add blue > 1500",
+                "Formato:\n"
+                "• /alertas_add <dólar> [compra|venta] <op> <importe>\n"
+                "  (oficial, mayorista, blue, mep, ccl, tarjeta, cripto)\n"
+                "• /alertas_add riesgo|inflacion|reservas <op> <importe>\n"
+                "• /alertas_add <TICKER>.BA <1m|3m|6m> <op> <porcentaje>\n\n"
+                "Ej.: /alertas_add blue compra > 1520\n"
+                "     /alertas_add inflacion > 8.3\n"
+                "     /alertas_add TSLA.BA 1m > 15",
                 parse_mode=ParseMode.HTML,
                 link_preview_options=LinkPreviewOptions(is_disabled=True),
             )
             return
-        tipo, op, val = parsed
-        chat_id = update.effective_chat.id
-        ALERTS.setdefault(chat_id, []).append({"type": tipo, "op": op, "value": val})
 
-        # Chequeo inmediato del valor actual (feedback)
+        chat_id = update.effective_chat.id
+        ALERTS.setdefault(chat_id, []).append(parsed)
+
+        # Feedback inmediato con valor actual
         async with ClientSession() as session:
-            cur_vals = await read_metrics_for_alerts(session)
-        cur = cur_vals.get(tipo)
-        if tipo in {"blue","mep","ccl"}:
-            cur_s = fmt_money_ars(cur) if cur is not None else "—"
-            thr_s = fmt_money_ars(val)
-        elif tipo == "riesgo":
-            cur_s = f"{cur:.0f} pb" if cur is not None else "—"
-            thr_s = f"{val:.0f} pb"
-        elif tipo == "reservas":
-            cur_s = f"{fmt_number(cur,0)} MUS$" if cur is not None else "—"
-            thr_s = f"{fmt_number(val,0)} MUS$"
-        else:  # inflacion
-            cur_s = f"{str(round(cur,1)).replace('.',',')}%" if cur is not None else "—"
-            thr_s = f"{str(round(val,1)).replace('.',',')}%"
+            if parsed["kind"] == "fx":
+                fx = await get_dolares(session)
+                row = fx.get(parsed["type"], {})
+                cur = row.get(parsed["side"])
+                cur_s = fmt_money_ars(cur) if cur is not None else "—"
+                thr_s = fmt_money_ars(parsed["value"])
+                tipo = parsed["type"].upper()
+                side = parsed["side"]
+                cur_text = f"Ahora: {tipo} ({side}) = {cur_s}\nSe avisará si {tipo} ({side}) {parsed['op']} {thr_s}"
+            elif parsed["kind"] == "metric":
+                vals = await read_metrics_for_alerts(session)
+                tipo = parsed["type"]
+                cur = vals.get(tipo)
+                if tipo == "riesgo":
+                    cur_s = f"{(cur or 0):.0f} pb" if cur is not None else "—"
+                    thr_s = f"{parsed['value']:.0f} pb"
+                elif tipo == "reservas":
+                    cur_s = f"{fmt_number(cur,0)} MUS$" if cur is not None else "—"
+                    thr_s = f"{fmt_number(parsed['value'],0)} MUS$"
+                else:
+                    cur_s = f"{str(round(cur,1)).replace('.',',')}%" if cur is not None else "—"
+                    thr_s = f"{str(round(parsed['value'],1)).replace('.',',')}%"
+                cur_text = f"Ahora: {tipo.upper()} = {cur_s}\nSe avisará si {tipo.upper()} {parsed['op']} {thr_s}"
+            else:
+                sym, per = parsed["symbol"], parsed["period"]
+                metmap, _ = await metrics_for_symbols(session, [sym])
+                cur = metmap.get(sym, {}).get(per)
+                cur_s = pct(cur,1) if cur is not None else "—"
+                thr_s = pct(parsed["value"],1)
+                cur_text = f"Ahora: {sym} ({per.upper()}) = {cur_s}\nSe avisará si {sym} ({per.upper()}) {parsed['op']} {thr_s}"
 
         await update.effective_message.reply_text(
-            f"Listo. Alerta agregada ✅\nAhora: {tipo.UPPER()} = {cur_s}\nSe avisará si {tipo.upper()} {op} {thr_s}",
+            f"Listo. Alerta agregada ✅\n{cur_text}",
             parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True)
         )
     except Exception as e:
@@ -870,18 +966,34 @@ async def cmd_alertas_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         chat_id = update.effective_chat.id
-        tipo = (context.args[0].lower() if context.args else None)
+        arg = (context.args[0].strip() if context.args else None)
+
         if not ALERTS.get(chat_id):
-            await update.effective_message.reply_text("No hay alertas para borrar.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+            await update.effective_message.reply_text("No había alertas guardadas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
             return
-        if tipo:
-            before = len(ALERTS[chat_id])
-            ALERTS[chat_id] = [r for r in ALERTS[chat_id] if r["type"] != tipo]
-            after = len(ALERTS[chat_id])
-            await update.effective_message.reply_text(f"Eliminadas {before-after} alertas de tipo {tipo.upper()}.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-        else:
+
+        if not arg:
+            cnt = len(ALERTS[chat_id])
             ALERTS[chat_id] = []
-            await update.effective_message.reply_text("Todas las alertas fueron eliminadas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+            await update.effective_message.reply_text(f"Se eliminaron {cnt} alertas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+            return
+
+        arg_low = arg.lower()
+        before = len(ALERTS[chat_id])
+        fx_types = {"oficial","mayorista","blue","mep","ccl","tarjeta","cripto"}
+        if arg_low in fx_types:
+            ALERTS[chat_id] = [r for r in ALERTS[chat_id] if not (r.get("kind")=="fx" and r.get("type")==arg_low)]
+        elif arg_low in {"riesgo","inflacion","reservas"}:
+            ALERTS[chat_id] = [r for r in ALERTS[chat_id] if not (r.get("kind")=="metric" and r.get("type")==arg_low)]
+        elif re.match(r"^[A-Za-z0-9]+\.BA$", arg, flags=re.I):
+            symu = arg.upper()
+            ALERTS[chat_id] = [r for r in ALERTS[chat_id] if not (r.get("kind")=="ticker" and r.get("symbol")==symu)]
+        else:
+            await update.effective_message.reply_text("Indicá un tipo (blue/mep/ccl/oficial/mayorista/tarjeta/cripto/riesgo/inflacion/reservas) o un TICKER.BA. Sin parámetro borra todas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+            return
+
+        after = len(ALERTS[chat_id])
+        await update.effective_message.reply_text(f"Eliminadas {before-after} alertas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
     except Exception as e:
         log.warning("/alertas_clear error: %s", e)
         await update.effective_message.reply_text("Error al borrar alertas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
