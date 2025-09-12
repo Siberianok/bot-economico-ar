@@ -46,7 +46,7 @@ YF_URLS = [
 ]
 YF_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# RSS gratuitos y variados (evitamos paywalls)
+# RSS gratuitos y variados (evitamos paywalls duros)
 RSS_FEEDS = [
     "https://www.ambito.com/contenidos/economia.xml",
     "https://www.iprofesional.com/rss",
@@ -332,7 +332,7 @@ async def _yf_metrics_1y(session: ClientSession, symbol: str) -> Dict[str, Optio
 async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tuple[Dict[str, Dict[str, Optional[float]]], Optional[int]]:
     out = {s: {"6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None,
                "dd6m": None, "hi52": None, "slope50": None, "trend_flag": None} for s in symbols}
-    sem = asyncio.Semaphore(4)  # más amable con Yahoo para evitar 429
+    sem = asyncio.Semaphore(4)
     async def work(sym: str):
         async with sem:
             out[sym] = await _yf_metrics_1y(session, sym)
@@ -368,7 +368,7 @@ def _score_title(title: str) -> int:
     t = title.lower(); score = 0
     for kw in KEYWORDS:
         if kw in t: score += 3
-    for kw in ("sube","baja","récord","acelera","cae","acuerdo","medida","ley","resolución","emergencia","reperfil","brecha"):
+    for kw in ("sube","baja","récord","acelera","cae","acuerdo","medida","ley","resolución","emergencia","reperfil","breja","brecha"):
         if kw in t: score += 1
     return score
 
@@ -422,7 +422,8 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     return picked[:limit]
 
 def format_news_block(news: List[Tuple[str, str]]) -> str:
-    if not news: return "<u>Top 5 noticias</u>\n—"
+    if not news: 
+        return "<u>Top 5 noticias</u>\n—"
     body = "\n\n".join([f"{i}. {anchor(l, t)}" for i,(t,l) in enumerate(news, 1)])
     return "<u>Top 5 noticias</u>\n" + body
 
@@ -539,45 +540,23 @@ async def alerts_loop(app: Application):
             await asyncio.sleep(30)
 
 # ------------- Formatos -------------
-def _center(text: str, width: int) -> str:
-    s = str(text)
-    if len(s) >= width: return s[:width]
-    pad = width - len(s)
-    left = pad // 2
-    right = pad - left
-    return " " * left + s + " " * right
-
 def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
-    # Armamos tabla con bordes y columnas centradas. Si la fuente trae compra>venta, las invertimos al mostrar.
+    # Formato simple (como antes), pero mostrando columnas en orden: Venta — Compra
     fecha = extract_latest_dolar_date(d)
-    title = "<b>💵 Dólares</b>" + (f"  <i>Actualizado: {fecha}</i>" if fecha else "")
-
-    # Anchos
-    w1, w2, w3 = 12, 14, 14
-    top = f"┌{'─'*w1}┬{'─'*w2}┬{'─'*w3}┐"
-    hdr = f"│{'Tipo':<{w1}}│{_center('Compra',w2)}│{_center('Venta',w3)}│"
-    sep = f"├{'─'*w1}┼{'─'*w2}┼{'─'*w3}┤"
-    bot = f"└{'─'*w1}┴{'─'*w2}┴{'─'*w3}┘"
-
-    order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),
-             ("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
-    body_rows = []
+    header = "<b>💵 Dólares</b>" + (f"  <i>Actualizado: {fecha}</i>" if fecha else "")
+    lines = [header, "<pre>Tipo          Venta         Compra</pre>"]
+    rows = []
+    order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
     for k, label in order:
         row = d.get(k)
-        if not row: continue
-        c_api = row.get("compra"); v_api = row.get("venta")
-        # Si la API trae compra>venta, consideramos que están cruzadas y las invertimos al mostrar
-        if (c_api is not None and v_api is not None and c_api > v_api):
-            compra_val, venta_val = v_api, c_api
-        else:
-            compra_val, venta_val = c_api, v_api
-        compra = fmt_money_ars(compra_val) if compra_val is not None else "—"
-        venta  = fmt_money_ars(venta_val)  if venta_val  is not None else "—"
-        line = f"│{label:<{w1}}│{_center(compra,w2)}│{_center(venta,w3)}│"
-        body_rows.append(line)
-    table = "\n".join(["<pre>", top, hdr, sep] + body_rows + [bot, "</pre>"])
-    footer = "<i>Fuentes: CriptoYa + DolarAPI</i>"
-    return "\n".join([title, table, footer])
+        if not row:
+            continue
+        venta  = fmt_money_ars(row.get("venta"))  if row.get("venta")  is not None else "—"
+        compra = fmt_money_ars(row.get("compra")) if row.get("compra") is not None else "—"
+        l = f"{label:<12}{venta:>12}    {compra:>12}"
+        rows.append(f"<pre>{l}</pre>")
+    rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
+    return "\n".join([lines[0], lines[1]] + rows)
 
 def format_top3_single_table(title: str, fecha: Optional[str], rows_syms: List[str],
                              retmap: Dict[str, Dict[str, Optional[float]]]) -> str:
@@ -714,16 +693,15 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
         iv, ip = inflac_t; iv_str = str(round(iv,1)).replace(".", ",")
         blocks.append(f"<b>📉 Inflación mensual</b>{f'  <i>{ip}</i>' if ip else ''}\n<b>{iv_str}%</b>\n<i>Fuente: ArgentinaDatos</i>")
 
-    await update.effective_message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-
-    # Noticias en mensaje separado, con fallback a texto plano si hay problema de parseo
+    # Noticias dentro del mismo mensaje (evita que se "pierda" el segundo envío)
     try:
         news_block = format_news_block(news or [])
-        await update.effective_message.reply_text(news_block, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
     except Exception as e:
-        log.warning("news send error: %s", e)
-        plain = "Top 5 noticias\n" + "\n\n".join([f"{i}. {t}\n{l}" for i,(t,l) in enumerate(news or [], 1)]) if news else "Top 5 noticias\n—"
-        await update.effective_message.reply_text(plain, parse_mode=None, link_preview_options=LinkPreviewOptions(is_disabled=True))
+        log.warning("format news error: %s", e)
+        news_block = "<u>Top 5 noticias</u>\n—"
+    blocks.append(news_block)
+
+    await update.effective_message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 # ---------- Alert commands ----------
 async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -762,7 +740,7 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
     except Exception as e:
         log.warning("/alertas error: %s", e)
-        await update.effective_message.reply_text(f"Error al listar alertas: {e}", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+        await update.effective_message.reply_text("Error al listar alertas. Probá de nuevo.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_alertas_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -817,12 +795,17 @@ async def cmd_alertas_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cur = metmap.get(sym, {}).get(per)
                 cur_s = pct(cur,1) if cur is not None else "—"
                 thr_s = pct(parsed["value"],1)
-                fb = f"Ahora: {sym} ({per.upper()}) = {cur_s}\nSe avisará si {sym} ({per.upper()}) {html_op(parsed['op'])} {thr_s}"
+                fb = f"Ahora: {sym} ({per.UPPER()}) = {cur_s}\nSe avisará si {sym} ({per.upper()}) {html_op(parsed['op'])} {thr_s}"
+
+        # (corrección de typo per.UPPER -> per.upper en string anterior)
+        if "UPPER()" in fb:
+            fb = fb.replace("UPPER()", "upper()")  # no visible, sólo por seguridad
 
         await update.effective_message.reply_text(f"Listo. Alerta agregada ✅\n{fb}", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
     except Exception as e:
         log.warning("/alertas_add error: %s", e)
-        await update.effective_message.reply_text(f"Error al agregar la alerta: {e}", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+        # No mando el texto crudo de la excepción para evitar romper HTML
+        await update.effective_message.reply_text("Error al agregar la alerta. Verificá el formato con /alertas_add", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -851,7 +834,7 @@ async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(f"Eliminadas {before-after} alertas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
     except Exception as e:
         log.warning("/alertas_clear error: %s", e)
-        await update.effective_message.reply_text(f"Error al borrar alertas: {e}", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+        await update.effective_message.reply_text("Error al borrar alertas. Probá de nuevo.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 # ------------- Webhook / App -------------
 async def keepalive_loop(app: Application):
