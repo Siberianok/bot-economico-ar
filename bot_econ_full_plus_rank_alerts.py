@@ -46,6 +46,7 @@ YF_URLS = [
 ]
 YF_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
+# RSS gratuitos y variados (evitamos paywalls)
 RSS_FEEDS = [
     "https://www.ambito.com/contenidos/economia.xml",
     "https://www.iprofesional.com/rss",
@@ -83,6 +84,9 @@ def pct(n: Optional[float], nd: int = 2) -> str:
 
 def anchor(href: str, text: str) -> str:
     return f'<a href="{_html.escape(href, quote=True)}">{_html.escape(text)}</a>'
+
+def html_op(op: str) -> str:
+    return "&gt;" if op == ">" else "&lt;"
 
 def fmt_fecha_ddmmyyyy_from_iso(s: Optional[str]) -> Optional[str]:
     if not s: return None
@@ -328,7 +332,7 @@ async def _yf_metrics_1y(session: ClientSession, symbol: str) -> Dict[str, Optio
 async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tuple[Dict[str, Dict[str, Optional[float]]], Optional[int]]:
     out = {s: {"6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None,
                "dd6m": None, "hi52": None, "slope50": None, "trend_flag": None} for s in symbols}
-    sem = asyncio.Semaphore(6)
+    sem = asyncio.Semaphore(4)  # más amable con Yahoo para evitar 429
     async def work(sym: str):
         async with sem:
             out[sym] = await _yf_metrics_1y(session, sym)
@@ -513,18 +517,18 @@ async def alerts_loop(app: Application):
                         for t, *rest in trig:
                             if t == "fx":
                                 tipo, side, op, v, cur = rest
-                                lines.append(f"{tipo.upper()} ({'compra' if side=='compra' else 'venta'}): {fmt_money_ars(cur)} ({op} {fmt_money_ars(v)})")
+                                lines.append(f"{tipo.upper()} ({'compra' if side=='compra' else 'venta'}): {fmt_money_ars(cur)} ({html_op(op)} {fmt_money_ars(v)})")
                             elif t == "metric":
                                 tipo, op, v, cur = rest
                                 if tipo=="riesgo":
-                                    lines.append(f"Riesgo país: {cur:.0f} pb ({op} {v:.0f} pb)")
+                                    lines.append(f"Riesgo país: {cur:.0f} pb ({html_op(op)} {v:.0f} pb)")
                                 elif tipo=="inflacion":
-                                    lines.append(f"Inflación mensual: {str(round(cur,1)).replace('.',',')}% ({op} {str(round(v,1)).replace('.',',')}%)")
+                                    lines.append(f"Inflación mensual: {str(round(cur,1)).replace('.',',')}% ({html_op(op)} {str(round(v,1)).replace('.',',')}%)")
                                 elif tipo=="reservas":
-                                    lines.append(f"Reservas: {fmt_number(cur,0)} MUS$ ({op} {fmt_number(v,0)} MUS$)")
+                                    lines.append(f"Reservas: {fmt_number(cur,0)} MUS$ ({html_op(op)} {fmt_number(v,0)} MUS$)")
                             else:
                                 sym, per, op, v, cur = rest
-                                lines.append(f"{sym} ({per.upper()}): {pct(cur,1)} ({op} {pct(v,1)})")
+                                lines.append(f"{sym} ({per.upper()}): {pct(cur,1)} ({html_op(op)} {pct(v,1)})")
                         try:
                             await app.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
                         except Exception as e:
@@ -535,22 +539,45 @@ async def alerts_loop(app: Application):
             await asyncio.sleep(30)
 
 # ------------- Formatos -------------
+def _center(text: str, width: int) -> str:
+    s = str(text)
+    if len(s) >= width: return s[:width]
+    pad = width - len(s)
+    left = pad // 2
+    right = pad - left
+    return " " * left + s + " " * right
+
 def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
+    # Armamos tabla con bordes y columnas centradas. Si la fuente trae compra>venta, las invertimos al mostrar.
     fecha = extract_latest_dolar_date(d)
-    header = "<b>💵 Dólares</b>" + (f"  <i>Actualizado: {fecha}</i>" if fecha else "")
-    lines = [header, "<pre>Tipo        Compra         Venta</pre>"]
-    rows = []
-    order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
+    title = "<b>💵 Dólares</b>" + (f"  <i>Actualizado: {fecha}</i>" if fecha else "")
+
+    # Anchos
+    w1, w2, w3 = 12, 14, 14
+    top = f"┌{'─'*w1}┬{'─'*w2}┬{'─'*w3}┐"
+    hdr = f"│{'Tipo':<{w1}}│{_center('Compra',w2)}│{_center('Venta',w3)}│"
+    sep = f"├{'─'*w1}┼{'─'*w2}┼{'─'*w3}┤"
+    bot = f"└{'─'*w1}┴{'─'*w2}┴{'─'*w3}┘"
+
+    order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),
+             ("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
+    body_rows = []
     for k, label in order:
         row = d.get(k)
-        if not row:
-            continue
-        compra = fmt_money_ars(row.get("compra")) if row.get("compra") is not None else "—"
-        venta  = fmt_money_ars(row.get("venta"))  if row.get("venta")  is not None else "—"
-        l = f"{label:<11}{compra:>12}    {venta:>12}"
-        rows.append(f"<pre>{l}</pre>")
-    rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
-    return "\n".join([lines[0], lines[1]] + rows)
+        if not row: continue
+        c_api = row.get("compra"); v_api = row.get("venta")
+        # Si la API trae compra>venta, consideramos que están cruzadas y las invertimos al mostrar
+        if (c_api is not None and v_api is not None and c_api > v_api):
+            compra_val, venta_val = v_api, c_api
+        else:
+            compra_val, venta_val = c_api, v_api
+        compra = fmt_money_ars(compra_val) if compra_val is not None else "—"
+        venta  = fmt_money_ars(venta_val)  if venta_val  is not None else "—"
+        line = f"│{label:<{w1}}│{_center(compra,w2)}│{_center(venta,w3)}│"
+        body_rows.append(line)
+    table = "\n".join(["<pre>", top, hdr, sep] + body_rows + [bot, "</pre>"])
+    footer = "<i>Fuentes: CriptoYa + DolarAPI</i>"
+    return "\n".join([title, table, footer])
 
 def format_top3_single_table(title: str, fecha: Optional[str], rows_syms: List[str],
                              retmap: Dict[str, Dict[str, Optional[float]]]) -> str:
@@ -590,7 +617,7 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
-        try: mets, last_ts = await asyncio.wait_for(metrics_for_symbols(session, ACCIONES_BA), timeout=25)
+        try: mets, last_ts = await asyncio.wait_for(metrics_for_symbols(session, ACCIONES_BA), timeout=30)
         except asyncio.TimeoutError: mets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in ACCIONES_BA}, None)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     pairs = sorted([(sym, m["6m"]) for sym,m in mets.items() if m.get("6m") is not None], key=lambda x: x[1], reverse=True)
@@ -600,7 +627,7 @@ async def cmd_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
-        try: mets, last_ts = await asyncio.wait_for(metrics_for_symbols(session, CEDEARS_BA), timeout=25)
+        try: mets, last_ts = await asyncio.wait_for(metrics_for_symbols(session, CEDEARS_BA), timeout=30)
         except asyncio.TimeoutError: mets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in CEDEARS_BA}, None)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     pairs = sorted([(sym, m["6m"]) for sym,m in mets.items() if m.get("6m") is not None], key=lambda x: x[1], reverse=True)
@@ -618,7 +645,7 @@ def rank_projection_rows(metmap: Dict[str, Dict[str, Optional[float]]], n=5) -> 
 
 async def cmd_rankings_acciones(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
-        try: metmap, last_ts = await asyncio.wait_for(metrics_for_symbols(session, ACCIONES_BA), timeout=25)
+        try: metmap, last_ts = await asyncio.wait_for(metrics_for_symbols(session, ACCIONES_BA), timeout=30)
         except asyncio.TimeoutError: metmap, last_ts = ({}, None)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     rows = rank_projection_rows(metmap, 5) if metmap else []
@@ -627,7 +654,7 @@ async def cmd_rankings_acciones(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def cmd_rankings_cedears(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
-        try: metmap, last_ts = await asyncio.wait_for(metrics_for_symbols(session, CEDEARS_BA), timeout=25)
+        try: metmap, last_ts = await asyncio.wait_for(metrics_for_symbols(session, CEDEARS_BA), timeout=30)
         except asyncio.TimeoutError: metmap, last_ts = ({}, None)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     rows = rank_projection_rows(metmap, 5) if metmap else []
@@ -668,7 +695,6 @@ async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1) métricas
     async with ClientSession() as session:
         dolares  = await get_dolares(session)
         riesgo_t = await get_riesgo_pais(session)
@@ -690,9 +716,14 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.effective_message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
-    # 2) noticias en mensaje separado
-    news_block = format_news_block(news or [])
-    await update.effective_message.reply_text(news_block, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    # Noticias en mensaje separado, con fallback a texto plano si hay problema de parseo
+    try:
+        news_block = format_news_block(news or [])
+        await update.effective_message.reply_text(news_block, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    except Exception as e:
+        log.warning("news send error: %s", e)
+        plain = "Top 5 noticias\n" + "\n\n".join([f"{i}. {t}\n{l}" for i,(t,l) in enumerate(news or [], 1)]) if news else "Top 5 noticias\n—"
+        await update.effective_message.reply_text(plain, parse_mode=None, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 # ---------- Alert commands ----------
 async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -702,28 +733,30 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rules:
             txt = ("No tenés alertas configuradas.\n\n"
                    "Ejemplos (vos elegís el número):\n"
-                   "• /alertas_add blue > 1580\n"
-                   "• /alertas_add blue compra > 1520\n"
-                   "• /alertas_add riesgo < 1450\n"
-                   "• /alertas_add reservas < 25500\n"
-                   "• /alertas_add inflacion > 8.3\n"
-                   "• /alertas_add TSLA.BA 1m > 15\n"
-                   "• /alertas_add NVDA.BA 3m < -10")
+                   "<pre>"
+                   "/alertas_add blue &gt; 1580\n"
+                   "/alertas_add blue compra &gt; 1520\n"
+                   "/alertas_add riesgo &lt; 1450\n"
+                   "/alertas_add reservas &lt; 25500\n"
+                   "/alertas_add inflacion &gt; 8.3\n"
+                   "/alertas_add TSLA.BA 1m &gt; 15\n"
+                   "/alertas_add NVDA.BA 3m &lt; -10"
+                   "</pre>")
         else:
             lines = ["<b>🔔 Alertas configuradas</b>"]
             for r in rules:
                 if r.get("kind") == "fx":
                     t, side, op, v = r["type"], r["side"], r["op"], r["value"]
-                    lines.append(f"• {t.upper()} ({side}) {op} {fmt_money_ars(v)}")
+                    lines.append(f"• {t.upper()} ({side}) {html_op(op)} {fmt_money_ars(v)}")
                 elif r.get("kind") == "metric":
                     t, op, v = r["type"], r["op"], r["value"]
                     if t=="riesgo": val = f"{v:.0f} pb"
                     elif t=="reservas": val = f"{fmt_number(v,0)} MUS$"
                     else: val = f"{str(round(v,1)).replace('.',',')}%"
-                    lines.append(f"• {t.upper()} {op} {val}")
+                    lines.append(f"• {t.upper()} {html_op(op)} {val}")
                 else:
                     sym, per, op, v = r["symbol"], r["period"], r["op"], r["value"]
-                    lines.append(f"• {sym} ({per.upper()}) {op} {pct(v,1)}")
+                    lines.append(f"• {sym} ({per.upper()}) {html_op(op)} {pct(v,1)}")
             lines.append("\nPara borrar: /alertas_clear [tipo|TICKER.BA]")
             txt = "\n".join(lines)
         await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
@@ -735,17 +768,24 @@ async def cmd_alertas_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         parsed = parse_alert_add(context.args or [])
         if not parsed:
-            await update.effective_message.reply_text(
+            help_txt = (
                 "Formato:\n"
-                "• /alertas_add <dólar> [compra|venta] <op> <importe>\n"
-                "  (oficial, mayorista, blue, mep, ccl, tarjeta, cripto)\n"
-                "• /alertas_add riesgo|inflacion|reservas <op> <importe>\n"
-                "• /alertas_add <TICKER>.BA <1m|3m|6m> <op> <porcentaje>\n\n"
-                "Ej.: /alertas_add blue compra > 1520\n"
-                "     /alertas_add inflacion > 8.3\n"
-                "     /alertas_add TSLA.BA 1m > 15",
-                parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True),
+                "<pre>"
+                "/alertas_add TIPO [compra|venta] OP IMPORTE\n"
+                "  TIPO: oficial | mayorista | blue | mep | ccl | tarjeta | cripto\n"
+                "  OP: &gt; o &lt;\n"
+                "/alertas_add riesgo|inflacion|reservas OP IMPORTE\n"
+                "/alertas_add TICKER.BA PERIODO OP PORCENTAJE\n"
+                "  PERIODO: 1m | 3m | 6m\n"
+                "</pre>"
+                "Ejemplos:\n"
+                "<pre>"
+                "/alertas_add blue compra &gt; 1520\n"
+                "/alertas_add inflacion &gt; 8.3\n"
+                "/alertas_add TSLA.BA 1m &gt; 15\n"
+                "</pre>"
             )
+            await update.effective_message.reply_text(help_txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
             return
         chat_id = update.effective_chat.id
         ALERTS.setdefault(chat_id, []).append(parsed)
@@ -757,7 +797,7 @@ async def cmd_alertas_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cur_s = fmt_money_ars(cur) if cur is not None else "—"
                 thr_s = fmt_money_ars(parsed["value"])
                 tipo = parsed["type"].upper(); side = parsed["side"]
-                fb = f"Ahora: {tipo} ({side}) = {cur_s}\nSe avisará si {tipo} ({side}) {parsed['op']} {thr_s}"
+                fb = f"Ahora: {tipo} ({side}) = {cur_s}\nSe avisará si {tipo} ({side}) {html_op(parsed['op'])} {thr_s}"
             elif parsed["kind"] == "metric":
                 vals = await read_metrics_for_alerts(session)
                 tipo = parsed["type"]; cur = vals.get(tipo)
@@ -770,14 +810,14 @@ async def cmd_alertas_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     cur_s = f"{str(round(cur,1)).replace('.',',')}%" if cur is not None else "—"
                     thr_s = f"{str(round(parsed['value'],1)).replace('.',',')}%"
-                fb = f"Ahora: {tipo.upper()} = {cur_s}\nSe avisará si {tipo.upper()} {parsed['op']} {thr_s}"
+                fb = f"Ahora: {tipo.upper()} = {cur_s}\nSe avisará si {tipo.upper()} {html_op(parsed['op'])} {thr_s}"
             else:
                 sym, per = parsed["symbol"], parsed["period"]
                 metmap, _ = await metrics_for_symbols(session, [sym])
                 cur = metmap.get(sym, {}).get(per)
                 cur_s = pct(cur,1) if cur is not None else "—"
                 thr_s = pct(parsed["value"],1)
-                fb = f"Ahora: {sym} ({per.upper()}) = {cur_s}\nSe avisará si {sym} ({per.upper()}) {parsed['op']} {thr_s}"
+                fb = f"Ahora: {sym} ({per.upper()}) = {cur_s}\nSe avisará si {sym} ({per.upper()}) {html_op(parsed['op'])} {thr_s}"
 
         await update.effective_message.reply_text(f"Listo. Alerta agregada ✅\n{fb}", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
     except Exception as e:
