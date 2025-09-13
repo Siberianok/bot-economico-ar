@@ -62,9 +62,8 @@ YF_URLS = [
 ]
 YF_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-# RSS nacionales (incluye Clarín/La Nación/El Cronista/Página12 y otros sin paywall duro)
+# RSS nacionales (incluye Clarín/La Nación/El Cronista/Página12 y otros)
 RSS_FEEDS = [
-    # Economía / negocios
     "https://www.ambito.com/contenidos/economia.xml",
     "https://www.iprofesional.com/rss",
     "https://www.infobae.com/economia/rss",
@@ -77,7 +76,6 @@ RSS_FEEDS = [
     "https://www.lanacion.com.ar/economia/rss/",
     "https://www.pagina12.com.ar/rss/secciones/economia/notas",
 ]
-# Ya no evitamos dominios, el usuario pidió incluir “todos”.
 
 ACCIONES_BA = ["GGAL.BA","YPFD.BA","PAMP.BA","CEPU.BA","ALUA.BA","TXAR.BA","TGSU2.BA","BYMA.BA","SUPV.BA","BMA.BA"]
 CEDEARS_BA  = ["AAPL.BA","MSFT.BA","NVDA.BA","AMZN.BA","GOOGL.BA","TSLA.BA","META.BA","JNJ.BA","KO.BA","NFLX.BA"]
@@ -308,7 +306,7 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         ret6 = (last/base6 - 1.0)*100.0 if base6 else None
         ret3 = (last/base3 - 1.0)*100.0 if base3 else None
         ret1 = (last/base1 - 1.0)*100.0 if base1 else None
-        # vol anualizada aprox (ventana 60d)
+        # vol anualizada aprox
         rets_d = []
         for i in range(1, len(closes)):
             if closes[i-1] and closes[i]: rets_d.append(closes[i]/closes[i-1]-1.0)
@@ -327,7 +325,7 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
             if dd < dd_min: dd_min = dd
         dd6 = abs(dd_min)*100.0 if dd_min < 0 else 0.0
         hi52 = (last/max(closes) - 1.0)*100.0
-        # SMA50/SMA200 para tendencia
+        # SMA50/SMA200
         def _sma(vals, w):
             out, s, q = [None]*len(vals), 0.0, []
             for i, v in enumerate(vals):
@@ -339,7 +337,7 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         s50_last = sma50[idx_last] if idx_last < len(sma50) else None
         s50_prev = sma50[idx_last-20] if idx_last-20 >= 0 else None
         slope50 = ((s50_last/s50_prev - 1.0)*100.0) if (s50_last and s50_prev) else 0.0
-        s200_last = sma200[idx_last] if idx_last < len(sma200) else None
+        s200_last = sma200[idx_last] if idx_last < len(s200) else None  # safe
         trend_flag = 1 if (s200_last and last > s200_last) else (-1 if s200_last else 0)
         return {"1m": ret1, "3m": ret3, "6m": ret6, "last_ts": int(t_last),
                 "vol_ann": vol_ann, "dd6m": dd6, "hi52": hi52, "slope50": slope50,
@@ -360,7 +358,7 @@ async def _yf_metrics_1y(session: ClientSession, symbol: str) -> Dict[str, Optio
 async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tuple[Dict[str, Dict[str, Optional[float]]], Optional[int]]:
     out = {s: {"6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None,
                "dd6m": None, "hi52": None, "slope50": None, "trend_flag": None} for s in symbols}
-    sem = asyncio.Semaphore(4)  # amable con Yahoo (evita 429)
+    sem = asyncio.Semaphore(4)
     async def work(sym: str):
         async with sem:
             out[sym] = await _yf_metrics_1y(session, sym)
@@ -404,13 +402,11 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str]]:
     out: List[Tuple[str, str]] = []
     try: root = ET.fromstring(xml)
     except Exception: return out
-    # RSS
     for item in root.findall(".//item"):
         t_el = item.find("title"); l_el = item.find("link")
         t = (t_el.text or "").strip() if (t_el is not None and t_el.text) else None
         l = (l_el.text or "").strip() if (l_el is not None and l_el.text) else None
         if t and l and l.startswith("http"): out.append((t, l))
-    # ATOM
     for entry in root.findall(".//{*}entry"):
         t_el = entry.find(".//{*}title")
         link_el = entry.find(".//{*}link[@rel='alternate']") or entry.find(".//{*}link")
@@ -420,7 +416,6 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str]]:
             l = (entry.find(".//{*}id").text or "").strip()
         if t and l and l.startswith("http"): out.append((t, l))
     if not out:
-        # fallback regex
         for m in re.finditer(r"<title>(.*?)</title>.*?<link>(https?://[^<]+)</link>", xml, flags=re.S|re.I):
             t = re.sub(r"<.*?>", "", m.group(1)).strip(); l = m.group(2).strip()
             if t and l: out.append((t, l))
@@ -433,7 +428,6 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         if not xml: continue
         try: entries.extend(_parse_feed_entries(xml))
         except Exception as e: log.warning("RSS parse %s: %s", url, e)
-    # dedup por link
     uniq: Dict[str, str] = {}
     for t, l in entries:
         if l not in uniq and l.startswith("http"): uniq[l] = t
@@ -445,11 +439,9 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     for t,l,_,_dom in scored:
         picked.append((t,l))
         if len(picked) >= limit: break
-    # si no llega a 5, rellena
     return picked[:limit]
 
 def format_news_block(news: List[Tuple[str, str]]) -> str:
-    # Bloque con 5 links
     if not news:
         return "<b>📰 Noticias</b>\n—"
     body = "\n".join([f"{i}. {anchor(l, t)}" for i,(t,l) in enumerate(news, 1)])
@@ -467,9 +459,8 @@ def _parse_float_user(s: str) -> Optional[float]:
 
 # ------------- Formatos de salida -------------
 def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
-    # Formato simple original, pero corrigiendo valores:
-    # lo que la API trae como "compra" lo mostramos en columna "Venta";
-    # y lo que trae como "venta" lo mostramos en columna "Compra".
+    # Se mantiene estética, pero SWAP intencional para corregir:
+    # mostramos en columna "Venta" lo que llega como "compra" y viceversa.
     fecha = extract_latest_dolar_date(d)
     header = "<b>💵 Dólares</b>" + (f"  <i>Actualizado: {fecha}</i>" if fecha else "")
     lines = [header, "<pre>Tipo          Venta         Compra</pre>"]
@@ -478,8 +469,7 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
     for k, label in order:
         row = d.get(k)
         if not row: continue
-        # swap intencional de campos:
-        venta_val  = row.get("compra")
+        venta_val  = row.get("compra")  # swap
         compra_val = row.get("venta")
         venta  = fmt_money_ars(venta_val)  if venta_val  is not None else "—"
         compra = fmt_money_ars(compra_val) if compra_val is not None else "—"
@@ -622,18 +612,12 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if inflac_t:
         iv, ip = inflac_t; iv_str = str(round(iv,1)).replace(".", ",")
         blocks.append(f"<b>📉 Inflación mensual</b>{f'  <i>{ip}</i>' if ip else ''}\n<b>{iv_str}%</b>\n<i>Fuente: ArgentinaDatos</i>")
-
-    # Noticias (mismo mensaje, 5 links)
-    try:
-        news_block = format_news_block(news or [])
-    except Exception as e:
-        log.warning("format news error: %s", e)
-        news_block = "<b>📰 Noticias</b>\n—"
-    blocks.append(news_block)
-
+    blocks.append(format_news_block(news or []))
     await update.effective_message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 # ------------- Alertas: listar/clear -------------
+ALERTS: Dict[int, List[Dict[str, Any]]] = {}
+
 async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     rules = ALERTS.get(chat_id, [])
@@ -684,9 +668,9 @@ async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     after = len(ALERTS[chat_id])
     await update.effective_message.reply_text(f"Eliminadas {before-after} alertas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
-# ------------- Alertas: menú interactivo -------------
-# Estados de conversación
-AL_KIND, AL_FX_TYPE, AL_FX_SIDE, AL_OP, AL_VALUE, AL_METRIC_TYPE, AL_TICKER, AL_PERIOD = range(8)
+# ------------- Alertas: menú interactivo con flechas y % -------------
+# Estados
+AL_KIND, AL_FX_TYPE, AL_FX_SIDE, AL_OP, AL_MODE, AL_VALUE, AL_METRIC_TYPE, AL_TICKER, AL_PERIOD = range(9)
 
 def kb(rows: List[List[Tuple[str,str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=data) for text, data in r] for r in rows])
@@ -751,10 +735,10 @@ async def alertas_add_fx_side(update: Update, context: ContextTypes.DEFAULT_TYPE
     side = q.data.split(":",1)[1]
     context.user_data["al"]["side"] = side
     k = kb([
-        [(">", "OP:>"), ("<", "OP:<")],
+        [("🔼 Arriba", "OP:UP"), ("🔽 Abajo", "OP:DOWN")],
         [("Cancelar","CANCEL")]
     ])
-    await q.edit_message_text(f"Lado: {side}\nElegí operador:", reply_markup=k)
+    await q.edit_message_text(f"Lado: {side}\nElegí dirección:", reply_markup=k)
     return AL_OP
 
 async def alertas_add_metric_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -763,31 +747,50 @@ async def alertas_add_metric_type(update: Update, context: ContextTypes.DEFAULT_
         await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
     m = q.data.split(":",1)[1]
     context.user_data["al"]["type"] = m
-    k = kb([
-        [(">", "OP:>"), ("<", "OP:<")],
-        [("Cancelar","CANCEL")]
-    ])
-    await q.edit_message_text(f"Métrica: {m.upper()}\nElegí operador:", reply_markup=k)
-    return AL_OP
+    # Riesgo/Inflación: solo nivel. Reservas: nivel o Δ%
+    if m == "reservas":
+        k = kb([
+            [("🔼 Arriba", "OP:UP"), ("🔽 Abajo", "OP:DOWN")],
+            [("Cancelar","CANCEL")]
+        ])
+        await q.edit_message_text("Reservas BCRA\nElegí dirección:", reply_markup=k)
+        return AL_OP
+    else:
+        context.user_data["al"]["op"] = ">"  # se pedirá número y se interpretará textual
+        await q.edit_message_text("Ingresá el valor objetivo (número). Ej.: riesgo 1450 / inflación 8,3")
+        return AL_VALUE
 
 async def alertas_add_op(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.data == "CANCEL":
         await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
-    op = q.data.split(":",1)[1]
-    context.user_data["al"]["op"] = op
+    op_raw = q.data.split(":",1)[1]
+    context.user_data["al"]["op"] = ">" if op_raw == "UP" else "<"
+    # ¿Qué modos están disponibles?
     kind = context.user_data["al"].get("kind")
-    if kind in ("fx","metric"):
-        txt = "Ingresá el valor objetivo (número). Ej:\n- Dólar: 1580\n- Riesgo: 1450\n- Inflación: 8,3\n- Reservas: 25500"
-        await q.edit_message_text(txt)
+    if kind == "metric" and context.user_data["al"].get("type") not in {"reservas"}:
+        # Solo nivel para riesgo/inflación
+        await q.edit_message_text("Ingresá el valor objetivo (número).")
         return AL_VALUE
-    # ticker
+    # fx / reservas / ticker → elegir Nivel o Δ%
     k = kb([
-        [("1m", "PERIOD:1m"), ("3m", "PERIOD:3m"), ("6m", "PERIOD:6m")],
+        [("Nivel (valor)", "MODE:abs"), ("Δ% vs actual", "MODE:pct")],
         [("Cancelar","CANCEL")]
     ])
-    await q.edit_message_text("Elegí período para el ticker:", reply_markup=k)
-    return AL_PERIOD
+    await q.edit_message_text("Seleccioná el modo de umbral:", reply_markup=k)
+    return AL_MODE
+
+async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    if q.data == "CANCEL":
+        await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    mode = q.data.split(":",1)[1]  # abs | pct
+    context.user_data["al"]["mode"] = mode
+    if mode == "pct":
+        await q.edit_message_text("Ingresá el porcentaje (solo número). Ej.: 10  → +10% / -10% según flecha elegida.")
+    else:
+        await q.edit_message_text("Ingresá el valor objetivo (número).")
+    return AL_VALUE
 
 async def alertas_add_ticker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip().upper()
@@ -809,73 +812,88 @@ async def alertas_add_period(update: Update, context: ContextTypes.DEFAULT_TYPE)
     per = q.data.split(":",1)[1]
     context.user_data["al"]["period"] = per
     k = kb([
-        [(">", "OP:>"), ("<", "OP:<")],
+        [("🔼 Arriba", "OP:UP"), ("🔽 Abajo", "OP:DOWN")],
         [("Cancelar","CANCEL")]
     ])
-    await q.edit_message_text(f"Período: {per}\nElegí operador:", reply_markup=k)
+    await q.edit_message_text(f"Período: {per}\nElegí dirección:", reply_markup=k)
     return AL_OP
 
 async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val = _parse_float_user(update.message.text or "")
-    if val is None:
+    al = context.user_data.get("al", {})
+    entered = _parse_float_user(update.message.text or "")
+    if entered is None:
         await update.message.reply_text("No entendí el número. Probá de nuevo (usá coma o punto).")
         return AL_VALUE
-    al = context.user_data.get("al", {})
-    al["value"] = val
+
     chat_id = update.effective_chat.id
+    mode = al.get("mode","abs")
+    op = al.get("op",">")
 
-    # Construcción de la regla
-    if al.get("kind") == "fx":
-        rule = {"kind":"fx","type":al["type"],"side":al["side"],"op":al["op"],"value":val}
-    elif al.get("kind") == "metric":
-        rule = {"kind":"metric","type":al["type"],"op":al["op"],"value":val}
-    else:
-        # Ticker: ya tenemos symbol+period+op en user_data (si vino por otro flujo)
-        if "symbol" not in al or "period" not in al or "op" not in al:
-            await update.message.reply_text("Faltan datos del ticker. Empezá de nuevo con /alertas_add.")
-            return ConversationHandler.END
-        rule = {"kind":"ticker","symbol":al["symbol"],"period":al["period"],"op":al["op"],"value":val}
-
-    ALERTS.setdefault(chat_id, []).append(rule)
-
-    # Feedback con valor actual
+    # Construimos regla (si es Δ%, calculamos umbral absoluto ahora)
+    rule = None
+    feedback_extra = ""
     try:
         async with ClientSession() as session:
-            if rule["kind"] == "fx":
-                fx = await get_dolares(session); row = fx.get(rule["type"], {})
-                cur = row.get(rule["side"])
-                cur_s = fmt_money_ars(cur) if cur is not None else "—"
-                thr_s = fmt_money_ars(rule["value"])
-                tipo = rule["type"].upper(); side = rule["side"]
-                fb = f"Ahora: {tipo} ({side}) = {cur_s}\nSe avisará si {tipo} ({side}) {html_op(rule['op'])} {thr_s}"
-            elif rule["kind"] == "metric":
-                vals = {
-                    "riesgo": None, "inflacion": None, "reservas": None
-                }
-                rp = await get_riesgo_pais(session);  vals["riesgo"] = float(rp[0]) if rp else None
-                inf = await get_inflacion_mensual(session); vals["inflacion"] = float(inf[0]) if inf else None
-                rv  = await get_reservas_lamacro(session); vals["reservas"] = rv[0] if rv else None
-                tipo = rule["type"]; cur = vals.get(tipo)
-                if tipo == "riesgo":
-                    cur_s = f"{(cur or 0):.0f} pb" if cur is not None else "—"
-                    thr_s = f"{rule['value']:.0f} pb"
-                elif tipo == "reservas":
-                    cur_s = f"{fmt_number(cur,0)} MUS$" if cur is not None else "—"
-                    thr_s = f"{fmt_number(rule['value'],0)} MUS$"
+            if al.get("kind") == "fx":
+                fx = await get_dolares(session)
+                row = fx.get(al["type"], {})
+                cur = row.get(al["side"])
+                if cur is None:
+                    await update.message.reply_text("No pude leer el valor actual. Probá de nuevo más tarde.")
+                    return ConversationHandler.END
+                if mode == "pct":
+                    # Δ% vs actual → umbral absoluto
+                    thr = cur * (1 + entered/100.0) if op == ">" else cur * (1 - entered/100.0)
+                    rule = {"kind":"fx","type":al["type"],"side":al["side"],"op":op,"value":thr}
+                    feedback_extra = f" (Δ {entered:+.1f}% → umbral {fmt_money_ars(thr)})".replace(".",",")
                 else:
-                    cur_s = f"{str(round(cur,1)).replace('.',',')}%" if cur is not None else "—"
-                    thr_s = f"{str(round(rule['value'],1)).replace('.',',')}%"
-                fb = f"Ahora: {tipo.upper()} = {cur_s}\nSe avisará si {tipo.upper()} {html_op(rule['op'])} {thr_s}"
+                    rule = {"kind":"fx","type":al["type"],"side":al["side"],"op":op,"value":entered}
+                ALERTS.setdefault(chat_id, []).append(rule)
+                cur_s = fmt_money_ars(cur); thr_s = fmt_money_ars(rule["value"])
+                fb = f"Ahora: {al['type'].upper()} ({al['side']}) = {cur_s}\nSe avisará si {al['type'].upper()} ({al['side']}) {html_op(op)} {thr_s}{feedback_extra}"
+            elif al.get("kind") == "metric":
+                if al.get("type") == "reservas":
+                    res = await get_reservas_lamacro(session)
+                    if not res or res[0] is None:
+                        await update.message.reply_text("No pude leer reservas ahora. Probá más tarde.")
+                        return ConversationHandler.END
+                    cur = float(res[0])
+                    if mode == "pct":
+                        thr = cur * (1 + entered/100.0) if op == ">" else cur * (1 - entered/100.0)
+                        rule = {"kind":"metric","type":"reservas","op":op,"value":thr}
+                        feedback_extra = f" (Δ {entered:+.1f}% → umbral {fmt_number(thr,0)} MUS$)".replace(".",",")
+                    else:
+                        rule = {"kind":"metric","type":"reservas","op":op,"value":entered}
+                    ALERTS.setdefault(chat_id, []).append(rule)
+                    cur_s = f"{fmt_number(cur,0)} MUS$"; thr_s = f"{fmt_number(rule['value'],0)} MUS$"
+                    fb = f"Ahora: RESERVAS = {cur_s}\nSe avisará si RESERVAS {html_op(op)} {thr_s}{feedback_extra}"
+                else:
+                    # riesgo / inflacion → solo nivel
+                    rule = {"kind":"metric","type":al["type"],"op":op,"value":entered}
+                    ALERTS.setdefault(chat_id, []).append(rule)
+                    fb = f"Alerta para {al['type'].upper()} {html_op(op)} {entered}"
             else:
-                sym, per = rule["symbol"], rule["period"]
+                # ticker
+                sym, per = al["symbol"], al["period"]
                 metmap, _ = await metrics_for_symbols(session, [sym])
                 cur = metmap.get(sym, {}).get(per)
-                cur_s = pct(cur,1) if cur is not None else "—"
-                thr_s = pct(rule["value"],1)
-                fb = f"Ahora: {sym} ({per.upper()}) = {cur_s}\nSe avisará si {sym} ({per.upper()}) {html_op(rule['op'])} {thr_s}"
+                if cur is None:
+                    await update.message.reply_text("No pude leer la métrica del ticker ahora. Probá más tarde.")
+                    return ConversationHandler.END
+                if mode == "pct":
+                    # Δ% en puntos porcentuales sobre la métrica actual (ej: +10pp)
+                    thr = cur + entered if op == ">" else cur - entered
+                    rule = {"kind":"ticker","symbol":sym,"period":per,"op":op,"value":thr}
+                    feedback_extra = f" (Δ {entered:+.1f} pp → umbral {thr:+.1f}%)".replace(".",",")
+                else:
+                    rule = {"kind":"ticker","symbol":sym,"period":per,"op":op,"value":entered}
+                ALERTS.setdefault(chat_id, []).append(rule)
+                cur_s = pct(cur,1); thr_s = pct(rule["value"],1)
+                fb = f"Ahora: {sym} ({per.upper()}) = {cur_s}\nSe avisará si {sym} ({per.upper()}) {html_op(op)} {thr_s}{feedback_extra}"
     except Exception as e:
-        log.warning("feedback alerta error: %s", e)
-        fb = "Alerta agregada."
+        log.warning("alerta add value error: %s", e)
+        await update.message.reply_text("Error al agregar la alerta. Probá de nuevo.")
+        return ConversationHandler.END
 
     await update.message.reply_text(f"Listo. Alerta agregada ✅\n{fb}", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
     return ConversationHandler.END
@@ -886,169 +904,4 @@ def _symbols_from_alerts() -> List[str]:
     for rules in ALERTS.values():
         for r in rules:
             if r.get("kind") == "ticker" and r.get("symbol"): syms.add(r["symbol"])
-    return sorted(syms)
-
-async def alerts_loop(app: Application):
-    await asyncio.sleep(5)
-    timeout = ClientTimeout(total=12)
-    while True:
-        try:
-            has_any = any((len(v)>0) for v in ALERTS.values())
-            if has_any:
-                async with ClientSession(timeout=timeout) as session:
-                    fx = await get_dolares(session)
-                    # métricas
-                    rp = await get_riesgo_pais(session)
-                    infl = await get_inflacion_mensual(session)
-                    rv = await get_reservas_lamacro(session)
-                    vals = {
-                        "riesgo": float(rp[0]) if rp else None,
-                        "inflacion": float(infl[0]) if infl else None,
-                        "reservas": rv[0] if rv else None
-                    }
-                    sym_list = _symbols_from_alerts()
-                    metmap, _ = (await metrics_for_symbols(session, sym_list)) if sym_list else ({}, None)
-                for chat_id, rules in list(ALERTS.items()):
-                    if not rules: continue
-                    trig = []
-                    for r in rules:
-                        if r.get("kind") == "fx":
-                            row = fx.get(r["type"]); 
-                            if not row: continue
-                            cur = row.get(r["side"])
-                            if cur is None: continue
-                            ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
-                            if ok: trig.append(("fx", r["type"], r["side"], r["op"], r["value"], cur))
-                        elif r.get("kind") == "metric":
-                            cur = vals.get(r["type"])
-                            if cur is None: continue
-                            ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
-                            if ok: trig.append(("metric", r["type"], r["op"], r["value"], cur))
-                        elif r.get("kind") == "ticker":
-                            sym = r["symbol"]; per = r["period"]; m = metmap.get(sym, {})
-                            cur = m.get(per)
-                            if cur is None: continue
-                            ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
-                            if ok: trig.append(("ticker", sym, per, r["op"], r["value"], cur))
-                    if trig:
-                        lines = [f"<b>🔔 Alertas</b>"]
-                        for t, *rest in trig:
-                            if t == "fx":
-                                tipo, side, op, v, cur = rest
-                                lines.append(f"{tipo.upper()} ({side}): {fmt_money_ars(cur)} ({html_op(op)} {fmt_money_ars(v)})")
-                            elif t == "metric":
-                                tipo, op, v, cur = rest
-                                if tipo=="riesgo":
-                                    lines.append(f"Riesgo país: {cur:.0f} pb ({html_op(op)} {v:.0f} pb)")
-                                elif tipo=="inflacion":
-                                    lines.append(f"Inflación mensual: {str(round(cur,1)).replace('.',',')}% ({html_op(op)} {str(round(v,1)).replace('.',',')}%)")
-                                elif tipo=="reservas":
-                                    lines.append(f"Reservas: {fmt_number(cur,0)} MUS$ ({html_op(op)} {fmt_number(v,0)} MUS$)")
-                            else:
-                                sym, per, op, v, cur = rest
-                                lines.append(f"{sym} ({per.upper()}): {pct(cur,1)} ({html_op(op)} {pct(v,1)})")
-                        try:
-                            await app.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-                        except Exception as e:
-                            log.warning("send alert failed %s: %s", chat_id, e)
-            await asyncio.sleep(600)
-        except Exception as e:
-            log.warning("alerts_loop error: %s", e)
-            await asyncio.sleep(30)
-
-# ------------- Webhook / App -------------
-async def keepalive_loop(app: Application):
-    await asyncio.sleep(5)
-    url = f"{BASE_URL}/"; timeout = ClientTimeout(total=6)
-    async with ClientSession(timeout=timeout) as session:
-        while True:
-            try:
-                async with session.get(url) as resp:
-                    log.info("Keepalive %s -> %s", url, resp.status)
-            except Exception as e:
-                log.warning("Keepalive error: %s", e)
-            await asyncio.sleep(300)
-
-async def on_startup(app: web.Application):
-    await application.initialize()
-    await application.start()
-    await application.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=["message","callback_query"], drop_pending_updates=True)
-    cmds = [
-        BotCommand("dolar", "Tipos de cambio"),
-        BotCommand("acciones", "Top 3 acciones"),
-        BotCommand("cedears", "Top 3 CEDEARs"),
-        BotCommand("rankings_acciones", "Top 5 acciones"),
-        BotCommand("rankings_cedears", "Top 5 CEDEARs"),
-        BotCommand("reservas", "Reservas BCRA"),
-        BotCommand("inflacion", "Inflación mensual"),
-        BotCommand("riesgo", "Riesgo país"),
-        BotCommand("resumen_diario", "Resumen diario"),
-        BotCommand("alertas", "Listar alertas"),
-        BotCommand("alertas_add", "Agregar alerta"),
-        BotCommand("alertas_clear", "Borrar alertas"),
-    ]
-    try: await application.bot.set_my_commands(cmds)
-    except Exception as e: log.warning("set_my_commands error: %s", e)
-    log.info("Webhook set: %s", WEBHOOK_URL)
-    asyncio.create_task(keepalive_loop(application))
-    asyncio.create_task(alerts_loop(application))
-
-async def on_cleanup(app: web.Application):
-    await application.stop(); await application.shutdown()
-
-async def handle_root(request: web.Request):
-    return web.Response(text="ok", status=200)
-
-async def handle_webhook(request: web.Request):
-    if request.method != "POST": return web.Response(text="Method Not Allowed", status=405)
-    try: data = await request.json()
-    except Exception: return web.Response(text="Bad Request", status=400)
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return web.Response(text="OK", status=200)
-
-def build_web_app() -> web.Application:
-    app = web.Application()
-    app.router.add_get("/", handle_root)
-    app.router.add_post(WEBHOOK_PATH, handle_webhook)
-    app.on_startup.append(on_startup); app.on_cleanup.append(on_cleanup)
-    return app
-
-defaults = Defaults(parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True), tzinfo=TZ)
-application = Application.builder().token(TELEGRAM_TOKEN).defaults(defaults).updater(None).build()
-
-# Handlers comandos
-application.add_handler(CommandHandler("dolar", cmd_dolar))
-application.add_handler(CommandHandler("acciones", cmd_acciones))
-application.add_handler(CommandHandler("cedears", cmd_cedears))
-application.add_handler(CommandHandler("rankings_acciones", cmd_rankings_acciones))
-application.add_handler(CommandHandler("rankings_cedears", cmd_rankings_cedears))
-application.add_handler(CommandHandler("reservas", cmd_reservas))
-application.add_handler(CommandHandler("inflacion", cmd_inflacion))
-application.add_handler(CommandHandler("riesgo", cmd_riesgo))
-application.add_handler(CommandHandler("resumen_diario", cmd_resumen_diario))
-application.add_handler(CommandHandler("alertas", cmd_alertas_list))
-application.add_handler(CommandHandler("alertas_clear", cmd_alertas_clear))
-
-# Conversación /alertas_add (menú)
-conv = ConversationHandler(
-    entry_points=[CommandHandler("alertas_add", alertas_add_start)],
-    states={
-        AL_KIND: [CallbackQueryHandler(alertas_add_kind, pattern=r"^(KIND:.*|CANCEL)$")],
-        AL_FX_TYPE: [CallbackQueryHandler(alertas_add_fx_type, pattern=r"^(FXTYPE:.*|CANCEL)$")],
-        AL_FX_SIDE: [CallbackQueryHandler(alertas_add_fx_side, pattern=r"^(SIDE:.*|CANCEL)$")],
-        AL_METRIC_TYPE: [CallbackQueryHandler(alertas_add_metric_type, pattern=r"^(METRIC:.*|CANCEL)$")],
-        AL_OP: [CallbackQueryHandler(alertas_add_op, pattern=r"^(OP:.*|CANCEL)$")],
-        AL_TICKER: [MessageHandler(filters.TEXT & ~filters.COMMAND, alertas_add_ticker)],
-        AL_PERIOD: [CallbackQueryHandler(alertas_add_period, pattern=r"^(PERIOD:.*|CANCEL)$")],
-        AL_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, alertas_add_value)],
-    },
-    fallbacks=[CallbackQueryHandler(alertas_add_kind, pattern=r"^CANCEL$")],
-    allow_reentry=True,
-)
-application.add_handler(conv)
-
-if __name__ == "__main__":
-    log.info("Iniciando bot Económico AR (Render webhook)")
-    app = build_web_app()
-    web.run_app(app, host="0.0.0.0", port=PORT)
+    return sorted
