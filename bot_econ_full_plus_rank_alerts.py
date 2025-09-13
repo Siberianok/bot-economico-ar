@@ -15,7 +15,7 @@
 #   /resumen_diario        Resumen Diario + Noticias (5 links)
 #   /alertas               Listar Alertas
 #   /alertas_add           Agregar Alerta (menú con flechas, %, “Volver”)
-#   /alertas_clear         Borrar Alertas (todas o por tipo/ticker)
+#   /alertas_clear         Borrar Alertas (individual o todas)
 #
 import os, asyncio, logging, re, html as _html
 from time import time
@@ -621,7 +621,7 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.effective_message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 # ------------- Alertas (memoria) -------------
-ALERTS: Dict[int, List[Dict[str, Any]]] = ALERTS  # alias
+ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 
 # Estados conversación
 AL_KIND, AL_FX_TYPE, AL_FX_SIDE, AL_OP, AL_MODE, AL_VALUE, AL_METRIC_TYPE, AL_TICKER, AL_PERIOD = range(9)
@@ -640,7 +640,7 @@ def kb_tickers(symbols: List[str], back_target: str) -> InlineKeyboardMarkup:
     rows.append([("Volver","BACK:"+back_target), ("Cancelar","CANCEL")])
     return kb(rows)
 
-# ----- Listar / Clear -----
+# ----- Listar -----
 async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     rules = ALERTS.get(chat_id, [])
@@ -649,47 +649,105 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
                "Usá /alertas_add para crear una con el menú.")
     else:
         lines = ["<b>🔔 Alertas Configuradas</b>"]
-        for r in rules:
+        for i, r in enumerate(rules, 1):
             if r.get("kind") == "fx":
                 t, side, op, v = r["type"], r["side"], r["op"], r["value"]
-                lines.append(f"• {t.upper()} ({side}) {html_op(op)} {fmt_money_ars(v)}")
+                lines.append(f"{i}. {t.upper()} ({side}) {html_op(op)} {fmt_money_ars(v)}")
             elif r.get("kind") == "metric":
                 t, op, v = r["type"], r["op"], r["value"]
                 if t=="riesgo": val = f"{v:.0f} pb"
                 elif t=="reservas": val = f"{fmt_number(v,0)} MUS$"
                 else: val = f"{str(round(v,1)).replace('.',',')}%"
-                lines.append(f"• {t.upper()} {html_op(op)} {val}")
+                lines.append(f"{i}. {t.upper()} {html_op(op)} {val}")
             else:
-                sym, per, op, v = r["symbol"], r["period"], r["op"], r["value"]
-                lines.append(f"• {sym} ({per.upper()}) {html_op(op)} {pct(v,1)}")
-        lines.append("\nPara borrar: /alertas_clear [tipo|TICKER.BA] (sin parámetro borra todas)")
+                sym, per, op, v, mode = r["symbol"], r["period"], r["op"], r["value"], r.get("mode","percent")
+                if mode == "absolute":
+                    lines.append(f"{i}. {sym} (Precio) {html_op(op)} {fmt_money_ars(v)}")
+                else:
+                    lines.append(f"{i}. {sym} ({per.upper()}) {html_op(op)} {pct(v,1)}")
+        lines.append("\nPara borrar con texto: /alertas_clear [número|tipo|TICKER.BA]")
         txt = "\n".join(lines)
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
+# ----- Clear: interactivo + texto -----
 async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    arg = (context.args[0].strip() if context.args else None)
-    if not ALERTS.get(chat_id):
-        await update.effective_message.reply_text("No había alertas guardadas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    rules = ALERTS.get(chat_id, [])
+    # Si pasaron un parámetro, mantener compatibilidad (número | tipo | ticker)
+    if context.args:
+        arg = context.args[0].strip()
+        if re.match(r"^\d+$", arg) and rules:
+            idx = int(arg) - 1
+            if 0 <= idx < len(rules):
+                removed = rules.pop(idx)
+                await update.effective_message.reply_text("Alerta eliminada.", parse_mode=ParseMode.HTML)
+                return
+            else:
+                await update.effective_message.reply_text("Número fuera de rango.", parse_mode=ParseMode.HTML)
+                return
+        # modo anterior por tipo/ticker
+        arg_low = arg.lower()
+        fx_types = {"oficial","mayorista","blue","mep","ccl","tarjeta","cripto"}
+        if arg_low in fx_types | {"riesgo","inflacion","reservas"} or re.match(r"^[A-Za-z0-9]+\.BA$", arg, flags=re.I):
+            before = len(rules)
+            if arg_low in fx_types:
+                ALERTS[chat_id] = [r for r in rules if not (r.get("kind")=="fx" and r.get("type")==arg_low)]
+            elif arg_low in {"riesgo","inflacion","reservas"}:
+                ALERTS[chat_id] = [r for r in rules if not (r.get("kind")=="metric" and r.get("type")==arg_low)]
+            else:
+                symu = arg.upper()
+                ALERTS[chat_id] = [r for r in rules if not (r.get("kind")=="ticker" and r.get("symbol")==symu)]
+            after = len(ALERTS[chat_id])
+            await update.effective_message.reply_text(f"Eliminadas {before-after} alertas.", parse_mode=ParseMode.HTML)
+            return
+        # si no coincidió, seguimos a interactivo
+
+    if not rules:
+        await update.effective_message.reply_text("No tenés alertas guardadas.", parse_mode=ParseMode.HTML)
         return
-    if not arg:
-        cnt = len(ALERTS[chat_id]); ALERTS[chat_id] = []
-        await update.effective_message.reply_text(f"Se eliminaron {cnt} alertas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+
+    # Interactivo: listar cada alerta con botón
+    buttons: List[List[Tuple[str,str]]] = []
+    for i, r in enumerate(rules, 1):
+        if r.get("kind") == "fx":
+            label = f"{i}. {r['type'].upper()}({r['side']}) {html_op(r['op'])} {fmt_money_ars(r['value'])}"
+        elif r.get("kind") == "metric":
+            if r["type"]=="riesgo": val = f"{r['value']:.0f} pb"
+            elif r["type"]=="reservas": val = f"{fmt_number(r['value'],0)} MUS$"
+            else: val = f"{str(round(r['value'],1)).replace('.',',')}%"
+            label = f"{i}. {r['type'].upper()} {html_op(r['op'])} {val}"
+        else:
+            if r.get("mode") == "absolute":
+                label = f"{i}. {r['symbol']} (Precio) {html_op(r['op'])} {fmt_money_ars(r['value'])}"
+            else:
+                label = f"{i}. {r['symbol']} ({r['period'].upper()}) {html_op(r['op'])} {pct(r['value'],1)}"
+        buttons.append([(label, f"CLR:{i-1}")])
+    buttons.append([("Borrar todas","CLR:ALL"), ("Cancelar","CLR:CANCEL")])
+    kb_clear = kb(buttons)
+    await update.effective_message.reply_text("Elegí qué alerta borrar:", reply_markup=kb_clear)
+
+async def alertas_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    chat_id = q.message.chat_id
+    rules = ALERTS.get(chat_id, [])
+    data = q.data.split(":",1)[1]
+    if data == "CANCEL":
+        await q.edit_message_text("Operación cancelada.")
         return
-    arg_low = arg.lower(); before = len(ALERTS[chat_id])
-    fx_types = {"oficial","mayorista","blue","mep","ccl","tarjeta","cripto"}
-    if arg_low in fx_types:
-        ALERTS[chat_id] = [r for r in ALERTS[chat_id] if not (r.get("kind")=="fx" and r.get("type")==arg_low)]
-    elif arg_low in {"riesgo","inflacion","reservas"}:
-        ALERTS[chat_id] = [r for r in ALERTS[chat_id] if not (r.get("kind")=="metric" and r.get("type")==arg_low)]
-    elif re.match(r"^[A-Za-z0-9]+\.BA$", arg, flags=re.I):
-        symu = arg.upper()
-        ALERTS[chat_id] = [r for r in ALERTS[chat_id] if not (r.get("kind")=="ticker" and r.get("symbol")==symu)]
+    if data == "ALL":
+        cnt = len(rules); ALERTS[chat_id] = []
+        await q.edit_message_text(f"Se eliminaron {cnt} alertas.")
+        return
+    try:
+        idx = int(data)
+    except Exception:
+        await q.edit_message_text("Acción inválida.")
+        return
+    if 0 <= idx < len(rules):
+        rules.pop(idx)
+        await q.edit_message_text("Alerta eliminada.")
     else:
-        await update.effective_message.reply_text("Indicá un tipo (blue/mep/ccl/oficial/mayorista/tarjeta/cripto/riesgo/inflacion/reservas) o un TICKER.BA. Sin parámetro borra todas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
-        return
-    after = len(ALERTS[chat_id])
-    await update.effective_message.reply_text(f"Eliminadas {before-after} alertas.", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+        await q.edit_message_text("Número fuera de rango.")
 
 # ----- Conversación /alertas_add (con “Volver” y valor actual) -----
 async def alertas_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -778,8 +836,8 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return AL_OP
     if target == "MODE":
         kb_mode = kb([
-            [("Ingresar Monto", "MODE:absolute")],
-            [("Ingresar % vs Valor Actual", "MODE:percent")],
+            [("Ingresar Monto (AR$)", "MODE:absolute")],
+            [("Ingresar % vs Rendimiento", "MODE:percent")],
             [("Volver","BACK:OP"),("Cancelar","CANCEL")]
         ])
         await q.edit_message_text("¿Cómo querés definir el umbral?", reply_markup=kb_mode)
@@ -846,11 +904,11 @@ async def alertas_add_fx_side(update: Update, context: ContextTypes.DEFAULT_TYPE
     if q.data.startswith("BACK:"): return await alertas_back(update, context)
     side = q.data.split(":",1)[1]
     context.user_data["al"]["side"] = side
-    k = kb([
+    kb_op = kb([
         [("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],
         [("Volver","BACK:FXSIDE"),("Cancelar","CANCEL")]
     ])
-    await q.edit_message_text(f"Lado: {side}\nElegí condición:", reply_markup=k)
+    await q.edit_message_text(f"Lado: {side}\nElegí condición:", reply_markup=kb_op)
     return AL_OP
 
 async def alertas_add_metric_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -859,11 +917,11 @@ async def alertas_add_metric_type(update: Update, context: ContextTypes.DEFAULT_
     if q.data.startswith("BACK:"): return await alertas_back(update, context)
     m = q.data.split(":",1)[1]
     context.user_data["al"]["type"] = m
-    k = kb([
+    kb_op = kb([
         [("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],
         [("Volver","BACK:METRIC"),("Cancelar","CANCEL")]
     ])
-    await q.edit_message_text(f"Métrica: {m.upper()}\nElegí condición:", reply_markup=k)
+    await q.edit_message_text(f"Métrica: {m.upper()}\nElegí condición:", reply_markup=kb_op)
     return AL_OP
 
 async def alertas_add_op(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -874,45 +932,33 @@ async def alertas_add_op(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["al"]["op"] = op
     kind = context.user_data["al"].get("kind")
 
-    # Si es ticker: mostrar precio actual y rendimiento del período antes de pedir el valor
+    # Tickers: ahora elige modo (monto o %)
     if kind == "ticker":
-        sym = context.user_data["al"].get("symbol")
-        per = context.user_data["al"].get("period")
-        if not sym or not per:
-            await q.edit_message_text("Faltan datos del ticker. Volvé a intentarlo con /alertas_add.")
-            return ConversationHandler.END
-        async with ClientSession() as session:
-            metmap, _ = await metrics_for_symbols(session, [sym])
-            cur = metmap.get(sym, {}).get(per)
-            last_px = metmap.get(sym, {}).get("last_px")
-        cur_s = pct(cur,1) if cur is not None else "—"
-        px_s  = fmt_money_ars(last_px) if last_px is not None else "—"
-        await q.edit_message_text(
-            f"Ticker: {sym}\nPeríodo: {per}\nCondición: {'↑ Sube' if op=='>' else '↓ Baja'}\n"
-            f"Actual: Precio {px_s} | Rendimiento {cur_s}\n\n"
-            "Ingresá el valor objetivo en % (puntos). Ej: 12  |  -8.5"
-        )
-        return AL_VALUE
+        kb_mode = kb([
+            [("Ingresar Monto (AR$)", "MODE:absolute")],
+            [("Ingresar % vs Rendimiento", "MODE:percent")],
+            [("Volver","BACK:OP"),("Cancelar","CANCEL")]
+        ])
+        await q.edit_message_text("¿Cómo querés definir el umbral?", reply_markup=kb_mode)
+        return AL_MODE
 
-    # Si es fx o metric: ir a elegir modo (monto / %), y mostrar valor actual al pedir el número (en AL_MODE)
-    k = kb([
+    # FX / Métricas: elegir modo como antes
+    kb_mode = kb([
         [("Ingresar Monto", "MODE:absolute")],
         [("Ingresar % vs Valor Actual", "MODE:percent")],
         [("Volver","BACK:OP"),("Cancelar","CANCEL")]
     ])
-    await q.edit_message_text("¿Cómo querés definir el umbral?", reply_markup=k)
+    await q.edit_message_text("¿Cómo querés definir el umbral?", reply_markup=kb_mode)
     return AL_MODE
 
 async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     if q.data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
     if q.data.startswith("BACK:"): return await alertas_back(update, context)
-    mode = q.data.split(":",1)[1]  # absolute | percent
+    mode = q.data.split(":",1)[1]
     context.user_data["al"]["mode"] = mode
-
     al = context.user_data.get("al", {})
     kind = al.get("kind")
-    msg_help = ""
 
     async with ClientSession() as session:
         if kind == "fx":
@@ -920,13 +966,16 @@ async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cur = row.get(al.get("side",""))
             cur_s = fmt_money_ars(cur) if cur is not None else "—"
             if mode == "percent":
-                msg_help = (f"Ahora: {al.get('type','?').upper()} ({al.get('side','?')}) = {cur_s}\n"
-                            "Ingresá el porcentaje (solo número). Ej: 10  |  7,5\n"
-                            "Se calculará sobre el valor actual (p. ej. 10% ↑ suma 10% al valor de hoy).")
+                msg = (f"Ahora: {al.get('type','?').upper()} ({al.get('side','?')}) = {cur_s}\n"
+                       "Ingresá el porcentaje (solo número). Ej: 10  |  7,5\n"
+                       "Se aplica sobre el valor actual (ej.: +10% ↑).")
             else:
-                msg_help = (f"Ahora: {al.get('type','?').upper()} ({al.get('side','?')}) = {cur_s}\n"
-                            "Ingresá el monto (solo número). Ej: 1580  |  25500")
-        elif kind == "metric":
+                msg = (f"Ahora: {al.get('type','?').upper()} ({al.get('side','?')}) = {cur_s}\n"
+                       "Ingresá el monto (solo número). Ej: 1580  |  25500")
+            await q.edit_message_text(msg)
+            return AL_VALUE
+
+        if kind == "metric":
             rp = await get_riesgo_pais(session)
             infl = await get_inflacion_mensual(session)
             rv  = await get_reservas_lamacro(session)
@@ -935,20 +984,35 @@ async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "inflacion": ((str(round(infl[0],1)).replace('.',','))+"%" if infl else "—", infl[0] if infl else None),
                 "reservas": (f"{fmt_number(rv[0],0)} MUS$" if rv else "—", rv[0] if rv else None)
             }
-            label, cur = vals.get(al.get("type",""), ("—", None))
+            label, _ = vals.get(al.get("type",""), ("—", None))
             if mode == "percent":
-                msg_help = (f"Ahora: {al.get('type','?').upper()} = {label}\n"
-                            "Ingresá el porcentaje (solo número). Ej: 10  |  7,5\n"
-                            "Se calculará sobre el valor actual (p. ej. 10% ↑ suma 10% al valor de hoy).")
+                msg = (f"Ahora: {al.get('type','?').upper()} = {label}\n"
+                       "Ingresá el porcentaje (solo número). Ej: 10  |  7,5\n"
+                       "Se aplica sobre el valor actual (ej.: +10% ↑).")
             else:
                 unidad = "pb" if al.get("type")=="riesgo" else ("MUS$" if al.get("type")=="reservas" else "%")
-                msg_help = (f"Ahora: {al.get('type','?').upper()} = {label}\n"
-                            f"Ingresá el monto (solo número, en {unidad}). Ej: 25000")
-        else:
-            msg_help = "Ingresá el valor."
+                msg = (f"Ahora: {al.get('type','?').upper()} = {label}\n"
+                       f"Ingresá el monto (solo número, en {unidad}). Ej: 25000")
+            await q.edit_message_text(msg)
+            return AL_VALUE
 
-    await q.edit_message_text(msg_help)
-    return AL_VALUE
+        # kind == "ticker": mostrar precio y rendimiento actual del período elegido
+        sym, per = al.get("symbol"), al.get("period")
+        metmap, _ = await metrics_for_symbols(session, [sym])
+        cur_ret = metmap.get(sym, {}).get(per)
+        last_px = metmap.get(sym, {}).get("last_px")
+        cur_ret_s = pct(cur_ret,1) if cur_ret is not None else "—"
+        price_s   = fmt_money_ars(last_px) if last_px is not None else "—"
+        if mode == "percent":
+            msg = (f"Ticker: {sym} | Período: {per}\n"
+                   f"Actual: Precio {price_s} | Rendimiento {cur_ret_s}\n\n"
+                   "Ingresá el valor objetivo en % (puntos). Ej: 12  |  -8.5")
+        else:
+            msg = (f"Ticker: {sym} | Período: {per}\n"
+                   f"Actual: Precio {price_s} | Rendimiento {cur_ret_s}\n\n"
+                   "Ingresá el precio objetivo (AR$). Ej: 3500  |  12850")
+        await q.edit_message_text(msg)
+        return AL_VALUE
 
 async def alertas_add_ticker_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -991,12 +1055,12 @@ async def alertas_add_period(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return AL_OP
 
 # --- Valor final e inserción de regla ---
-def _symbols_from_alerts() -> List[str]:
-    syms = set()
-    for rules in ALERTS.values():
-        for r in rules:
-            if r.get("kind") == "ticker" and r.get("symbol"): syms.add(r["symbol"])
-    return sorted(syms)
+def _parse_float_user(s: str) -> Optional[float]:
+    s = s.strip()
+    s = s.replace("pb","").replace("%","").replace("MUS$","").replace("mus$","").replace("$","")
+    s = s.replace(".", "").replace(",", ".")
+    try: return float(s)
+    except Exception: return None
 
 async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = _parse_float_user(update.message.text or "")
@@ -1059,19 +1123,31 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   )
 
         else:  # ticker
-            sym, per = al.get("symbol"), al.get("period")
+            sym, per, mode = al.get("symbol"), al.get("period"), al.get("mode","percent")
             metmap, _ = await metrics_for_symbols(session, [sym])
-            cur = metmap.get(sym, {}).get(per)
-            if cur is None:
-                await update.message.reply_text("No pude leer el rendimiento actual. Probá más tarde.")
-                return ConversationHandler.END
-            thr = val  # puntos porcentuales
-            rule = {"kind":"ticker","symbol":sym,"period":per,"op":al["op"],"value":float(thr)}
-            ALERTS.setdefault(chat_id, []).append(rule)
-            cur_s = pct(cur,1); thr_s = pct(thr,1)
-            fb = (f"Ahora: {sym} ({per.upper()}) = {cur_s}\n"
-                  f"Se avisará si {sym} ({per.upper()}) "
-                  f"{'supera' if al['op']=='>' else 'cae por debajo de'} {thr_s}")
+            cur_ret = metmap.get(sym, {}).get(per)
+            last_px = metmap.get(sym, {}).get("last_px")
+            if mode == "percent":
+                if cur_ret is None:
+                    await update.message.reply_text("No pude leer el rendimiento actual. Probá más tarde.")
+                    return ConversationHandler.END
+                thr = val  # puntos porcentuales del rendimiento del período
+                rule = {"kind":"ticker","symbol":sym,"period":per,"op":al["op"],"value":float(thr),"mode":"percent"}
+                ALERTS.setdefault(chat_id, []).append(rule)
+                cur_s = pct(cur_ret,1); thr_s = pct(thr,1)
+                fb = (f"Ahora: {sym} ({per.upper()}) = {cur_s}\n"
+                      f"Se avisará si {sym} ({per.upper()}) "
+                      f"{'supera' if al['op']=='>' else 'cae por debajo de'} {thr_s}")
+            else:
+                if last_px is None:
+                    await update.message.reply_text("No pude leer el precio actual. Probá más tarde.")
+                    return ConversationHandler.END
+                thr = val  # precio AR$
+                rule = {"kind":"ticker","symbol":sym,"period":per,"op":al["op"],"value":float(thr),"mode":"absolute"}
+                ALERTS.setdefault(chat_id, []).append(rule)
+                fb = (f"Ahora: {sym} (Precio) = {fmt_money_ars(last_px)}\n"
+                      f"Se avisará si {sym} (Precio) "
+                      f"{'supera' if al['op']=='>' else 'cae por debajo de'} {fmt_money_ars(thr)}")
 
     await update.message.reply_text(f"Listo. Alerta agregada ✅\n{fb}", parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
     return ConversationHandler.END
@@ -1118,10 +1194,17 @@ async def alerts_loop(app: Application):
                             if ok: trig.append(("metric", r["type"], r["op"], r["value"], cur))
                         elif r.get("kind") == "ticker":
                             sym = r["symbol"]; per = r["period"]; m = metmap.get(sym, {})
-                            cur = m.get(per)
-                            if cur is None: continue
-                            ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
-                            if ok: trig.append(("ticker", sym, per, r["op"], r["value"], cur))
+                            mode = r.get("mode","percent")
+                            if mode == "absolute":
+                                cur = m.get("last_px")
+                                if cur is None: continue
+                                ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
+                                if ok: trig.append(("ticker_px", sym, r["op"], r["value"], cur))
+                            else:
+                                cur = m.get(per)
+                                if cur is None: continue
+                                ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
+                                if ok: trig.append(("ticker_ret", sym, per, r["op"], r["value"], cur))
                     if trig:
                         lines = [f"<b>🔔 Alertas</b>"]
                         for t, *rest in trig:
@@ -1136,7 +1219,10 @@ async def alerts_loop(app: Application):
                                     lines.append(f"Inflación Mensual: {str(round(cur,1)).replace('.',',')}% ({'↑' if op=='>' else '↓'} {str(round(v,1)).replace('.',',')}%)")
                                 elif tipo=="reservas":
                                     lines.append(f"Reservas: {fmt_number(cur,0)} MUS$ ({'↑' if op=='>' else '↓'} {fmt_number(v,0)} MUS$)")
-                            else:
+                            elif t == "ticker_px":
+                                sym, op, v, cur = rest
+                                lines.append(f"{sym} (Precio): {fmt_money_ars(cur)} ({'↑' if op=='>' else '↓'} {fmt_money_ars(v)})")
+                            else:  # ticker_ret
                                 sym, per, op, v, cur = rest
                                 lines.append(f"{sym} ({per.upper()}): {pct(cur,1)} ({'↑' if op=='>' else '↓'} {pct(v,1)})")
                         try:
@@ -1220,7 +1306,10 @@ application.add_handler(CommandHandler("inflacion", cmd_inflacion))
 application.add_handler(CommandHandler("riesgo", cmd_riesgo))
 application.add_handler(CommandHandler("resumen_diario", cmd_resumen_diario))
 application.add_handler(CommandHandler("alertas", cmd_alertas_list))
+
+# /alertas_clear: comando + callbacks
 application.add_handler(CommandHandler("alertas_clear", cmd_alertas_clear))
+application.add_handler(CallbackQueryHandler(alertas_clear_cb, pattern=r"^CLR:(\d+|ALL|CANCEL)$"))
 
 # Conversación /alertas_add
 conv = ConversationHandler(
