@@ -3,3 +3,4 @@ httpx==0.26.*
 aiohttp>=3.9,<4
 certifi
 tzdata
+redis>=5,<6
