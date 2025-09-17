@@ -3,11 +3,13 @@
 
 # Bot Económico AR — Webhook (Render)
 # Persistencia: Redis (Upstash) + fallback /tmp/state.json
-# Cambios:
-# - Tickers (Acciones/CEDEARs): alertas SOLO por precio absoluto AR$, sin períodos.
-# - Economía (Riesgo/Inflación/Reservas): botones de modo sin AR$ (pb, %, USD(MUS$)).
-# - Validación estricta de input numérico + mensajes guía.
-# - Mantiene compatibilidad para alertas antiguas ya guardadas.
+# Cambios relevantes:
+# - FIX: botón "Volver" en el paso de MODO (Economía) ahora retrocede a OP (↑/↓).
+# - Revisión de "Volver" en FX y Tickers para un flujo consistente.
+# - Validación numérica y mensajes guía (solo números, sin símbolos).
+# - Sin períodos en alertas de Acciones/Cedears: solo precio objetivo AR$.
+# - Unidades macro: Riesgo(pb), Inflación(%), Reservas(USD/MUS$).
+# - Sin comando de diagnóstico de almacenamiento.
 
 import os, asyncio, logging, re, html as _html, json
 from time import time
@@ -125,16 +127,6 @@ class Storage:
                 log.warning("Redis status: Filesystem fallback (%s)", e)
         else:
             log.info("Redis status: Filesystem (REDIS_URL no está configurado)")
-
-    async def debug_info(self) -> str:
-        if self.backend == "redis":
-            try:
-                pong = await self._r.ping()
-                return "Backend: Redis (ping OK)" if pong else "Backend: Redis (ping FALLÓ)"
-            except Exception as e:
-                return f"Backend: Redis (error: {e})"
-        else:
-            return f"Backend: Filesystem ({self.state_path})"
 
     async def load(self) -> Dict[str, Any]:
         if self.backend == "redis" and self._r:
@@ -592,7 +584,6 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
     for k, label in order:
         row = d.get(k)
         if not row: continue
-        # En la tabla: columna "Venta" muestra row["compra"]; "Compra" muestra row["venta"] (diseño original).
         venta_val  = row.get("compra")
         compra_val = row.get("venta")
         venta  = fmt_money_ars(venta_val)  if venta_val  is not None else "—"
@@ -759,7 +750,6 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.effective_message.reply_text("\n\n".join(blocks), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 # ------------- Alertas -------------
-# Estados conversación alertas (única definición)
 AL_KIND, AL_FX_TYPE, AL_FX_SIDE, AL_OP, AL_MODE, AL_VALUE, AL_METRIC_TYPE, AL_TICKER = range(8)
 
 def kb(rows: List[List[Tuple[str,str]]]) -> InlineKeyboardMarkup:
@@ -796,7 +786,6 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if r.get("mode") == "absolute":
                     lines.append(f"{i}. {_label_long(r['symbol'])} (Precio) {html_op(r['op'])} {fmt_money_ars(r['value'])}")
                 else:
-                    # Compatibilidad con alertas antiguas por % (ya no se crean nuevas)
                     lines.append(f"{i}. {_label_long(r['symbol'])} (% antiguo) {html_op(r['op'])} {pct(r['value'],1)}")
         if chat_id in ALERTS_PAUSED:
             lines.append("\n<i>Alertas en pausa (indefinida)</i>")
@@ -944,7 +933,6 @@ def kb_submenu_metric() -> InlineKeyboardMarkup:
     ])
 
 def kb_mode_for(kind: str, metric_type: Optional[str]=None) -> InlineKeyboardMarkup:
-    # Devuelve teclado de modo según categoría
     if kind == "fx":
         return kb([[("Ingresar Monto (AR$)", "MODE:absolute")],
                    [("Ingresar % vs Valor Actual", "MODE:percent")],
@@ -961,7 +949,6 @@ def kb_mode_for(kind: str, metric_type: Optional[str]=None) -> InlineKeyboardMar
         return kb([[ (lab_abs, "MODE:absolute") ],
                    [("Ingresar % vs Valor Actual", "MODE:percent")],
                    [("Volver","BACK:OP"),("Cancelar","CANCEL")]])
-    # Para tickers ya no ofrecemos %: solo precio absoluto
     return kb([[("Ingresar Precio (AR$)", "MODE:absolute")],
                [("Volver","BACK:OP"),("Cancelar","CANCEL")]])
 
@@ -979,6 +966,7 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     target = q.data.split(":",1)[1]
     al = context.user_data.get("al", {})
+
     if target == "KIND":
         k = kb([
             [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
@@ -986,33 +974,45 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [("Cancelar", "CANCEL")]
         ])
         await q.edit_message_text("¿Qué querés alertar?", reply_markup=k); return AL_KIND
+
     if target == "FXTYPE":
         await q.edit_message_text("Elegí el tipo de dólar:", reply_markup=kb_submenu_fx()); return AL_FX_TYPE
+
     if target == "FXSIDE":
         t = al.get("type","?")
-        await q.edit_message_text(f"Tipo: {t.upper()}\nElegí lado:", reply_markup=kb([[("Venta","SIDE:venta"),("Compra","SIDE:compra")],[("Volver","BACK:FXTYPE"),("Cancelar","CANCEL")]])); return AL_FX_SIDE
+        kb_side = kb([[("Venta","SIDE:venta"),("Compra","SIDE:compra")],[("Volver","BACK:FXTYPE"),("Cancelar","CANCEL")]])
+        if t == "tarjeta":
+            kb_side = kb([[("Venta","SIDE:venta")],[("Volver","BACK:FXTYPE"),("Cancelar","CANCEL")]])
+        await q.edit_message_text(f"Tipo: {t.upper()}\nElegí lado:", reply_markup=kb_side); return AL_FX_SIDE
+
     if target == "METRIC":
         await q.edit_message_text("Elegí la métrica:", reply_markup=kb_submenu_metric()); return AL_METRIC_TYPE
+
     if target == "TICKERS_ACC":
         await q.edit_message_text("Elegí el ticker (Acciones .BA):", reply_markup=kb_tickers(ACCIONES_BA, "KIND")); return AL_TICKER
+
     if target == "TICKERS_CEDEARS":
         await q.edit_message_text("Elegí el ticker (Cedears .BA):", reply_markup=kb_tickers(CEDEARS_BA, "KIND")); return AL_TICKER
+
     if target == "OP":
+        # FIX: Retroceder al selector de condición ↑/↓ según el tipo
         kind = al.get("kind")
-        if kind == "ticker":
-            await q.edit_message_text(f"Condición: {'↑ Sube' if al.get('op')=='>' else '↓ Baja'}\n"
-                                      "Ingresá el <b>precio objetivo</b> en AR$.\n\n"
-                                      "👉 <b>Escribí SOLO el número</b>, sin $ ni separadores de miles.\n"
-                                      "Ej: 3500   |   12850.5")
-            al["mode"] = "absolute"
-            return AL_VALUE
-        # fx/metric: mostrar modos adecuados
         if kind == "fx":
-            kb_mode = kb_mode_for("fx")
-        else:
-            kb_mode = kb_mode_for("metric", al.get("type"))
-        await q.edit_message_text("¿Cómo querés definir el umbral?", reply_markup=kb_mode)
-        return AL_MODE
+            kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],
+                        [("Volver","BACK:FXSIDE"),("Cancelar","CANCEL")]])
+            await q.edit_message_text("Elegí condición:", reply_markup=kb_op); return AL_OP
+        elif kind == "metric":
+            kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],
+                        [("Volver","BACK:METRIC"),("Cancelar","CANCEL")]])
+            await q.edit_message_text("Elegí condición:", reply_markup=kb_op); return AL_OP
+        else:  # ticker
+            back_target = "TICKERS_ACC" if al.get("segment")=="acciones" else "TICKERS_CEDEARS"
+            kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],
+                        [("Volver",f"BACK:{back_target}"),("Cancelar","CANCEL")]])
+            sym = al.get("symbol")
+            prefix = f"Ticker: {_label_long(sym)}\n" if sym else ""
+            await q.edit_message_text(prefix + "Elegí condición:", reply_markup=kb_op); return AL_OP
+
     await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
 
 async def alertas_add_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1054,7 +1054,8 @@ async def alertas_add_fx_side(update: Update, context: ContextTypes.DEFAULT_TYPE
     if q.data.startswith("BACK:"): return await alertas_back(update, context)
     side = q.data.split(":",1)[1]
     context.user_data["al"]["side"] = side
-    kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],[("Volver","BACK:FXSIDE"),("Cancelar","CANCEL")]])
+    kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],
+                [("Volver","BACK:FXSIDE"),("Cancelar","CANCEL")]])
     await q.edit_message_text("Elegí condición:", reply_markup=kb_op)
     return AL_OP
 
@@ -1064,7 +1065,8 @@ async def alertas_add_metric_type(update: Update, context: ContextTypes.DEFAULT_
     if q.data.startswith("BACK:"): return await alertas_back(update, context)
     m = q.data.split(":",1)[1]
     context.user_data["al"]["type"] = m
-    kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],[("Volver","BACK:METRIC"),("Cancelar","CANCEL")]])
+    kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],
+                [("Volver","BACK:METRIC"),("Cancelar","CANCEL")]])
     await q.edit_message_text(f"Métrica: {m.upper()}\nElegí condición:", reply_markup=kb_op)
     return AL_OP
 
@@ -1075,15 +1077,15 @@ async def alertas_add_op(update: Update, context: ContextTypes.DEFAULT_TYPE):
     op = q.data.split(":",1)[1]
     context.user_data["al"]["op"] = op
     al = context.user_data.get("al", {})
-    # Tickers: saltamos elección de modo y pedimos precio AR$
     if al.get("kind") == "ticker":
-        await q.edit_message_text(f"Condición: {'↑ Sube' if op=='>' else '↓ Baja'}\n"
-                                  "Ingresá el <b>precio objetivo</b> en AR$.\n\n"
-                                  "👉 <b>Escribí SOLO el número</b>, sin $ ni separadores de miles.\n"
-                                  "Ej: 3500   |   12850.5")
+        await q.edit_message_text(
+            f"Condición: {'↑ Sube' if op=='>' else '↓ Baja'}\n"
+            "Ingresá el <b>precio objetivo</b> en AR$.\n\n"
+            "👉 <b>Escribí SOLO el número</b>, sin $ ni separadores de miles.\n"
+            "Ej: 3500   |   12850.5"
+        )
         al["mode"] = "absolute"
         return AL_VALUE
-    # FX/Metric: mostrar modos adecuados
     if al.get("kind") == "fx":
         km = kb_mode_for("fx")
     else:
@@ -1102,7 +1104,6 @@ async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         if al.get("kind") == "fx":
             fx = await get_dolares(session); row = fx.get(al.get("type",""), {}) or {}
-            # Valor que se muestra: coincide con columna visible en /dolar
             cur = row.get("compra") if al.get("side","venta")=="venta" else row.get("venta")
             cur_s = fmt_money_ars(cur) if cur is not None else "—"
             if mode == "percent":
@@ -1142,7 +1143,6 @@ async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             msg += "\n\n👉 <b>Escribí SOLO el número</b>, sin símbolos (%, pb, USD) ni separadores de miles."
             await q.edit_message_text(msg); return AL_VALUE
 
-        # kind == "ticker" (no debería entrar acá porque ya saltamos MODE)
         await q.edit_message_text("Ingresá el precio objetivo en AR$ (solo número)."); return AL_VALUE
 
 async def alertas_add_ticker_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1151,7 +1151,8 @@ async def alertas_add_ticker_cb(update: Update, context: ContextTypes.DEFAULT_TY
     if q.data.startswith("BACK:"): return await alertas_back(update, context)
     sym = q.data.split(":",1)[1].upper()
     context.user_data["al"]["symbol"] = sym
-    k = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],[("Volver","BACK:" + ("TICKERS_ACC" if context.user_data["al"].get("segment")=="acciones" else "TICKERS_CEDEARS")),("Cancelar","CANCEL")]])
+    back_target = "TICKERS_ACC" if context.user_data["al"].get("segment")=="acciones" else "TICKERS_CEDEARS"
+    k = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],[("Volver","BACK:"+back_target),("Cancelar","CANCEL")]])
     await q.edit_message_text(f"Ticker: {_label_long(sym)}\nElegí condición:", reply_markup=k)
     return AL_OP
 
@@ -1166,7 +1167,6 @@ async def alertas_add_ticker_text(update: Update, context: ContextTypes.DEFAULT_
     return AL_OP
 
 async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Validación estricta
     val = parse_user_number(update.message.text or "")
     if val is None:
         await update.message.reply_text("No entendí el número. Ingresá <b>solo dígitos</b> y opcional decimal con <b>coma o punto</b>.\n"
@@ -1174,8 +1174,6 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return AL_VALUE
     al = context.user_data.get("al", {})
     chat_id = update.effective_chat.id
-
-    # No permitir negativos para % (tiene poco sentido para 'variación vs actual')
     if al.get("mode") == "percent" and val < 0:
         await update.message.reply_text("El porcentaje debe ser un número positivo.")
         return AL_VALUE
@@ -1299,7 +1297,6 @@ async def alerts_loop(app: Application):
                                 ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
                                 if ok: trig.append(("ticker_px", sym, r["op"], r["value"], cur))
                             else:
-                                # compatibilidad con alertas antiguas por % y período
                                 per = r.get("period","1m")
                                 cur = m.get(per)
                                 if cur is None: continue
@@ -1410,8 +1407,6 @@ async def on_startup(app: web.Application):
     global ALERTS, SUBS
     ALERTS = {int(k): v for k,v in data.get("alerts", {}).items()}
     SUBS   = {int(k): v for k,v in data.get("subs", {}).items()}
-    info = await STORAGE.debug_info()
-    log.info(info)
     await application.initialize()
     await application.start()
     await application.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=["message","callback_query"], drop_pending_updates=True)
