@@ -703,7 +703,7 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = "\n".join(lines)
     await update.effective_message.reply_text(txt)
 
-# ---- CLEAR/PAUSE/RESUME (igual que antes) ----
+# ---- CLEAR/PAUSE/RESUME ----
 async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     rules = ALERTS.get(chat_id, [])
@@ -772,7 +772,7 @@ async def cmd_alertas_resume(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
     await update.effective_message.reply_text("🔔 Alertas reanudadas.")
 
-# ---- Conversación Agregar Alerta (ARREGLADA) ----
+# ---- Conversación Agregar Alerta ----
 def kb_submenu_fx() -> InlineKeyboardMarkup:
     return kb([
         [("Oficial","FXTYPE:oficial"),("Mayorista","FXTYPE:mayorista")],
@@ -1192,7 +1192,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _,_,mon,tc = data.split(":")
         pf = pf_get(chat_id)
         pf["base"] = {"moneda": mon, "tc": tc if tc!="-" else None}; save_state()
-        msg = f"Base fijada: {mon}" + (f" / {tc.upper()}" if tc and tc!="-": "")
+        msg = f"Base fijada: {mon}" + (f" / {tc.upper()}" if (tc and tc != "-") else "")
         await q.edit_message_text(msg); return
     if data == "PF:SETMONTO":
         context.user_data["pf_mode"] = "set_monto"
@@ -1461,7 +1461,7 @@ application.add_handler(CommandHandler("alertas_pause", cmd_alertas_pause))
 application.add_handler(CallbackQueryHandler(alerts_pause_cb, pattern=r"^AP:(PAUSE:(INF|1|3|6|12|24)|RESUME|CLOSE)$"))
 application.add_handler(CommandHandler("alertas_resume", cmd_alertas_resume))
 
-# ---- Conversación Agregar Alerta (esta vez completa y funcional) ----
+# ---- Conversación Agregar Alerta ----
 conv_alertas = ConversationHandler(
     entry_points=[CommandHandler("alertas_add", alertas_add_start)],
     states={
