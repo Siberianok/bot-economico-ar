@@ -94,7 +94,7 @@ TICKER_NAME = {
     "GD41":"Bono GD41","AE38":"Bono AE38","AL41":"Bono AL41","AL38":"Bono AL38",
     "GD46":"Bono GD46","AL32":"Bono AL32","GD29":"Bono GD29","AL36":"Bono AL36","AL39":"Bono AL39",
     "GD35D":"Bono GD35D (USD)","GD41D":"Bono GD41D (USD)","AL29D":"Bono AL29D (USD)",
-    # FCI y Letras: descriptivos genéricos
+    # FCI & Letras genérico
     "FCI-MoneyMarket":"FCI Money Market","FCI-BonosUSD":"FCI Bonos USD","FCI-AccionesArg":"FCI Acciones AR",
     "FCI-Corporativos":"FCI Bonos Corporativos","FCI-Liquidez":"FCI Liquidez","FCI-Balanceado":"FCI Balanceado",
     "FCI-RentaMixta":"FCI Renta Mixta","FCI-RealEstate":"FCI Real Estate","FCI-Commodity":"FCI Commodities",
@@ -102,13 +102,7 @@ TICKER_NAME = {
     "FCI-DurationMedia":"FCI Duration Media","FCI-DurationLarga":"FCI Duration Larga","FCI-HighYield":"FCI High Yield",
     "FCI-BlueChips":"FCI Blue Chips","FCI-Growth":"FCI Growth","FCI-Value":"FCI Value",
     "FCI-Latam":"FCI Latam","FCI-Global":"FCI Global",
-    # Letras
     **{k:k.replace("-", " ") for k in LETES_LIST},
-    # Cripto
-    "BTC-USD":"Bitcoin","ETH-USD":"Ethereum","SOL-USD":"Solana","BNB-USD":"BNB","XRP-USD":"XRP","ADA-USD":"Cardano",
-    "DOGE-USD":"Dogecoin","TON-USD":"Toncoin","TRX-USD":"TRON","DOT-USD":"Polkadot","AVAX-USD":"Avalanche",
-    "MATIC-USD":"Polygon","LINK-USD":"Chainlink","LTC-USD":"Litecoin","UNI-USD":"Uniswap",
-    "BCH-USD":"Bitcoin Cash","ATOM-USD":"Cosmos","XLM-USD":"Stellar","NEAR-USD":"NEAR","APT-USD":"Aptos",
 }
 NAME_ABBR = {k: (v.split()[0] if ".BA" in k else v.split()[0]) for k,v in TICKER_NAME.items()}
 
@@ -249,7 +243,6 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
     return data
 
 async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str]]]:
-    # ArgentinaDatos
     for suf in ("/riesgo-pais/ultimo", "/riesgo-pais"):
         base_ok = None
         for base in ARG_DATOS_BASES:
@@ -500,17 +493,17 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
         f = row.get("fecha")
         if f: fecha = parse_iso_ddmmyyyy(f)
     header = "<b>💵 Dólares</b>" + (f"  <i>Actualizado: {fecha}</i>" if fecha else "")
-    lines = [header, "<pre>Tipo          Venta         Compra</pre>"]
+    lines = [header, "<pre>Tipo          Compra       Venta</pre>"]
     rows = []
     order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
     for k, label in order:
         row = d.get(k)
         if not row: continue
-        venta_val  = row.get("compra")
-        compra_val = row.get("venta")
-        venta  = fmt_money_ars(venta_val)  if venta_val  is not None else "—"
-        compra = fmt_money_ars(compra_val) if compra_val is not None else "—"
-        l = f"{label:<12}{venta:>12}    {compra:>12}"
+        compra_val  = row.get("compra")
+        venta_val   = row.get("venta")
+        compra = fmt_money_ars(compra_val) if compra_val  is not None else "—"
+        venta  = fmt_money_ars(venta_val)  if venta_val   is not None else "—"
+        l = f"{label:<12}{compra:>12}    {venta:>12}"
         rows.append(f"<pre>{l}</pre>")
     rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
     return "\n".join([lines[0], lines[1]] + rows)
@@ -567,7 +560,7 @@ def projection_6m(m: Dict[str, Optional[float]]) -> float:
     meanrev = -0.05*max(0.0, abs(r1)-15.0)
     return momentum + trend + hi52 + risk + meanrev
 
-# Helpers para enviar cada ranking por separado
+# Helpers de ranking
 async def _rank_top3(update: Update, symbols: List[str], title: str):
     async with ClientSession() as session:
         mets, last_ts = await metrics_for_symbols(session, symbols)
@@ -615,12 +608,16 @@ async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data
     if data == "ACC:TOP3":
         await _rank_top3(update, ACCIONES_BA, "📈 Top 3 Acciones (Rendimiento)")
+        await cmd_acciones_menu(update, context)
     elif data == "ACC:TOP5":
         await _rank_proj5(update, ACCIONES_BA, "🏁 Top 5 Acciones (Proyección)")
+        await cmd_acciones_menu(update, context)
     elif data == "CED:TOP3":
         await _rank_top3(update, CEDEARS_BA, "🌎 Top 3 Cedears (Rendimiento)")
+        await cmd_cedears_menu(update, context)
     elif data == "CED:TOP5":
         await _rank_proj5(update, CEDEARS_BA, "🏁 Top 5 Cedears (Proyección)")
+        await cmd_cedears_menu(update, context)
 
 # ---------- Macro ----------
 async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -703,8 +700,10 @@ def _parse_float_user_strict(s: str) -> Optional[float]:
     except Exception: return None
 
 def _fx_display_value(row: Dict[str, Any], side: str) -> Optional[float]:
-    # mostramos “venta” al usuario como precio de referencia
-    return row.get("compra") if side == "venta" else row.get("venta")
+    # usar el lado seleccionado por el usuario, sin invertir
+    if side == "compra": return row.get("compra")
+    if side == "venta": return row.get("venta")
+    return None
 
 async def cmd_alertas_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb_menu = kb([
@@ -717,10 +716,16 @@ async def cmd_alertas_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def alertas_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
-    if data == "AL:LIST": return await cmd_alertas_list(update, context)
-    if data == "AL:CLEAR":return await cmd_alertas_clear(update, context)
-    if data == "AL:PAUSE":return await cmd_alertas_pause(update, context)
-    if data == "AL:RESUME":return await cmd_alertas_resume(update, context)
+    if data == "AL:LIST": 
+        await cmd_alertas_list(update, context)
+        await cmd_alertas_menu(update, context)
+    if data == "AL:CLEAR":
+        await cmd_alertas_clear(update, context)
+    if data == "AL:PAUSE":
+        await cmd_alertas_pause(update, context)
+    if data == "AL:RESUME":
+        await cmd_alertas_resume(update, context)
+        await cmd_alertas_menu(update, context)
 
 async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -834,10 +839,9 @@ def kb_submenu_metric() -> InlineKeyboardMarkup:
 def kb_fx_side_for(t: str) -> InlineKeyboardMarkup:
     if t == "tarjeta":
         return kb([[("Venta","SIDE:venta")],[("Volver","BACK:FXTYPE"),("Cancelar","CANCEL")]])
-    return kb([[("Venta","SIDE:venta"),("Compra","SIDE:compra")],[("Volver","BACK:FXTYPE"),("Cancelar","CANCEL")]])
+    return kb([[("Compra","SIDE:compra"),("Venta","SIDE:venta")],[("Volver","BACK:FXTYPE"),("Cancelar","CANCEL")]])
 
 async def alertas_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # entry point del flujo, soporta callback directo "AL:ADD"
     if update.callback_query:
         q = update.callback_query; await q.answer()
         context.user_data["al"] = {}
@@ -1030,6 +1034,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if cur is None: await update.message.reply_text("No pude leer el valor actual."); return ConversationHandler.END
             thr = cur*(1 + (val/100.0)) if al.get("mode")=="percent" and al["op"] == ">" else \
                   cur*(1 - (val/100.0)) if al.get("mode")=="percent" else val
+            # validar en absoluto
             if al.get("mode") == "absolute":
                 if (al["op"] == ">" and thr <= cur) or (al["op"] == "<" and thr >= cur):
                     await update.message.reply_text(f"El objetivo debe ser {'mayor' if al['op']=='>' else 'menor'} que {fmt_money_ars(cur)}."); return AL_VALUE
@@ -1218,12 +1223,31 @@ def kb_pick_generic(symbols: List[str], back: str, prefix: str) -> InlineKeyboar
         if len(row) == 2:
             rows.append(row); row = []
     if row: rows.append(row)
-    # ← volver un paso (al submenú de tipo de instrumento), NO al menú principal
     rows.append([("Volver","PF:ADD")])
     return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t,d in r] for r in rows])
 
 async def cmd_portafolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text("📦 Menú Portafolio", reply_markup=kb_pf_main())
+
+async def _pf_total_usado(chat_id: int) -> float:
+    """Suma importes de todos los ítems; si tienen cantidad y precio actual disponible (acciones/cedears), usa precio*qty."""
+    pf = pf_get(chat_id)
+    total = 0.0
+    # intentar valuar acciones/cedears por precio actual
+    syms = [it["simbolo"] for it in pf["items"] if it.get("simbolo") and it.get("tipo") in ("accion","cedear")]
+    prices: Dict[str, float] = {}
+    if syms:
+        async with ClientSession() as session:
+            mets, _ = await metrics_for_symbols(session, sorted(set(syms)))
+        for s in syms:
+            px = mets.get(s,{}).get("last_px")
+            if px: prices[s] = float(px)
+    for it in pf["items"]:
+        if it.get("importe") is not None:
+            total += float(it["importe"])
+        elif it.get("cantidad") is not None and it.get("simbolo") in prices:
+            total += float(it["cantidad"]) * float(prices[it["simbolo"]])
+    return total
 
 async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -1308,6 +1332,8 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if it.get("importe")  is not None: desc += f" | Importe: {fmt_money_ars(it['importe'])}"
             if it.get("tna")      is not None: desc += f" | TNA: {str(it['tna']).replace('.',',')}%"
             lines.append(desc)
+        usado = await _pf_total_usado(chat_id)
+        lines.append(f"\nUsado: {fmt_money_ars(usado)}  ·  Restante: {fmt_money_ars(max(0.0, pf['monto']-usado))}")
         await q.edit_message_text("\n".join(lines), reply_markup=kb_pf_main()); return
     if data == "PF:EDIT":
         pf = pf_get(chat_id)
@@ -1369,12 +1395,17 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     pf = pf_get(chat_id)
 
+    def _restante_str(usado: float) -> str:
+        return fmt_money_ars(max(0.0, pf["monto"] - usado))
+
     if mode == "set_monto":
         v = _parse_num_text(text)
         if v is None:
             await update.message.reply_text("Ingresá solo número (sin símbolos)."); return
         pf["monto"] = float(v); save_state()
-        await update.message.reply_text(f"Monto fijado: {fmt_money_ars(v)}"); context.user_data["pf_mode"]=None; return
+        usado = await _pf_total_usado(chat_id)
+        await update.message.reply_text(f"Monto fijado: {fmt_money_ars(v)} · Restante: {_restante_str(usado)}")
+        context.user_data["pf_mode"]=None; return
 
     # Alta por cantidad/importe (símbolo ya elegido)
     if mode in ("pf_add_qty","pf_add_amt"):
@@ -1382,12 +1413,52 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if v is None:
             await update.message.reply_text("Ingresá solo número (sin símbolos)."); return
         tipo = context.user_data.get("pf_add_tipo"); sym = context.user_data.get("pf_add_simbolo","")
+
+        # obtener precio actual para Acciones/Cedears
+        price = None
+        if tipo in ("accion","cedear") and sym:
+            async with ClientSession() as session:
+                mets, _ = await metrics_for_symbols(session, [sym])
+            price = mets.get(sym,{}).get("last_px")
+
+        # calcular importe/cantidad según modo
+        cantidad, importe = None, None
         if mode == "pf_add_qty":
-            pf["items"].append({"tipo":tipo, "simbolo": sym, "cantidad": float(v)})
+            cantidad = float(v)
+            if price is not None:
+                importe = cantidad * float(price)
+        else:  # pf_add_amt
+            importe = float(v)
+            if price and price > 0:
+                cantidad = round(importe / float(price), 6)
+
+        # chequear presupuesto (usar importe resultante si lo tenemos)
+        usado_pre = await _pf_total_usado(chat_id)
+        add_val = float(importe if importe is not None else 0.0)
+        if pf["monto"] > 0 and (usado_pre + add_val) > pf["monto"] + 1e-6:
+            faltan = pf["monto"] - usado_pre
+            await update.message.reply_text(f"🚫 Te pasás del presupuesto. Restante: {fmt_money_ars(max(0.0, faltan))}"); 
+            return
+
+        item = {"tipo":tipo, "simbolo": sym}
+        if cantidad is not None: item["cantidad"] = float(cantidad)
+        if importe  is not None: item["importe"]  = float(importe)
+        pf["items"].append(item); save_state()
+
+        usado_post = await _pf_total_usado(chat_id)
+        if tipo in ("accion","cedear") and price:
+            det = (f"Agregado {_label_long(sym)} "
+                   f"{'(cant: '+str(cantidad)+') ' if cantidad is not None else ''}"
+                   f"a {fmt_money_ars(price)} c/u"
+                   f"{' (= '+fmt_money_ars(importe)+')' if importe is not None else ''}.\n"
+                   f"Restante: {_restante_str(usado_post)}")
         else:
-            pf["items"].append({"tipo":tipo, "simbolo": sym, "importe": float(v)})
-        save_state()
-        await update.message.reply_text("Agregado ✅"); context.user_data["pf_mode"]=None; context.user_data.pop("pf_add_tipo",None); context.user_data.pop("pf_add_simbolo",None); return
+            det = (f"Agregado {tipo.upper()}" + (f" {_label_long(sym)}" if sym else "") +
+                   (f" por {fmt_money_ars(importe)}" if importe is not None else (f" cant: {cantidad}" if cantidad is not None else "")) +
+                   f".\nRestante: {_restante_str(usado_post)}")
+        await update.message.reply_text(det)
+        context.user_data["pf_mode"]=None; context.user_data.pop("pf_add_tipo",None); context.user_data.pop("pf_add_simbolo",None); 
+        return
 
     # Ediciones
     if mode in ("edit_addq","edit_subq","edit_amt"):
@@ -1398,14 +1469,47 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not (0 <= idx < len(pf["items"])):
             await update.message.reply_text("Índice inválido."); context.user_data["pf_mode"]=None; return
         it = pf["items"][idx]
+
+        # si es acción/cedear, traigo precio para recalcular importe
+        price = None
+        if it.get("tipo") in ("accion","cedear") and it.get("simbolo"):
+            async with ClientSession() as session:
+                mets, _ = await metrics_for_symbols(session, [it["simbolo"]])
+            price = mets.get(it["simbolo"],{}).get("last_px")
+
         if mode == "edit_amt":
-            it["importe"] = float(v)
+            nuevo_importe = float(v)
+            usado_pre = await _pf_total_usado(chat_id)
+            usado_sin = usado_pre - float(it.get("importe") or 0.0)
+            if pf["monto"] > 0 and (usado_sin + nuevo_importe) > pf["monto"] + 1e-6:
+                restante = pf["monto"] - usado_sin
+                await update.message.reply_text(f"🚫 Te pasás del presupuesto. Restante: {fmt_money_ars(max(0.0, restante))}")
+                return
+            it["importe"] = nuevo_importe
+            if price and price > 0:
+                it["cantidad"] = round(nuevo_importe/price, 6)
         else:
+            delta = float(v) if mode=="edit_addq" else -float(v)
             cur = float(it.get("cantidad") or 0.0)
-            it["cantidad"] = cur + (v if mode=="edit_addq" else -v)
-            if it["cantidad"] < 0: it["cantidad"] = 0.0
+            nueva_cant = max(0.0, cur + delta)
+            it["cantidad"] = nueva_cant
+            if price:
+                it["importe"] = nueva_cant * float(price)
+                # validar presupuesto con nuevo importe
+                usado_pre = await _pf_total_usado(chat_id)
+                # usado_pre ya incluye la versión vieja; ajusto
+                delta_importe = it["importe"] - float((cur*price) if price else 0.0)
+                if pf["monto"] > 0 and (usado_pre + delta_importe) > pf["monto"] + 1e-6:
+                    # revertir
+                    it["cantidad"] = cur
+                    it["importe"] = cur*float(price)
+                    restante = pf["monto"] - usado_pre
+                    await update.message.reply_text(f"🚫 Te pasás del presupuesto. Restante: {fmt_money_ars(max(0.0, restante))}")
+                    return
         save_state()
-        await update.message.reply_text("Actualizado ✅"); context.user_data["pf_mode"]=None; return
+        usado = await _pf_total_usado(chat_id)
+        await update.message.reply_text("Actualizado ✅ · Restante: " + fmt_money_ars(max(0.0, pf["monto"]-usado)))
+        context.user_data["pf_mode"]=None; return
 
 # ============================ MENÚ ECONOMÍA ============================
 async def cmd_menu_economia(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1426,6 +1530,8 @@ async def econ_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "ECO:INFLACION":await cmd_inflacion(update, context)
     if data == "ECO:RIESGO":   await cmd_riesgo(update, context)
     if data == "ECO:NOTICIAS": await cmd_noticias(update, context)
+    # re-mostrar menú economía automáticamente
+    await cmd_menu_economia(update, context)
 
 # ============================ WEBHOOK / APP ============================
 async def keepalive_loop(app: Application):
@@ -1491,7 +1597,6 @@ application.add_handler(CommandHandler("economia", cmd_menu_economia))
 application.add_handler(CallbackQueryHandler(econ_cb, pattern=r"^ECO:(DOLAR|RESERVAS|INFLACION|RIESGO|NOTICIAS)$"))
 
 application.add_handler(CommandHandler("alertas_menu", cmd_alertas_menu))
-# Ojo: NO capturamos AL:ADD acá; lo maneja la conversación como entry point.
 application.add_handler(CallbackQueryHandler(alertas_menu_cb, pattern=r"^AL:(LIST|CLEAR|PAUSE|RESUME)$"))
 
 application.add_handler(CommandHandler("portafolio", cmd_portafolio))
@@ -1502,7 +1607,7 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pf_text_
 application.add_handler(CommandHandler("suscripciones", cmd_subs))
 application.add_handler(CallbackQueryHandler(subs_cb, pattern=r"^SUBS:(T:..:..|OFF|CLOSE)$"))
 
-# ---- Comandos directos macro (para reutilizar) ----
+# ---- Comandos directos macro ----
 application.add_handler(CommandHandler("dolar", cmd_dolar))
 application.add_handler(CommandHandler("reservas", cmd_reservas))
 application.add_handler(CommandHandler("inflacion", cmd_inflacion))
@@ -1521,7 +1626,7 @@ application.add_handler(CommandHandler("alertas_resume", cmd_alertas_resume))
 conv_alertas = ConversationHandler(
     entry_points=[
         CommandHandler("alertas_add", alertas_add_start),
-        CallbackQueryHandler(alertas_add_start, pattern=r"^AL:ADD$"),  # ← ahora el botón "Agregar" inicia el flujo
+        CallbackQueryHandler(alertas_add_start, pattern=r"^AL:ADD$"),
     ],
     states={
         AL_KIND: [
