@@ -46,32 +46,71 @@ YF_URLS = [
 YF_HEADERS = {"User-Agent": "Mozilla/5.0"}
 REQ_HEADERS = {"User-Agent":"Mozilla/5.0", "Accept":"*/*"}
 
-# Listados (mantenibles/ejemplos)
-ACCIONES_BA = ["GGAL.BA","YPFD.BA","PAMP.BA","CEPU.BA","ALUA.BA","TXAR.BA","TGSU2.BA","BYMA.BA","SUPV.BA","BMA.BA"]
-CEDEARS_BA  = ["AAPL.BA","MSFT.BA","NVDA.BA","AMZN.BA","GOOGL.BA","TSLA.BA","META.BA","JNJ.BA","KO.BA","NFLX.BA"]
-BONOS_AR    = ["AL30","AL30D","GD30","GD30D","GD35"]
-FCI_LIST    = ["FCI-MoneyMarket","FCI-BonosUSD","FCI-AccionesArg"]
-LETES_LIST  = ["LETRA-90D","LETRA-180D","LETRA-360D"]
-CRIPTO_TOP  = ["BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD","ADA-USD","DOGE-USD","TON-USD","TRX-USD","DOT-USD"]
+# ============================ LISTADOS (AMPLIADOS) ============================
+ACCIONES_BA = [
+    "GGAL.BA","YPFD.BA","PAMP.BA","CEPU.BA","ALUA.BA","TXAR.BA","TGSU2.BA","BYMA.BA","SUPV.BA","BMA.BA",
+    "EDN.BA","CRES.BA","COME.BA","VALO.BA","TGNO4.BA","TRAN.BA","LOMA.BA","HARG.BA","CVH.BA","TECO2.BA"
+]
+CEDEARS_BA  = [
+    "AAPL.BA","MSFT.BA","NVDA.BA","AMZN.BA","GOOGL.BA","TSLA.BA","META.BA","JNJ.BA","KO.BA","NFLX.BA",
+    "BRKB.BA","PG.BA","DISN.BA","AMD.BA","INTC.BA","NKE.BA","V.BA","MA.BA","PFE.BA","XOM.BA"
+]
+BONOS_AR    = [
+    "AL30","AL30D","AL35","AL29","GD30","GD30D","GD35","GD38","GD41","AE38",
+    "AL41","AL38","GD46","AL32","GD29","AL36","AL39","GD35D","GD41D","AL29D"
+]
+FCI_LIST    = [
+    "FCI-MoneyMarket","FCI-BonosUSD","FCI-AccionesArg","FCI-Corporativos","FCI-Liquidez","FCI-Balanceado",
+    "FCI-RentaMixta","FCI-RealEstate","FCI-Commodity","FCI-Tech","FCI-BonosCER","FCI-DurationCorta",
+    "FCI-DurationMedia","FCI-DurationLarga","FCI-HighYield","FCI-BlueChips","FCI-Growth","FCI-Value",
+    "FCI-Latam","FCI-Global"
+]
+LETES_LIST  = [
+    "LETRA-30D","LETRA-60D","LETRA-90D","LETRA-120D","LETRA-180D","LETRA-270D","LETRA-360D",
+    "LETRA-12M","LETRA-18M","LETRA-24M","LETRA-US$-90D","LETRA-US$-180D","LETRA-USD-12M",
+    "LETRA-CER-90D","LETRA-CER-180D","LETRA-CER-12M","LETRA-TNA-ALTA","LETRA-TNA-MEDIA","LETRA-TNA-BAJA","LETRA-ESPECIAL"
+]
+CRIPTO_TOP  = [
+    "BTC-USD","ETH-USD","SOL-USD","BNB-USD","XRP-USD","ADA-USD","DOGE-USD","TON-USD","TRX-USD","DOT-USD",
+    "AVAX-USD","MATIC-USD","LINK-USD","LTC-USD","UNI-USD","BCH-USD","ATOM-USD","XLM-USD","NEAR-USD","APT-USD"
+]
 
 TICKER_NAME = {
+    # Acciones AR
     "GGAL.BA":"Grupo Financiero Galicia","YPFD.BA":"YPF","PAMP.BA":"Pampa Energía","CEPU.BA":"Central Puerto",
     "ALUA.BA":"Aluar","TXAR.BA":"Ternium Argentina","TGSU2.BA":"Transportadora de Gas del Sur",
-    "BYMA.BA":"BYMA","SUPV.BA":"Supervielle","BMA.BA":"Banco Macro",
-    "AAPL.BA":"Apple","MSFT.BA":"Microsoft","NVDA.BA":"NVIDIA","AMZN.BA":"Amazon",
-    "GOOGL.BA":"Alphabet","TSLA.BA":"Tesla","META.BA":"Meta","JNJ.BA":"Johnson & Johnson",
-    "KO.BA":"Coca-Cola","NFLX.BA":"Netflix",
-    # Bonos:
-    "AL30":"Bono AL30 (ARS)","AL30D":"Bono AL30D (USD)","GD30":"Bono GD30 (ARS)","GD30D":"Bono GD30D (USD)","GD35":"Bono GD35 (ARS)",
-    # FCI
+    "BYMA.BA":"BYMA","SUPV.BA":"Supervielle","BMA.BA":"Banco Macro","EDN.BA":"Edenor","CRES.BA":"Cresud",
+    "COME.BA":"Soc. Comercial del Plata","VALO.BA":"Gpo. Financiero Valores","TGNO4.BA":"Transportadora Gas Norte",
+    "TRAN.BA":"Transener","LOMA.BA":"Loma Negra","HARG.BA":"Holcim Argentina","CVH.BA":"Cablevisión Holding",
+    "TECO2.BA":"Telecom Argentina",
+    # Cedears
+    "AAPL.BA":"Apple","MSFT.BA":"Microsoft","NVDA.BA":"NVIDIA","AMZN.BA":"Amazon","GOOGL.BA":"Alphabet",
+    "TSLA.BA":"Tesla","META.BA":"Meta","JNJ.BA":"Johnson & Johnson","KO.BA":"Coca-Cola","NFLX.BA":"Netflix",
+    "BRKB.BA":"Berkshire Hathaway B","PG.BA":"Procter & Gamble","DISN.BA":"Disney","AMD.BA":"AMD","INTC.BA":"Intel",
+    "NKE.BA":"Nike","V.BA":"Visa","MA.BA":"Mastercard","PFE.BA":"Pfizer","XOM.BA":"ExxonMobil",
+    # Bonos (descriptivo)
+    "AL30":"Bono AL30 (ARS)","AL30D":"Bono AL30D (USD)","AL35":"Bono AL35","AL29":"Bono AL29",
+    "GD30":"Bono GD30 (ARS)","GD30D":"Bono GD30D (USD)","GD35":"Bono GD35 (ARS)","GD38":"Bono GD38",
+    "GD41":"Bono GD41","AE38":"Bono AE38","AL41":"Bono AL41","AL38":"Bono AL38",
+    "GD46":"Bono GD46","AL32":"Bono AL32","GD29":"Bono GD29","AL36":"Bono AL36","AL39":"Bono AL39",
+    "GD35D":"Bono GD35D (USD)","GD41D":"Bono GD41D (USD)","AL29D":"Bono AL29D (USD)",
+    # FCI y Letras: descriptivos genéricos
     "FCI-MoneyMarket":"FCI Money Market","FCI-BonosUSD":"FCI Bonos USD","FCI-AccionesArg":"FCI Acciones AR",
+    "FCI-Corporativos":"FCI Bonos Corporativos","FCI-Liquidez":"FCI Liquidez","FCI-Balanceado":"FCI Balanceado",
+    "FCI-RentaMixta":"FCI Renta Mixta","FCI-RealEstate":"FCI Real Estate","FCI-Commodity":"FCI Commodities",
+    "FCI-Tech":"FCI Tech","FCI-BonosCER":"FCI Bonos CER","FCI-DurationCorta":"FCI Duration Corta",
+    "FCI-DurationMedia":"FCI Duration Media","FCI-DurationLarga":"FCI Duration Larga","FCI-HighYield":"FCI High Yield",
+    "FCI-BlueChips":"FCI Blue Chips","FCI-Growth":"FCI Growth","FCI-Value":"FCI Value",
+    "FCI-Latam":"FCI Latam","FCI-Global":"FCI Global",
     # Letras
-    "LETRA-90D":"Letra Tesoro 90 días","LETRA-180D":"Letra Tesoro 180 días","LETRA-360D":"Letra Tesoro 360 días",
+    **{k:k.replace("-", " ") for k in LETES_LIST},
     # Cripto
     "BTC-USD":"Bitcoin","ETH-USD":"Ethereum","SOL-USD":"Solana","BNB-USD":"BNB","XRP-USD":"XRP","ADA-USD":"Cardano",
-    "DOGE-USD":"Dogecoin","TON-USD":"Toncoin","TRX-USD":"TRON","DOT-USD":"Polkadot",
+    "DOGE-USD":"Dogecoin","TON-USD":"Toncoin","TRX-USD":"TRON","DOT-USD":"Polkadot","AVAX-USD":"Avalanche",
+    "MATIC-USD":"Polygon","LINK-USD":"Chainlink","LTC-USD":"Litecoin","UNI-USD":"Uniswap",
+    "BCH-USD":"Bitcoin Cash","ATOM-USD":"Cosmos","XLM-USD":"Stellar","NEAR-USD":"NEAR","APT-USD":"Aptos",
 }
-NAME_ABBR = {k: (v.split()[0] if ".BA" in k else v.split()[0]) + ("" if ".BA" not in k else "") for k,v in TICKER_NAME.items()}
+NAME_ABBR = {k: (v.split()[0] if ".BA" in k else v.split()[0]) for k,v in TICKER_NAME.items()}
 
 # ============================ LOGGING ============================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -264,9 +303,6 @@ async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, 
     return (val, fecha)
 
 # ============================ YF MÉTRICAS ============================
-RET_CACHE_1Y: Dict[str, Tuple[float, Optional[Dict[str, Any]]]] = {}
-RET_TTL = 600
-
 async def _yf_chart_1y(session: ClientSession, symbol: str, interval: str) -> Optional[Dict[str, Any]]:
     for base in YF_URLS:
         params = {"range": "1y", "interval": interval, "events": "div,split"}
@@ -531,28 +567,34 @@ def projection_6m(m: Dict[str, Optional[float]]) -> float:
     meanrev = -0.05*max(0.0, abs(r1)-15.0)
     return momentum + trend + hi52 + risk + meanrev
 
+# Helpers para enviar cada ranking por separado
+async def _rank_top3(update: Update, symbols: List[str], title: str):
+    async with ClientSession() as session:
+        mets, last_ts = await metrics_for_symbols(session, symbols)
+    fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
+    pairs = sorted([(sym, m["6m"]) for sym,m in mets.items() if m.get("6m") is not None], key=lambda x: x[1], reverse=True)
+    top_syms = [sym for sym,_ in pairs[:3]]
+    msg = format_top3_table(title, fecha, top_syms, mets)
+    await update.effective_message.reply_text(msg)
+
+async def _rank_proj5(update: Update, symbols: List[str], title: str):
+    async with ClientSession() as session:
+        mets, last_ts = await metrics_for_symbols(session, symbols)
+    fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
+    rows = []
+    for sym, m in mets.items():
+        if m.get("6m") is None: continue
+        rows.append((sym, projection_3m(m), projection_6m(m)))
+    rows.sort(key=lambda x: x[2], reverse=True)
+    msg = format_proj_dual(title, fecha, rows[:5])
+    await update.effective_message.reply_text(msg)
+
 # ============================ COMANDOS BÁSICOS ============================
 async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         data = await get_dolares(session)
     msg = format_dolar_message(data) if data else "No pude obtener cotizaciones ahora."
     await update.effective_message.reply_text(msg)
-
-async def _rank_common(update: Update, symbols: List[str], title_top3: str, title_top5: str):
-    async with ClientSession() as session:
-        try: mets, last_ts = await asyncio.wait_for(metrics_for_symbols(session, symbols), timeout=30)
-        except asyncio.TimeoutError: mets, last_ts = ({s: {"6m": None, "3m": None, "1m": None} for s in symbols}, None)
-    fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-    pairs = sorted([(sym, m["6m"]) for sym,m in mets.items() if m.get("6m") is not None], key=lambda x: x[1], reverse=True)
-    top_syms = [sym for sym,_ in pairs[:3]]
-    msg1 = format_top3_table(title_top3, fecha, top_syms, mets)
-    rows = []
-    for sym, m in mets.items():
-        if m.get("6m") is None: continue
-        rows.append((sym, projection_3m(m), projection_6m(m)))
-    rows.sort(key=lambda x: x[2], reverse=True)
-    msg2 = format_proj_dual(title_top5, fecha, rows[:5])
-    await update.effective_message.reply_text(msg1 + "\n\n" + msg2)
 
 async def cmd_acciones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb_menu = InlineKeyboardMarkup([
@@ -571,10 +613,14 @@ async def cmd_cedears_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
-    if data in ("ACC:TOP3","ACC:TOP5"):
-        await _rank_common(update, ACCIONES_BA, "📈 Top 3 Acciones (Rendimiento)", "🏁 Top 5 Acciones (Proyección)")
-    if data in ("CED:TOP3","CED:TOP5"):
-        await _rank_common(update, CEDEARS_BA, "🌎 Top 3 Cedears (Rendimiento)", "🏁 Top 5 Cedears (Proyección)")
+    if data == "ACC:TOP3":
+        await _rank_top3(update, ACCIONES_BA, "📈 Top 3 Acciones (Rendimiento)")
+    elif data == "ACC:TOP5":
+        await _rank_proj5(update, ACCIONES_BA, "🏁 Top 5 Acciones (Proyección)")
+    elif data == "CED:TOP3":
+        await _rank_top3(update, CEDEARS_BA, "🌎 Top 3 Cedears (Rendimiento)")
+    elif data == "CED:TOP5":
+        await _rank_proj5(update, CEDEARS_BA, "🏁 Top 5 Cedears (Proyección)")
 
 # ---------- Macro ----------
 async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -612,7 +658,6 @@ async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(txt)
 
 async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Para suscripciones: incluye todo; en Economía/Noticias solo se usa cmd_noticias
     async with ClientSession() as session:
         dolares = await get_dolares(session)
         riesgo  = await get_riesgo_pais(session)
@@ -673,7 +718,6 @@ async def alertas_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
     if data == "AL:LIST": return await cmd_alertas_list(update, context)
-    if data == "AL:ADD":  return await alertas_add_start(update, context)
     if data == "AL:CLEAR":return await cmd_alertas_clear(update, context)
     if data == "AL:PAUSE":return await cmd_alertas_pause(update, context)
     if data == "AL:RESUME":return await cmd_alertas_resume(update, context)
@@ -793,13 +837,24 @@ def kb_fx_side_for(t: str) -> InlineKeyboardMarkup:
     return kb([[("Venta","SIDE:venta"),("Compra","SIDE:compra")],[("Volver","BACK:FXTYPE"),("Cancelar","CANCEL")]])
 
 async def alertas_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["al"] = {}
-    k = kb([
-        [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
-        [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
-        [("Cancelar", "CANCEL")]
-    ])
-    await update.effective_message.reply_text("¿Qué querés alertar?", reply_markup=k)
+    # entry point del flujo, soporta callback directo "AL:ADD"
+    if update.callback_query:
+        q = update.callback_query; await q.answer()
+        context.user_data["al"] = {}
+        k = kb([
+            [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
+            [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
+            [("Cancelar", "CANCEL")]
+        ])
+        await q.edit_message_text("¿Qué querés alertar?", reply_markup=k)
+    else:
+        context.user_data["al"] = {}
+        k = kb([
+            [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
+            [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
+            [("Cancelar", "CANCEL")]
+        ])
+        await update.effective_message.reply_text("¿Qué querés alertar?", reply_markup=k)
     return AL_KIND
 
 async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1163,7 +1218,8 @@ def kb_pick_generic(symbols: List[str], back: str, prefix: str) -> InlineKeyboar
         if len(row) == 2:
             rows.append(row); row = []
     if row: rows.append(row)
-    rows.append([("Volver","PF:BACK")])
+    # ← volver un paso (al submenú de tipo de instrumento), NO al menú principal
+    rows.append([("Volver","PF:ADD")])
     return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t,d in r] for r in rows])
 
 async def cmd_portafolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1178,7 +1234,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                "3) Agregá instrumentos (lista seleccionable).\n"
                "4) Ver composición y editar.\n5) Rendimiento y Proyección (en desarrollo).\n\n"
                "<i>Formato de números: solo dígitos y decimal. Sin $ ni % ni comas.</i>")
-        await q.edit_message_text(txt); return
+        await q.edit_message_text(txt, reply_markup=kb_pf_main()); return
     if data == "PF:SETBASE":
         kb_base = InlineKeyboardMarkup([
             [InlineKeyboardButton("ARS / MEP", callback_data="PF:BASE:ARS:mep"),
@@ -1193,10 +1249,10 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pf = pf_get(chat_id)
         pf["base"] = {"moneda": mon, "tc": tc if tc!="-" else None}; save_state()
         msg = f"Base fijada: {mon}" + (f" / {tc.upper()}" if (tc and tc != "-") else "")
-        await q.edit_message_text(msg); return
+        await q.edit_message_text(msg, reply_markup=kb_pf_main()); return
     if data == "PF:SETMONTO":
         context.user_data["pf_mode"] = "set_monto"
-        await q.edit_message_text("Ingresá el <b>monto total</b> (solo número).", parse_mode=ParseMode.HTML); return
+        await q.edit_message_text("Ingresá el <b>monto total</b> (solo número).", parse_mode=ParseMode.HTML, reply_markup=kb_pf_main()); return
     if data == "PF:ADD":
         kb_add = InlineKeyboardMarkup([
             [InlineKeyboardButton("Acción (.BA)", callback_data="PF:ADD:accion"),
@@ -1242,21 +1298,21 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "PF:LIST":
         pf = pf_get(chat_id)
         if not pf["items"]:
-            await q.edit_message_text("Tu portafolio está vacío. Usá «Agregar instrumento»."); return
+            await q.edit_message_text("Tu portafolio está vacío. Usá «Agregar instrumento».", reply_markup=kb_pf_main()); return
         lines = [f"<b>Portafolio</b> — Base: {pf['base']['moneda']}" + (f"/{pf['base']['tc'].upper()}" if pf['base'].get('tc') else ""),
                  f"Monto objetivo: {fmt_money_ars(pf['monto'])}"]
         for i,it in enumerate(pf["items"],1):
-            desc = f"{i}. {it['tipo'].upper()} — {it.get('simbolo', TICKER_NAME.get(it.get('simbolo',''), it.get('simbolo','')))}"
+            desc = f"{i}. {it.get('tipo','').upper()}"
             if it.get("simbolo"): desc = f"{i}. {_label_long(it['simbolo'])} [{it['tipo'].upper()}]"
             if it.get("cantidad") is not None: desc += f" | Cant: {it['cantidad']}"
             if it.get("importe")  is not None: desc += f" | Importe: {fmt_money_ars(it['importe'])}"
             if it.get("tna")      is not None: desc += f" | TNA: {str(it['tna']).replace('.',',')}%"
             lines.append(desc)
-        await q.edit_message_text("\n".join(lines)); return
+        await q.edit_message_text("\n".join(lines), reply_markup=kb_pf_main()); return
     if data == "PF:EDIT":
         pf = pf_get(chat_id)
         if not pf["items"]:
-            await q.edit_message_text("No hay instrumentos para editar."); return
+            await q.edit_message_text("No hay instrumentos para editar.", reply_markup=kb_pf_main()); return
         buttons = []
         for i,it in enumerate(pf["items"],1):
             label = f"{i}. " + (_label_long(it['simbolo']) if it.get("simbolo") else it.get("tipo","").upper())
@@ -1287,15 +1343,17 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pf = pf_get(chat_id); idx = context.user_data.get("pf_edit_idx", -1)
         if 0 <= idx < len(pf["items"]):
             pf["items"].pop(idx); save_state()
-            await q.edit_message_text("Instrumento eliminado."); return
-        await q.edit_message_text("Índice inválido."); return
+            await q.edit_message_text("Instrumento eliminado.", reply_markup=kb_pf_main()); return
+        await q.edit_message_text("Índice inválido.", reply_markup=kb_pf_main()); return
     if data == "PF:RET":
-        await q.edit_message_text("Rendimiento del portafolio: (en desarrollo)."); return
+        kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:BACK")]])
+        await q.edit_message_text("Rendimiento del portafolio: (en desarrollo).", reply_markup=kb_back); return
     if data == "PF:PROJ":
-        await q.edit_message_text("Proyección del portafolio: (en desarrollo)."); return
+        kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:BACK")]])
+        await q.edit_message_text("Proyección del portafolio: (en desarrollo).", reply_markup=kb_back); return
     if data == "PF:CLEAR":
         PF[chat_id] = {"base": {"moneda":"ARS","tc":"mep"}, "monto": 0.0, "items": []}; save_state()
-        await q.edit_message_text("Portafolio eliminado."); return
+        await q.edit_message_text("Portafolio eliminado.", reply_markup=kb_pf_main()); return
     if data == "PF:BACK":
         await q.edit_message_text("📦 Menú Portafolio", reply_markup=kb_pf_main()); return
 
@@ -1369,9 +1427,6 @@ async def econ_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "ECO:RIESGO":   await cmd_riesgo(update, context)
     if data == "ECO:NOTICIAS": await cmd_noticias(update, context)
 
-# ============================ SUSCRIPCIÓN DIARIA ============================
-# (handlers arriba)
-
 # ============================ WEBHOOK / APP ============================
 async def keepalive_loop(app: Application):
     await asyncio.sleep(5)
@@ -1436,7 +1491,8 @@ application.add_handler(CommandHandler("economia", cmd_menu_economia))
 application.add_handler(CallbackQueryHandler(econ_cb, pattern=r"^ECO:(DOLAR|RESERVAS|INFLACION|RIESGO|NOTICIAS)$"))
 
 application.add_handler(CommandHandler("alertas_menu", cmd_alertas_menu))
-application.add_handler(CallbackQueryHandler(alertas_menu_cb, pattern=r"^AL:(LIST|ADD|CLEAR|PAUSE|RESUME)$"))
+# Ojo: NO capturamos AL:ADD acá; lo maneja la conversación como entry point.
+application.add_handler(CallbackQueryHandler(alertas_menu_cb, pattern=r"^AL:(LIST|CLEAR|PAUSE|RESUME)$"))
 
 application.add_handler(CommandHandler("portafolio", cmd_portafolio))
 application.add_handler(CallbackQueryHandler(pf_menu_cb, pattern=r"^PF:(HELP|SETBASE|SETMONTO|ADD|LIST|EDIT|RET|PROJ|CLEAR|BASE:.*|ADD:.*|PICK:.*|ED:ADDQ|ED:SUBQ|ED:AMT|ED:DEL|BACK|EDIT:\d+|ADDQTY|ADDAMT)$"))
@@ -1463,7 +1519,10 @@ application.add_handler(CommandHandler("alertas_resume", cmd_alertas_resume))
 
 # ---- Conversación Agregar Alerta ----
 conv_alertas = ConversationHandler(
-    entry_points=[CommandHandler("alertas_add", alertas_add_start)],
+    entry_points=[
+        CommandHandler("alertas_add", alertas_add_start),
+        CallbackQueryHandler(alertas_add_start, pattern=r"^AL:ADD$"),  # ← ahora el botón "Agregar" inicia el flujo
+    ],
     states={
         AL_KIND: [
             CallbackQueryHandler(alertas_add_kind, pattern=r"^KIND:(fx|metric|acciones|cedears)$"),
