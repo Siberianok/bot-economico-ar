@@ -76,7 +76,9 @@ async def alerts_list(chat_id: int) -> List[Dict]:
 
 async def alerts_del_all(chat_id: int) -> int:
     r = await _client()
-    return await r.delete(_k_alerts(chat_id))
+    removed = await r.delete(_k_alerts(chat_id))
+    await r.srem(_k_alerts_chats(), chat_id)
+    return removed
 
 async def alerts_del_by_index(chat_id: int, idx: int) -> bool:
     lst = await alerts_list(chat_id)
@@ -91,6 +93,40 @@ async def alert_chats_all() -> List[int]:
     ids = await r.smembers(_k_alerts_chats())
     return [int(x) for x in ids] if ids else []
 
+# ---------- Portafolios ----------
+# Guardamos cada portafolio como JSON individual para cada chat.
+
+def _k_pf(chat_id: int) -> str:
+    return _k("state", "pf", str(chat_id))
+
+def _k_pf_chats() -> str:
+    return _k("state", "pf_chats")
+
+async def pf_set(chat_id: int, payload: Dict) -> None:
+    r = await _client()
+    await r.set(_k_pf(chat_id), json.dumps(payload, ensure_ascii=False))
+    await r.sadd(_k_pf_chats(), chat_id)
+
+async def pf_get(chat_id: int) -> Optional[Dict]:
+    r = await _client()
+    raw = await r.get(_k_pf(chat_id))
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+async def pf_del(chat_id: int) -> None:
+    r = await _client()
+    await r.delete(_k_pf(chat_id))
+    await r.srem(_k_pf_chats(), chat_id)
+
+async def pf_chats_all() -> List[int]:
+    r = await _client()
+    ids = await r.smembers(_k_pf_chats())
+    return [int(x) for x in ids] if ids else []
+
 # Pausas
 async def alerts_pause_indef(chat_id: int):
     r = await _client()
@@ -100,6 +136,10 @@ async def alerts_pause_hours(chat_id: int, hours: int):
     until = int(time.time() + hours*3600)
     r = await _client()
     await r.set(_k_alerts_pause(chat_id), f"until:{until}")
+
+async def alerts_pause_until(chat_id: int, until_ts: int):
+    r = await _client()
+    await r.set(_k_alerts_pause(chat_id), f"until:{int(until_ts)}")
 
 async def alerts_resume(chat_id: int):
     r = await _client()
