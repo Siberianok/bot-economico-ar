@@ -9,6 +9,13 @@ from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional, Set
 from urllib.parse import urlparse
 
+_STORAGE_IMPORT_ERROR: Optional[Exception] = None
+try:
+    import storage  # type: ignore
+except Exception as _err:
+    storage = None  # type: ignore
+    _STORAGE_IMPORT_ERROR = _err
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -122,6 +129,11 @@ def requires_integer_units(sym: str) -> bool: return sym.endswith(".BA")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("bot-econ-ar")
 
+if storage is None and _STORAGE_IMPORT_ERROR:
+    log.warning("No se pudo importar storage: %s", _STORAGE_IMPORT_ERROR)
+
+APPSTASH_ENABLED = storage is not None and bool(getattr(storage, "REDIS_URL", ""))
+
 # ============================ PERSISTENCIA ============================
 
 def _writable_path(candidate: str) -> str:
@@ -147,8 +159,129 @@ ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 SUBS: Dict[int, Dict[str, Any]] = {}
 PF: Dict[int, Dict[str, Any]] = {}
 
+async def _load_state_from_appstash() -> Tuple[
+    Dict[int, List[Dict[str, Any]]], Dict[int, Dict[str, Any]], Set[int], Dict[int, float], bool, bool
+]:
+    alerts: Dict[int, List[Dict[str, Any]]] = {}
+    portfolios: Dict[int, Dict[str, Any]] = {}
+    paused: Set[int] = set()
+    silent_until: Dict[int, float] = {}
+    alerts_loaded = False
+    pf_loaded = False
+
+    if not APPSTASH_ENABLED or storage is None:
+        return alerts, portfolios, paused, silent_until, alerts_loaded, pf_loaded
+
+    try:
+        chat_ids = await storage.alert_chats_all()
+        alerts_loaded = True
+        for chat_id in chat_ids:
+            rules = await storage.alerts_list(chat_id)
+            cleaned: List[Dict[str, Any]] = []
+            for rule in rules:
+                payload = dict(rule)
+                payload.pop("_id", None)
+                cleaned.append(payload)
+            alerts[chat_id] = cleaned
+            try:
+                status = await storage.alerts_pause_status(chat_id)
+                if status.get("paused"):
+                    if status.get("indef"):
+                        paused.add(chat_id)
+                    else:
+                        until = status.get("until")
+                        if until:
+                            silent_until[chat_id] = float(until)
+            except Exception as e:
+                log.debug("No se pudo obtener pausa de alertas para %s: %s", chat_id, e)
+    except Exception as e:
+        log.warning("No se pudieron cargar alertas desde AppStash: %s", e)
+        alerts.clear()
+        paused.clear()
+        silent_until.clear()
+        alerts_loaded = False
+
+    try:
+        chat_ids_pf = await storage.pf_chats_all()
+        pf_loaded = True
+        for chat_id in chat_ids_pf:
+            data = await storage.pf_get(chat_id)
+            if data is not None:
+                portfolios[chat_id] = data
+    except Exception as e:
+        log.warning("No se pudieron cargar portafolios desde AppStash: %s", e)
+        portfolios.clear()
+        pf_loaded = False
+
+    return alerts, portfolios, paused, silent_until, alerts_loaded, pf_loaded
+
+async def _sync_state_to_appstash():
+    if not APPSTASH_ENABLED or storage is None:
+        return
+
+    try:
+        remote_alert_chats = set(await storage.alert_chats_all())
+    except Exception as e:
+        log.warning("No pude obtener alertas remotas desde AppStash: %s", e)
+        remote_alert_chats = set()
+
+    local_alert_chats = set(ALERTS.keys())
+    for chat_id in local_alert_chats:
+        rules = ALERTS.get(chat_id, [])
+        try:
+            await storage.alerts_del_all(chat_id)
+            if rules:
+                for rule in rules:
+                    payload = dict(rule)
+                    payload.pop("_id", None)
+                    await storage.alerts_add(chat_id, payload)
+        except Exception as e:
+            log.warning("No pude sincronizar alertas para %s: %s", chat_id, e)
+
+        try:
+            if chat_id in ALERTS_PAUSED:
+                await storage.alerts_pause_indef(chat_id)
+            elif chat_id in ALERTS_SILENT_UNTIL:
+                await storage.alerts_pause_until(chat_id, int(ALERTS_SILENT_UNTIL[chat_id]))
+            else:
+                await storage.alerts_resume(chat_id)
+        except Exception as e:
+            log.debug("No pude sincronizar pausa de alertas para %s: %s", chat_id, e)
+
+    for chat_id in remote_alert_chats - local_alert_chats:
+        try:
+            await storage.alerts_del_all(chat_id)
+            await storage.alerts_resume(chat_id)
+        except Exception:
+            pass
+
+    try:
+        remote_pf_chats = set(await storage.pf_chats_all())
+    except Exception as e:
+        log.warning("No pude obtener portafolios remotos desde AppStash: %s", e)
+        remote_pf_chats = set()
+
+    local_pf_chats = set(PF.keys())
+    for chat_id in local_pf_chats:
+        payload = PF.get(chat_id, {})
+        try:
+            has_items = bool(payload.get("items"))
+            monto = float(payload.get("monto", 0) or 0.0)
+            if has_items or monto > 0:
+                await storage.pf_set(chat_id, payload)
+            else:
+                await storage.pf_del(chat_id)
+        except Exception as e:
+            log.warning("No pude sincronizar portafolio para %s: %s", chat_id, e)
+
+    for chat_id in remote_pf_chats - local_pf_chats:
+        try:
+            await storage.pf_del(chat_id)
+        except Exception:
+            pass
+
 def load_state():
-    global ALERTS, SUBS, PF
+    global ALERTS, SUBS, PF, ALERTS_PAUSED, ALERTS_SILENT_UNTIL
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -157,14 +290,37 @@ def load_state():
         PF = {int(k): v for k,v in data.get("pf", {}).items()}
         log.info("State loaded. alerts=%d subs=%d pf=%d", sum(len(v) for v in ALERTS.values()), len(SUBS), len(PF))
     except Exception:
-        log.info("No previous state found.")
+        log.info("No previous local state found.")
 
-def save_state():
+    if APPSTASH_ENABLED and storage is not None:
+        try:
+            alerts_remote, pf_remote, paused_remote, silent_remote, alerts_ok, pf_ok = asyncio.run(_load_state_from_appstash())
+            if alerts_ok:
+                ALERTS = alerts_remote
+                ALERTS_PAUSED = paused_remote
+                ALERTS_SILENT_UNTIL = silent_remote
+            if pf_ok:
+                PF = pf_remote
+            if alerts_ok or pf_ok:
+                log.info(
+                    "Estado sincronizado desde AppStash. alerts=%d pf=%d",
+                    sum(len(v) for v in ALERTS.values()),
+                    len(PF),
+                )
+        except Exception as e:
+            log.warning("Fallo al sincronizar estado desde AppStash: %s", e)
+
+async def save_state():
     try:
         with open(STATE_PATH, "w", encoding="utf-8") as f:
             json.dump({"alerts": ALERTS, "subs": SUBS, "pf": PF}, f, ensure_ascii=False)
     except Exception as e:
         log.warning("save_state error: %s", e)
+
+    try:
+        await _sync_state_to_appstash()
+    except Exception as e:
+        log.warning("No se pudo sincronizar AppStash: %s", e)
 
 # ============================ UTILS ============================
 
@@ -634,12 +790,12 @@ async def _rank_proj5(update: Update, symbols: List[str], title: str):
 
 def set_menu_counter(context: ContextTypes.DEFAULT_TYPE, name: str, n: int):
     context.user_data.setdefault("menu_counts", {})[name] = n
-def dec_and_maybe_show(update: Update, context: ContextTypes.DEFAULT_TYPE, name: str, show_func):
+async def dec_and_maybe_show(update: Update, context: ContextTypes.DEFAULT_TYPE, name: str, show_func):
     cnt = context.user_data.get("menu_counts", {}).get(name, 0)
     cnt = max(0, cnt-1)
     context.user_data["menu_counts"][name] = cnt
     if cnt > 0:
-        return show_func(update, context)
+        await show_func(update, context)
 
 async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
@@ -841,13 +997,13 @@ async def alertas_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "CANCEL":
         await q.edit_message_text("Operación cancelada."); return
     if data == "ALL":
-        cnt = len(rules); ALERTS[chat_id] = []; save_state()
+        cnt = len(rules); ALERTS[chat_id] = []; await save_state()
         await q.edit_message_text(f"Se eliminaron {cnt} alertas."); return
     try: idx = int(data)
     except Exception:
         await q.edit_message_text("Acción inválida."); return
     if 0 <= idx < len(rules):
-        rules.pop(idx); save_state(); await q.edit_message_text("Alerta eliminada.")
+        rules.pop(idx); await save_state(); await q.edit_message_text("Alerta eliminada.")
     else:
         await q.edit_message_text("Número fuera de rango.")
 
@@ -869,15 +1025,30 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Listo."); return
     if data == "AP:RESUME":
         ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
+        if APPSTASH_ENABLED and storage is not None:
+            try:
+                await storage.alerts_resume(chat_id)
+            except Exception as e:
+                log.debug("No pude reanudar alertas en AppStash para %s: %s", chat_id, e)
         await q.edit_message_text("🔔 Alertas reanudadas."); return
     if data.startswith("AP:PAUSE:"):
         arg = data.split(":")[-1]
         if arg == "INF":
             ALERTS_PAUSED.add(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
+            if APPSTASH_ENABLED and storage is not None:
+                try:
+                    await storage.alerts_pause_indef(chat_id)
+                except Exception as e:
+                    log.debug("No pude pausar indefinidamente en AppStash para %s: %s", chat_id, e)
             await q.edit_message_text("🔕 Alertas en pausa (indefinida)."); return
         try:
             hrs = int(arg); until = datetime.now(TZ) + timedelta(hours=hrs)
             ALERTS_SILENT_UNTIL[chat_id] = until.timestamp(); ALERTS_PAUSED.discard(chat_id)
+            if APPSTASH_ENABLED and storage is not None:
+                try:
+                    await storage.alerts_pause_until(chat_id, int(until.timestamp()))
+                except Exception as e:
+                    log.debug("No pude pausar temporalmente en AppStash para %s: %s", chat_id, e)
             await q.edit_message_text(f"🔕 Alertas en pausa por {hrs}h (hasta {until.strftime('%d/%m %H:%M')})."); return
         except Exception:
             await q.edit_message_text("Acción inválida."); return
@@ -885,6 +1056,11 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_alertas_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
+    if APPSTASH_ENABLED and storage is not None:
+        try:
+            await storage.alerts_resume(chat_id)
+        except Exception as e:
+            log.debug("No pude reanudar alertas en AppStash para %s: %s", chat_id, e)
     await update.effective_message.reply_text("🔔 Alertas reanudadas.")
 
 # ---- Conversación Agregar Alerta ----
@@ -1095,8 +1271,9 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if al.get("mode") == "absolute":
                 if (al["op"] == ">" and thr <= cur) or (al["op"] == "<" and thr >= cur):
                     await update.message.reply_text(f"El objetivo debe ser {'mayor' if al['op']=='>' else 'menor'} que {fmt_money_ars(cur)}."); return AL_VALUE
-            ALERTS.setdefault(chat_id, []).append({"kind":"fx","type":al["type"],"side":al["side"],"op":al["op"],"value":float(thr)})
-            save_state()
+            rule = {"kind":"fx","type":al["type"],"side":al["side"],"op":al["op"],"value":float(thr),"created_at":int(time())}
+            ALERTS.setdefault(chat_id, []).append(rule)
+            await save_state()
             await update.message.reply_text("Listo. Alerta agregada ✅"); return ConversationHandler.END
 
         if al.get("kind") == "metric":
@@ -1110,8 +1287,9 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if al.get("mode") == "absolute":
                 if (al["op"] == ">" and thr <= cur) or (al["op"] == "<" and thr >= cur):
                     await update.message.reply_text("El objetivo debe ser válido respecto al valor actual."); return AL_VALUE
-            ALERTS.setdefault(chat_id, []).append({"kind":"metric","type":al["type"],"op":al["op"],"value":float(thr)})
-            save_state()
+            rule = {"kind":"metric","type":al["type"],"op":al["op"],"value":float(thr),"created_at":int(time())}
+            ALERTS.setdefault(chat_id, []).append(rule)
+            await save_state()
             await update.message.reply_text("Listo. Alerta agregada ✅"); return ConversationHandler.END
 
         # ticker
@@ -1123,8 +1301,9 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         thr = val
         if (op == ">" and thr <= last_px) or (op == "<" and thr >= last_px):
             await update.message.reply_text(f"El precio objetivo debe ser {'mayor' if op=='>' else 'menor'} que {fmt_money_ars(last_px)}."); return AL_VALUE
-        ALERTS.setdefault(chat_id, []).append({"kind":"ticker","symbol":sym,"op":op,"value":float(thr),"mode":"absolute"})
-        save_state()
+        rule = {"kind":"ticker","symbol":sym,"op":op,"value":float(thr),"mode":"absolute","created_at":int(time())}
+        ALERTS.setdefault(chat_id, []).append(rule)
+        await save_state()
         await update.message.reply_text("Listo. Alerta agregada ✅"); return ConversationHandler.END
 
 # ============================ LOOP ALERTAS ============================
@@ -1244,12 +1423,12 @@ async def subs_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "SUBS:CLOSE": await q.edit_message_text("Listo."); return ConversationHandler.END
     if data == "SUBS:OFF":
         if chat_id in SUBS and SUBS[chat_id].get("daily"):
-            SUBS[chat_id]["daily"] = None; save_state()
+            SUBS[chat_id]["daily"] = None; await save_state()
             for j in context.application.job_queue.get_jobs_by_name(_job_name_daily(chat_id)): j.schedule_removal()
         await q.edit_message_text("Suscripción cancelada."); return ConversationHandler.END
     if data.startswith("SUBS:T:"):
         hhmm = data.split(":",2)[2]
-        SUBS.setdefault(chat_id, {})["daily"] = hhmm; save_state()
+        SUBS.setdefault(chat_id, {})["daily"] = hhmm; await save_state()
         _schedule_daily_for_chat(context.application, chat_id, hhmm)
         await q.edit_message_text(f"Te suscribí al Resumen Diario a las {hhmm} (hora AR)."); return ConversationHandler.END
     await q.edit_message_text("Acción inválida."); return ConversationHandler.END
@@ -1325,7 +1504,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _,_,mon,tc = data.split(":")
         pf = pf_get(chat_id)
         pf["base"] = {"moneda": mon, "tc": tc}
-        save_state()
+        await save_state()
         msg = f"Base fijada: {mon.upper()} / {tc.upper()}"
         # re-mostramos el menú principal (edit) y además una confirmación DEBAJO
         await q.edit_message_text("📦 Menú Portafolio", reply_markup=kb_pf_main())
@@ -1435,7 +1614,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "PF:ED:DEL":
         pf = pf_get(chat_id); idx = context.user_data.get("pf_edit_idx", -1)
         if 0 <= idx < len(pf["items"]):
-            pf["items"].pop(idx); save_state()
+            pf["items"].pop(idx); await save_state()
             await _send_below_menu(context, chat_id, text="Instrumento eliminado."); return
         await _send_below_menu(context, chat_id, text="Índice inválido."); return
 
@@ -1447,9 +1626,9 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "PF:CLEAR":
-        PF[chat_id] = {"base": {"moneda":"ARS","tc":"mep"}, "monto": 0.0, "items": []}; save_state()
+        PF.pop(chat_id, None); await save_state()
         await _send_below_menu(context, chat_id, text="Portafolio eliminado.")
-        await q.edit_message_text("📦 Menú Portafolio", reply_markup=kb_pf_main()); 
+        await q.edit_message_text("📦 Menú Portafolio", reply_markup=kb_pf_main());
         return
 
     if data == "PF:BACK":
@@ -1477,7 +1656,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         v = _parse_num_text(text)
         if v is None:
             await update.message.reply_text("Ingresá solo número (sin símbolos)."); return
-        pf["monto"] = float(v); save_state()
+        pf["monto"] = float(v); await save_state()
         usado = await _pf_total_usado(chat_id)
         pf_base = pf["base"]["moneda"].upper()
         f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
@@ -1555,7 +1734,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item = {"tipo":tipo, "simbolo": yfsym if yfsym else sym}
         if cantidad is not None: item["cantidad"] = float(cantidad)
         if importe_base is not None: item["importe"] = float(importe_base)  # en MONEDA BASE
-        pf["items"].append(item); save_state()
+        pf["items"].append(item); await save_state()
 
         pf_base = pf["base"]["moneda"].upper()
         qty_str = ""
@@ -1638,7 +1817,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 it["importe"] = nuevo_importe
             it["cantidad"] = nueva_cant
 
-        save_state()
+        await save_state()
         usado = await _pf_total_usado(chat_id)
         f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
         await update.message.reply_text("Actualizado ✅ · Restante: " + f_money(max(0.0, pf["monto"]-usado)))
