@@ -6,7 +6,22 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python bot_econ_full_plus_rank_alerts.py
     envVars:
-      - key: BOT_TOKEN
+      - key: TELEGRAM_TOKEN          # cargalo en el panel de Render (Environment)
         sync: false
+      - key: WEBHOOK_SECRET          # elegí algo único, sin "/"
+        value: tgwebhook-secret
+      - key: BASE_URL                # Render completa con la URL pública del servicio
+        fromService:
+          type: web
+          name: bot-economico-ar
+          property: url
       - key: PORT
         value: "10000"
+      - key: STATE_PATH              # opcional pero recomendado para persistir estado
+        value: /data/state.json
+      - key: PYTHON_VERSION          # fija la versión de Python en Render
+        value: 3.11.9
+    disk:                            # opcional: persistencia entre deploys/restarts
+      name: data
+      mountPath: /data
+      sizeGB: 1
