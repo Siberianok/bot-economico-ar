@@ -1,41 +1,34 @@
-# bot_econ_full_plus_rank_alerts_fxconv.py
+# bot_econ_full_plus_rank_alerts.py
 # -*- coding: utf-8 -*-
 
 import os, asyncio, logging, re, html as _html, json, math
+from time import time
 from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional, Set
 from urllib.parse import urlparse
-
 from aiohttp import web, ClientSession, ClientTimeout
 from telegram import (
-    Update,
-    LinkPreviewOptions,
-    BotCommand,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
+    Update, LinkPreviewOptions, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    Defaults,
-    CallbackQueryHandler,
-    MessageHandler,
-    ConversationHandler,
-    filters
+    Application, CommandHandler, ContextTypes, Defaults, CallbackQueryHandler,
+    MessageHandler, ConversationHandler, filters
 )
 
 # ============================ CONFIG ============================
-TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 
+TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "tgwebhook").strip().strip("/")
 PORT = int(os.getenv("PORT", "10000"))
 BASE_URL = os.getenv("BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "https://bot-economico-ar.onrender.com")).rstrip("/")
 ENV_STATE_PATH = os.getenv("STATE_PATH", "state.json")
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN no configurado.")
 
 WEBHOOK_PATH = f"/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
@@ -57,7 +50,8 @@ YF_URLS = [
 YF_HEADERS = {"User-Agent": "Mozilla/5.0"}
 REQ_HEADERS = {"User-Agent":"Mozilla/5.0", "Accept":"*/*"}
 
-# ============================ LISTADOS ============================
+# ============================ LISTADOS (AMPLIADOS) ============================
+
 ACCIONES_BA = [
     "GGAL.BA","YPFD.BA","PAMP.BA","CEPU.BA","ALUA.BA","TXAR.BA","TGSU2.BA","BYMA.BA","SUPV.BA","BMA.BA",
     "EDN.BA","CRES.BA","COME.BA","VALO.BA","TGNO4.BA","TRAN.BA","LOMA.BA","HARG.BA","CVH.BA","TECO2.BA"
@@ -85,53 +79,46 @@ CRIPTO_TOP_NAMES = [
     "BTC","ETH","SOL","BNB","XRP","ADA","DOGE","TON","TRX","DOT",
     "AVAX","MATIC","LINK","LTC","UNI","BCH","ATOM","XLM","NEAR","APT"
 ]
-
-def _crypto_to_symbol(cname: str) -> str:
-    return f"{cname}-USD"
+def _crypto_to_symbol(cname: str) -> str: return f"{cname}-USD"
 
 TICKER_NAME = {
-    # Acciones AR
     "GGAL.BA":"Grupo Financiero Galicia","YPFD.BA":"YPF","PAMP.BA":"Pampa Energía","CEPU.BA":"Central Puerto",
     "ALUA.BA":"Aluar","TXAR.BA":"Ternium Argentina","TGSU2.BA":"Transportadora de Gas del Sur",
     "BYMA.BA":"BYMA","SUPV.BA":"Supervielle","BMA.BA":"Banco Macro","EDN.BA":"Edenor","CRES.BA":"Cresud",
     "COME.BA":"Soc. Comercial del Plata","VALO.BA":"Gpo. Financiero Valores","TGNO4.BA":"Transportadora Gas Norte",
     "TRAN.BA":"Transener","LOMA.BA":"Loma Negra","HARG.BA":"Holcim Argentina","CVH.BA":"Cablevisión Holding",
     "TECO2.BA":"Telecom Argentina",
-    # Cedears
     "AAPL.BA":"Apple","MSFT.BA":"Microsoft","NVDA.BA":"NVIDIA","AMZN.BA":"Amazon","GOOGL.BA":"Alphabet",
     "TSLA.BA":"Tesla","META.BA":"Meta","JNJ.BA":"Johnson & Johnson","KO.BA":"Coca-Cola","NFLX.BA":"Netflix",
     "BRKB.BA":"Berkshire Hathaway B","PG.BA":"Procter & Gamble","DISN.BA":"Disney","AMD.BA":"AMD","INTC.BA":"Intel",
     "NKE.BA":"Nike","V.BA":"Visa","MA.BA":"Mastercard","PFE.BA":"Pfizer","XOM.BA":"ExxonMobil",
 }
 NAME_ABBR = {k: (v.split()[0] if ".BA" in k else v.split()[0]) for k,v in TICKER_NAME.items()}
-
-def bono_moneda(sym: str) -> str:
-    return "USD" if sym.endswith("D") else "ARS"
+def bono_moneda(sym: str) -> str: return "USD" if sym.endswith("D") else "ARS"
 
 def label_with_currency(sym: str) -> str:
     if sym.endswith(".BA"):
         base = f"{TICKER_NAME.get(sym, sym)} ({sym})"
         return f"{base} (ARS)"
-    if sym in BONOS_AR:
-        return f"{sym} ({bono_moneda(sym)})"
+    if sym in BONOS_AR: return f"{sym} ({bono_moneda(sym)})"
     if sym.startswith("FCI-"):
         cur = "USD" if "USD" in sym.upper() else "ARS"
         return f"{sym.replace('-',' ')} ({cur})"
     if sym.startswith("LETRA"):
         cur = "USD" if "USD" in sym.upper() else "ARS"
         return f"{sym.replace('-',' ')} ({cur})"
-    if sym in CRIPTO_TOP_NAMES or sym.endswith("-USD"):
-        return f"{sym.replace('-USD','')} (USD)"
+    if sym in CRIPTO_TOP_NAMES: return f"{sym} (USD)"
     return sym
 
-def requires_integer_units(sym: str) -> bool:
-    return sym.endswith(".BA")
+def requires_integer_units(sym: str) -> bool: return sym.endswith(".BA")
 
 # ============================ LOGGING ============================
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("bot-econ-ar")
 
 # ============================ PERSISTENCIA ============================
+
 def _writable_path(candidate: str) -> str:
     try:
         d = os.path.dirname(candidate) or "."
@@ -151,7 +138,6 @@ def _writable_path(candidate: str) -> str:
             return fallback
 
 STATE_PATH = _writable_path(ENV_STATE_PATH)
-
 ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 SUBS: Dict[int, Dict[str, Any]] = {}
 PF: Dict[int, Dict[str, Any]] = {}
@@ -176,6 +162,7 @@ def save_state():
         log.warning("save_state error: %s", e)
 
 # ============================ UTILS ============================
+
 def fmt_number(n: Optional[float], nd=2) -> str:
     try:
         if n is None: return "—"
@@ -193,65 +180,58 @@ def fmt_money_ars(n: Optional[float], nd: int = 2) -> str:
 
 def fmt_money_usd(n: Optional[float], nd: int = 2) -> str:
     try:
-        if n is None: return "U$D —"
-        s = f"{float(n):,.{nd}f}".replace(",", "X").replace(".", ",").replace("X", ".")
-        return f"U$D {s}"
+        if n is None: return "US$ —"
+        return f"US$ {fmt_number(float(n), nd)}"
     except Exception:
-        return f"U$D {n}"
+        return f"US$ {n}"
 
 def pct(n: Optional[float], nd: int = 2) -> str:
-    try:
-        return f"{n:+.{nd}f}%".replace(".", ",")
-    except Exception:
-        return "—"
+    try: return f"{n:+.{nd}f}%".replace(".", ",")
+    except Exception: return "—"
 
-def anchor(href: str, text: str) -> str:
-    return f'<a href="{_html.escape(href, True)}">{_html.escape(text)}</a>'
-
-def html_op(op: str) -> str:
-    return "↑" if op == ">" else "↓"
-
-def pad(s: str, width: int) -> str:
-    s=s[:width]; return s+(" "*(width-len(s)))
-
+def anchor(href: str, text: str) -> str: return f'<a href="{_html.escape(href, True)}">{_html.escape(text)}</a>'
+def html_op(op: str) -> str: return "↑" if op == ">" else "↓"
+def pad(s: str, width: int) -> str: s=s[:width]; return s+(" "*(width-len(s)))
 def center_text(s: str, width: int) -> str:
     s=str(s)[:width]; total=width-len(s); left=total//2; right=total-left; return " "*left+s+" "*right
-
 def parse_iso_ddmmyyyy(s: Optional[str]) -> Optional[str]:
     if not s: return None
     try:
         if re.match(r"^\d{4}-\d{2}-\d{2}", s):
             return datetime.strptime(s[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
-    except Exception:
-        pass
+    except Exception: pass
     return s
 
 # ============================ HTTP HELPERS ============================
-from random import random
-async def _retry_get(session, url, *, is_json, headers=None, tries=3, base_wait=0.5, **kwargs):
-    headers = {**REQ_HEADERS, **(headers or {})}
-    for attempt in range(1, tries+1):
-        try:
-            async with session.get(url, timeout=kwargs.pop("timeout", ClientTimeout(total=15)), headers=headers, **kwargs) as resp:
-                if resp.status == 200:
-                    return await (resp.json(content_type=None) if is_json else resp.text())
-                log.warning("GET %s -> %s", url, resp.status)
-        except Exception as e:
-            log.warning("GET %s attempt %s error: %s", url, attempt, e)
-        if attempt < tries:
-            await asyncio.sleep(base_wait * (2**(attempt-1)) * (0.7 + 0.6*random()))
-    return None
 
 async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dict[str, Any]]:
-    return await _retry_get(session, url, is_json=True, **kwargs)
+    try:
+        timeout = kwargs.pop("timeout", ClientTimeout(total=15))
+        headers = kwargs.pop("headers", {})
+        async with session.get(url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs) as resp:
+            if resp.status == 200:
+                return await resp.json(content_type=None)
+            log.warning("GET %s -> %s", url, resp.status)
+    except Exception as e:
+        log.warning("fetch_json error %s: %s", url, e)
+    return None
 
 async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str]:
-    return await _retry_get(session, url, is_json=False, **kwargs)
+    try:
+        timeout = kwargs.pop("timeout", ClientTimeout(total=15))
+        headers = kwargs.pop("headers", {})
+        async with session.get(url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs) as resp:
+            if resp.status == 200:
+                return await resp.text()
+            log.warning("GET %s -> %s", url, resp.status)
+    except Exception as e:
+        log.warning("fetch_text error %s: %s", url, e)
+    return None
 
 # ============================ DATA SOURCES ============================
+
 async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
     data: Dict[str, Dict[str, Any]] = {}
-
     cj = await fetch_json(session, CRYPTOYA_DOLAR_URL)
     if cj:
         def _safe(block: Dict[str, Any]):
@@ -259,7 +239,6 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
             c, v = block.get("compra") or block.get("buy"), block.get("venta") or block.get("sell")
             try: return (float(c) if c is not None else None, float(v) if v is not None else None)
             except Exception: return (None, None)
-
         for k in ["oficial","mayorista","blue","mep","ccl","cripto","tarjeta"]:
             c,v = _safe(cj.get(k,{}))
             if c is not None or v is not None:
@@ -288,12 +267,11 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
                 data[k] = {"compra": c, "venta": v, "fuente": "DolarAPI", "fecha": fecha}
     return data
 
-async def get_tc_value(session: ClientSession, tc_name: Optional[str], side: str = "venta") -> Optional[float]:
-    """Devuelve ARS por USD para el tc pedido."""
+async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
     if not tc_name: return None
     fx = await get_dolares(session)
     row = fx.get(tc_name.lower(), {})
-    v = row.get(side)
+    v = row.get("venta")
     try: return float(v) if v is not None else None
     except: return None
 
@@ -302,16 +280,19 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
         base_ok = None
         for base in ARG_DATOS_BASES:
             j = await fetch_json(session, base+suf)
-            if j: base_ok = j; break
-        j = base_ok
-        if isinstance(j, dict):
-            val = j.get("valor"); f = j.get("fecha") or j.get("periodo")
-            try: return (int(float(val)), f) if val is not None else None
-            except Exception: return None
-        if isinstance(j, list) and j:
-            last = j[-1]; val = last.get("valor"); f = last.get("fecha") or last.get("periodo")
-            try: return (int(float(val)), f) if val is not None else None
-            except Exception: return None
+            if j:
+                base_ok = j; break
+        if base_ok:
+            j = base_ok; break
+        else: j = None
+    if isinstance(j, dict):
+        val = j.get("valor"); f = j.get("fecha") or j.get("periodo")
+        try: return (int(float(val)), f) if val is not None else None
+        except Exception: return None
+    if isinstance(j, list) and j:
+        last = j[-1]; val = last.get("valor"); f = last.get("fecha") or last.get("periodo")
+        try: return (int(float(val)), f) if val is not None else None
+        except Exception: return None
     return None
 
 async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
@@ -323,20 +304,18 @@ async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float,
                 if isinstance(j, dict) and "serie" in j and isinstance(j["serie"], list) and j["serie"]:
                     j = j["serie"]
                 break
-        if j:
-            if isinstance(j, list) and j:
-                last = j[-1]; val = last.get("valor"); per = last.get("fecha") or last.get("periodo")
-            elif isinstance(j, dict):
-                val = j.get("valor"); per = j.get("fecha") or j.get("periodo")
-            else:
-                return None
-            if val is None: return None
-            try: return (float(val), per)
-            except Exception: return None
-    return None
+        if j: break
+    if isinstance(j, list) and j:
+        last = j[-1]; val = last.get("valor"); per = last.get("fecha") or last.get("periodo")
+    elif isinstance(j, dict):
+        val = j.get("valor"); per = j.get("fecha") or j.get("periodo")
+    else: return None
+    if val is None: return None
+    try: return (float(val), per)
+    except Exception: return None
 
 async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
-    html = await fetch_text(session, LAMACRO_RESERVAS_URL, timeout=ClientTimeout(total=10))
+    html = await fetch_text(session, LAMACRO_RESERVAS_URL)
     if not html: return None
     m_val = re.search(r"(?:Último dato|Valor actual)\s*:\s*([0-9\.\,]+)", html)
     m_date = re.search(r"([0-3]\d/[0-1]\d/\d{4})", html)
@@ -348,6 +327,7 @@ async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, 
     return (val, fecha)
 
 # ============================ YF MÉTRICAS ============================
+
 async def _yf_chart_1y(session: ClientSession, symbol: str, interval: str) -> Optional[Dict[str, Any]]:
     for base in YF_URLS:
         params = {"range": "1y", "interval": interval, "events": "div,split"}
@@ -396,7 +376,6 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
             dd = v/peak - 1.0
             if dd < 0 and abs(dd) > abs(dd_min): dd_min = dd
         dd6 = abs(dd_min)*100.0 if dd_min < 0 else 0.0
-
         hi52 = (last/max(closes) - 1.0)*100.0
 
         def _sma(vals, w):
@@ -406,19 +385,14 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
                 if len(q) > w: s -= q.pop(0)
                 if len(q) == w: out[i] = s/w
             return out
-
         sma50 = _sma(closes, 50); sma200 = _sma(closes, 200)
         s50_last = sma50[idx_last] if idx_last < len(sma50) else None
         s50_prev = sma50[idx_last-20] if idx_last-20 >= 0 else None
         slope50 = ((s50_last/s50_prev - 1.0)*100.0) if (s50_last and s50_prev) else 0.0
         s200_last = sma200[idx_last] if idx_last < len(sma200) else None
         trend_flag = 1 if (s200_last and last > s200_last) else (-1 if s200_last else 0)
-
-        return {
-            "1m": ret1, "3m": ret3, "6m": ret6, "last_ts": int(t_last),
-            "vol_ann": vol_ann, "dd6m": dd6, "hi52": hi52, "slope50": slope50,
-            "trend_flag": float(trend_flag), "last_px": float(last)
-        }
+        return {"1m": ret1, "3m": ret3, "6m": ret6, "last_ts": int(t_last), "vol_ann": vol_ann,
+                "dd6m": dd6, "hi52": hi52, "slope50": slope50, "trend_flag": float(trend_flag), "last_px": float(last)}
     except Exception:
         return None
 
@@ -428,8 +402,7 @@ async def _yf_metrics_1y(session: ClientSession, symbol: str) -> Dict[str, Optio
         res = await _yf_chart_1y(session, symbol, interval)
         if res:
             m = _metrics_from_chart(res)
-            if m:
-                out.update(m); break
+            if m: out.update(m); break
     return out
 
 async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tuple[Dict[str, Dict[str, Optional[float]]], Optional[int]]:
@@ -442,11 +415,11 @@ async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
     last_ts = None
     for d in out.values():
         ts = d.get("last_ts")
-        if ts:
-            last_ts = ts if last_ts is None else max(last_ts, ts)
+        if ts: last_ts = ts if last_ts is None else max(last_ts, ts)
     return out, last_ts
 
 # ============================ NOTICIAS ============================
+
 from xml.etree import ElementTree as ET
 RSS_FEEDS = [
     "https://www.ambito.com/contenidos/economia.xml",
@@ -472,7 +445,7 @@ def domain_of(url: str) -> str:
 
 def _score_title(title: str) -> int:
     t = title.lower(); score = 0
-    for kw in KEYWORDS:
+    for kw in KEYWORDS: 
         if kw in t: score += 3
     for kw in ("sube","baja","récord","acelera","cae","acuerdo","medida","ley","resolución","reperfil","brecha","dólar","inflación"):
         if kw in t: score += 1
@@ -483,22 +456,20 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str]]:
     try:
         root = ET.fromstring(xml)
     except Exception:
-        pass
-    else:
-        for item in root.findall(".//item"):
-            t_el = item.find("title"); l_el = item.find("link")
-            t = (t_el.text or "").strip() if (t_el is not None and t_el.text) else None
-            l = (l_el.text or "").strip() if (l_el is not None and l_el.text) else None
-            if t and l and l.startswith("http"): out.append((t, l))
-        for entry in root.findall(".//{*}entry"):
-            t_el = entry.find(".//{*}title")
-            link_el = entry.find(".//{*}link[@rel='alternate']") or entry.find(".//{*}link")
-            t = (t_el.text or "").strip() if (t_el is not None and t_el.text) else None
-            l = link_el.get("href").strip() if (link_el is not None and link_el.get("href")) else None
-            if (not l) and entry.find(".//{*}id") is not None:
-                l = (entry.find(".//{*}id").text or "").strip()
-            if t and l and l.startswith("http"): out.append((t, l))
-
+        return out
+    for item in root.findall(".//item"):
+        t_el = item.find("title"); l_el = item.find("link")
+        t = (t_el.text or "").strip() if (t_el is not None and t_el.text) else None
+        l = (l_el.text or "").strip() if (l_el is not None and l_el.text) else None
+        if t and l and l.startswith("http"): out.append((t, l))
+    for entry in root.findall(".//{*}entry"):
+        t_el = entry.find(".//{*}title")
+        link_el = entry.find(".//{*}link[@rel='alternate']") or entry.find(".//{*}link")
+        t = (t_el.text or "").strip() if (t_el is not None and t_el.text) else None
+        l = link_el.get("href").strip() if (link_el is not None and link_el.get("href")) else None
+        if (not l) and entry.find(".//{*}id") is not None:
+            l = (entry.find(".//{*}id").text or "").strip()
+        if t and l and l.startswith("http"): out.append((t, l))
     if not out:
         for m in re.finditer(r"<title>(.*?)</title>.*?<link>(https?://[^<]+)</link>", xml, flags=re.S|re.I):
             t = re.sub(r"<.*?>", "", m.group(1)).strip(); l = m.group(2).strip()
@@ -527,15 +498,17 @@ def _impact_lines(title: str) -> str:
 async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tuple[str, str]]:
     entries: List[Tuple[str, str]] = []
     for url in RSS_FEEDS:
-        xml = await fetch_text(session, url, headers={"Accept":"application/rss+xml, application/atom+xml, */*"}, timeout=ClientTimeout(total=10))
+        xml = await fetch_text(session, url, headers={"Accept":"application/rss+xml, application/atom+xml, */*"})
         if not xml: continue
-        try:
-            entries.extend(_parse_feed_entries(xml))
-        except Exception as e:
-            log.warning("RSS parse %s: %s", url, e)
+        try: entries.extend(_parse_feed_entries(xml))
+        except Exception as e: log.warning("RSS parse %s: %s", url, e)
 
     uniq: Dict[str, str] = {l:t for t,l in entries if l.startswith("http")}
-    if not uniq: return []
+    if not uniq:
+        return [("Mercados: sin novedades relevantes", "https://www.ambito.com/"),
+                ("Actividad: esperando datos de inflación", "https://www.cronista.com/"),
+                ("Dólar: foco en brecha y CCL/MEP", "https://www.infobae.com/economia/")][:limit]
+
     scored = sorted([(t,l,_score_title(t), domain_of(l)) for l,t in uniq.items()], key=lambda x: x[2], reverse=True)
     picked: List[Tuple[str,str]] = []; used_domains = set()
     for t,l,_,dom in scored:
@@ -544,8 +517,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         if len(picked) >= limit: break
     for t,l,_,dom in scored:
         if len(picked) >= limit: break
-        if (t,l) not in picked:
-            picked.append((t,l))
+        if (t,l) not in picked: picked.append((t,l))
     return picked[:limit]
 
 def format_news_block(news: List[Tuple[str, str]]) -> str:
@@ -554,12 +526,10 @@ def format_news_block(news: List[Tuple[str, str]]) -> str:
     return "<b>📰 Noticias</b>\n" + body
 
 # ============================ FORMATS & RANKINGS ============================
-def _label_long(sym: str) -> str:
-    return label_with_currency(sym)
 
+def _label_long(sym: str) -> str: return label_with_currency(sym)
 def _label_short(sym: str) -> str:
-    if sym.endswith(".BA"):
-        return f"{NAME_ABBR.get(sym, sym)} ({sym})"
+    if sym.endswith(".BA"): return f"{NAME_ABBR.get(sym, sym)} ({sym})"
     return label_with_currency(sym)
 
 def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
@@ -568,7 +538,7 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
         f = row.get("fecha")
         if f: fecha = parse_iso_ddmmyyyy(f)
     header = "<b>💵 Dólares</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
-    lines = [header, "<pre>Tipo        Compra        Venta</pre>"]
+    lines = [header, "<pre>Tipo         Compra        Venta</pre>"]
     rows = []
     order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
     for k, label in order:
@@ -584,7 +554,7 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
 
 def format_top3_table(title: str, fecha: Optional[str], rows_syms: List[str], retmap: Dict[str, Dict[str, Optional[float]]]) -> str:
     head = f"<b>{title}</b>" + (f" <i>Últ. Dato: {fecha}</i>" if fecha else "")
-    lines = [head, "<pre>Rank Empresa (Ticker)              1M        3M        6M</pre>"]
+    lines = [head, "<pre>Rank Empresa (Ticker)             1M        3M        6M</pre>"]
     out = []
     for idx, sym in enumerate(rows_syms[:3], start=1):
         d = retmap.get(sym, {})
@@ -601,10 +571,9 @@ def format_top3_table(title: str, fecha: Optional[str], rows_syms: List[str], re
 def format_proj_dual(title: str, fecha: Optional[str], rows: List[Tuple[str, float, float]]) -> str:
     head = f"<b>{title}</b>" + (f" <i>Últ. Dato: {fecha}</i>" if fecha else "")
     sub = "<i>Proy. 3M (corto) y Proy. 6M (medio)</i>"
-    lines = [head, sub, "<pre>Rank Empresa (Ticker)            Proy. 3M    Proy. 6M</pre>"]
+    lines = [head, sub, "<pre>Rank Empresa (Ticker)             Proy. 3M     Proy. 6M</pre>"]
     out = []
-    if not rows:
-        out.append("<pre>—</pre>")
+    if not rows: out.append("<pre>—</pre>")
     else:
         for idx, (sym, p3v, p6v) in enumerate(rows[:5], start=1):
             p3 = pct(p3v, 1) if p3v is not None else "—"
@@ -615,8 +584,7 @@ def format_proj_dual(title: str, fecha: Optional[str], rows: List[Tuple[str, flo
             out.append(f"<pre>{l}</pre>")
     return "\n".join(lines + out)
 
-def _nz(x: Optional[float], fb: float) -> float:
-    return float(x) if x is not None else fb
+def _nz(x: Optional[float], fb: float) -> float: return float(x) if x is not None else fb
 
 def projection_3m(m: Dict[str, Optional[float]]) -> float:
     r6, r3, r1 = _nz(m.get("6m"), -80.0), _nz(m.get("3m"), -40.0), _nz(m.get("1m"), -15.0)
@@ -636,88 +604,119 @@ def projection_6m(m: Dict[str, Optional[float]]) -> float:
     meanrev = -0.05*max(0.0, abs(r1)-15.0)
     return momentum + trend + hi52 + risk + meanrev
 
-# ============================ ALERTAS ============================
-AL_KIND, AL_FX_TYPE, AL_FX_SIDE, AL_OP, AL_MODE, AL_VALUE, AL_METRIC_TYPE, AL_TICKER = range(8)
-ALERTS_SILENT_UNTIL: Dict[int, float] = {}
-ALERTS_PAUSED: Set[int] = set()
+async def _rank_top3(update: Update, symbols: List[str], title: str):
+    async with ClientSession() as session:
+        mets, last_ts = await metrics_for_symbols(session, symbols)
+        fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
+        pairs = sorted([(sym, m["6m"]) for sym,m in mets.items() if m.get("6m") is not None], key=lambda x: x[1], reverse=True)
+        top_syms = [sym for sym,_ in pairs[:3]]
+        msg = format_top3_table(title, fecha, top_syms, mets)
+        await update.effective_message.reply_text(msg)
 
-def kb(rows: List[List[Tuple[str,str]]]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=data) for text, data in r] for r in rows])
+async def _rank_proj5(update: Update, symbols: List[str], title: str):
+    async with ClientSession() as session:
+        mets, last_ts = await metrics_for_symbols(session, symbols)
+        fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
+        rows = []
+        for sym, m in mets.items():
+            if m.get("6m") is None: continue
+            rows.append((sym, projection_3m(m), projection_6m(m)))
+        rows.sort(key=lambda x: x[2], reverse=True)
+        msg = format_proj_dual(title, fecha, rows[:5])
+        await update.effective_message.reply_text(msg)
 
-def kb_tickers(symbols: List[str], back_target: str, prefix: str) -> InlineKeyboardMarkup:
-    rows: List[List[Tuple[str,str]]] = []
-    row: List[Tuple[str,str]] = []
-    for s in symbols:
-        label = _label_long(s)
-        row.append((label, f"{prefix}:{s}"))
-        if len(row) == 2:
-            rows.append(row); row = []
-    if row: rows.append(row)
-    rows.append([("Volver","BACK:"+back_target), ("Cancelar","CANCEL")])
-    return kb(rows)
+# ============================ CONTADOR DE MENÚS ============================
 
-def _parse_float_user_strict(s: str) -> Optional[float]:
-    s = (s or "").strip()
-    if re.search(r"[^\d\.,\-+]", s): return None
-    s = s.replace(".", "").replace(",", ".")
-    try: return float(s)
-    except Exception: return None
+def set_menu_counter(context: ContextTypes.DEFAULT_TYPE, name: str, n: int):
+    context.user_data.setdefault("menu_counts", {})[name] = n
+def dec_and_maybe_show(update: Update, context: ContextTypes.DEFAULT_TYPE, name: str, show_func):
+    cnt = context.user_data.get("menu_counts", {}).get(name, 0)
+    cnt = max(0, cnt-1)
+    context.user_data["menu_counts"][name] = cnt
+    if cnt > 0:
+        return show_func(update, context)
 
-def _fx_display_value(row: Dict[str, Any], side: str) -> Optional[float]:
-    if side == "compra": return row.get("compra")
-    if side == "venta":  return row.get("venta")
-    return None
+# ============================ COMANDOS / MENÚS ============================
 
-# ============================ MENÚS / COMANDOS BÁSICOS ============================
 async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         data = await get_dolares(session)
-        msg = format_dolar_message(data) if data else "No pude obtener cotizaciones ahora."
-        await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
+    msg = format_dolar_message(data) if data else "No pude obtener cotizaciones ahora."
+    await update.effective_message.reply_text(msg)
+
+async def cmd_acciones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_menu_counter(context, "acciones", 2)
+    kb_menu = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Top 3 Acciones (Rendimiento)", callback_data="ACC:TOP3")],
+        [InlineKeyboardButton("Top 5 Acciones (Proyección)", callback_data="ACC:TOP5")],
+    ])
+    await update.effective_message.reply_text("📊 Menú Acciones", reply_markup=kb_menu)
+
+async def cmd_cedears_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_menu_counter(context, "cedears", 2)
+    kb_menu = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Top 3 Cedears (Rendimiento)", callback_data="CED:TOP3")],
+        [InlineKeyboardButton("Top 5 Cedears (Proyección)", callback_data="CED:TOP5")],
+    ])
+    await update.effective_message.reply_text("🌎 Menú Cedears", reply_markup=kb_menu)
+
+async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    data = q.data
+    if data == "ACC:TOP3":
+        await _rank_top3(update, ACCIONES_BA, "📈 Top 3 Acciones (Rendimiento)")
+        await dec_and_maybe_show(update, context, "acciones", cmd_acciones_menu)
+    elif data == "ACC:TOP5":
+        await _rank_proj5(update, ACCIONES_BA, "🏁 Top 5 Acciones (Proyección)")
+        await dec_and_maybe_show(update, context, "acciones", cmd_acciones_menu)
+    elif data == "CED:TOP3":
+        await _rank_top3(update, CEDEARS_BA, "🌎 Top 3 Cedears (Rendimiento)")
+        await dec_and_maybe_show(update, context, "cedears", cmd_cedears_menu)
+    elif data == "CED:TOP5":
+        await _rank_proj5(update, CEDEARS_BA, "🏁 Top 5 Cedears (Proyección)")
+        await dec_and_maybe_show(update, context, "cedears", cmd_cedears_menu)
 
 # ---------- Macro ----------
+
 async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         res = await get_reservas_lamacro(session)
-        if not res:
-            txt = "No pude obtener reservas ahora."
-        else:
-            val, fecha = res
-            txt = (f"<b>🏦 Reservas BCRA</b>{f' <i>Últ. Act.: {fecha}</i>' if fecha else ''}\n"
-                   f"<b>{fmt_number(val,0)} MUS$</b>\n<i>Fuente: LaMacro</i>")
-        await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
+    if not res:
+        txt = "No pude obtener reservas ahora."
+    else:
+        val, fecha = res
+        txt = (f"<b>🏦 Reservas BCRA</b>{f' <i>Últ. Act.: {fecha}</i>' if fecha else ''}\n"
+               f"<b>{fmt_number(val,0)} MUS$</b>\n<i>Fuente: LaMacro</i>")
+    await update.effective_message.reply_text(txt)
 
 async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         tup = await get_inflacion_mensual(session)
-        if tup is None:
-            txt = "No pude obtener inflación ahora."
-        else:
-            val, fecha = tup; val_str = str(round(val,1)).replace(".", ",")
-            txt = f"<b>📉 Inflación Mensual</b>{f' <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>\n<i>Fuente: ArgentinaDatos</i>"
-        await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
+    if tup is None:
+        txt = "No pude obtener inflación ahora."
+    else:
+        val, fecha = tup; val_str = str(round(val,1)).replace(".", ",")
+        txt = f"<b>📉 Inflación Mensual</b>{f' <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>\n<i>Fuente: ArgentinaDatos</i>"
+    await update.effective_message.reply_text(txt)
 
 async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         tup = await get_riesgo_pais(session)
-        if tup is None:
-            txt = "No pude obtener riesgo país ahora."
-        else:
-            rp, f = tup; f_str = parse_iso_ddmmyyyy(f)
-            txt = f"<b>📈 Riesgo País</b>{f' <i>{f_str}</i>' if f_str else ''}\n<b>{rp} pb</b>\n<i>Fuente: ArgentinaDatos</i>"
-        await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
+    if tup is None:
+        txt = "No pude obtener riesgo país ahora."
+    else:
+        rp, f = tup; f_str = parse_iso_ddmmyyyy(f)
+        txt = f"<b>📈 Riesgo País</b>{f' <i>{f_str}</i>' if f_str else ''}\n<b>{rp} pb</b>\n<i>Fuente: ArgentinaDatos</i>"
+    await update.effective_message.reply_text(txt)
 
 async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         news = await fetch_rss_entries(session, limit=5)
-        txt = format_news_block(news or [])
-        await update.effective_message.reply_text(
-            txt,
-            parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=False)
-        )
+    txt = format_news_block(news or [])
+    await update.effective_message.reply_text(txt)
 
 async def cmd_menu_economia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    set_menu_counter(context, "economia", 5)
     kb_menu = InlineKeyboardMarkup([
         [InlineKeyboardButton("Tipos de Cambio", callback_data="ECO:DOLAR")],
         [InlineKeyboardButton("Reservas", callback_data="ECO:RESERVAS")],
@@ -735,52 +734,39 @@ async def econ_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "ECO:INFLACION": await cmd_inflacion(update, context)
     if data == "ECO:RIESGO":    await cmd_riesgo(update, context)
     if data == "ECO:NOTICIAS":  await cmd_noticias(update, context)
+    await dec_and_maybe_show(update, context, "economia", cmd_menu_economia)
 
-# ============================ RANKINGS (acciones/cedears) ============================
-async def _rank_top3(update: Update, symbols: List[str], title: str):
-    async with ClientSession() as session:
-        mets, last_ts = await metrics_for_symbols(session, symbols)
-        fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-        pairs = sorted([(sym, m["6m"]) for sym,m in mets.items() if m.get("6m") is not None], key=lambda x: x[1], reverse=True)
-        top_syms = [sym for sym,_ in pairs[:3]]
-        msg = format_top3_table(title, fecha, top_syms, mets)
-        await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
+# ============================ ALERTAS ============================
 
-async def _rank_proj5(update: Update, symbols: List[str], title: str):
-    async with ClientSession() as session:
-        mets, last_ts = await metrics_for_symbols(session, symbols)
-        fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-        rows = []
-        for sym, m in mets.items():
-            if m.get("6m") is None: continue
-            rows.append((sym, projection_3m(m), projection_6m(m)))
-        rows.sort(key=lambda x: x[2], reverse=True)
-        msg = format_proj_dual(title, fecha, rows[:5])
-        await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML)
+AL_KIND, AL_FX_TYPE, AL_FX_SIDE, AL_OP, AL_MODE, AL_VALUE, AL_METRIC_TYPE, AL_TICKER = range(8)
+ALERTS_SILENT_UNTIL: Dict[int, float] = {}
+ALERTS_PAUSED: Set[int] = set()
 
-async def cmd_acciones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb_menu = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Top 3 Acciones (Rendimiento)", callback_data="ACC:TOP3")],
-        [InlineKeyboardButton("Top 5 Acciones (Proyección)", callback_data="ACC:TOP5")],
-    ])
-    await update.effective_message.reply_text("📊 Menú Acciones", reply_markup=kb_menu)
+def kb(rows: List[List[Tuple[str,str]]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=data) for text, data in r] for r in rows])
 
-async def cmd_cedears_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb_menu = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Top 3 Cedears (Rendimiento)", callback_data="CED:TOP3")],
-        [InlineKeyboardButton("Top 5 Cedears (Proyección)", callback_data="CED:TOP5")],
-    ])
-    await update.effective_message.reply_text("🌎 Menú Cedears", reply_markup=kb_menu)
+def kb_tickers(symbols: List[str], back_target: str, prefix: str) -> InlineKeyboardMarkup:
+    rows: List[List[Tuple[str,str]]] = []; row: List[Tuple[str,str]] = []
+    for s in symbols:
+        label = _label_long(s)
+        row.append((label, f"{prefix}:{s}"))
+        if len(row) == 2: rows.append(row); row = []
+    if row: rows.append(row)
+    rows.append([("Volver","BACK:"+back_target), ("Cancelar","CANCEL")])
+    return kb(rows)
 
-async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    data = q.data
-    if data == "ACC:TOP3": await _rank_top3(update, ACCIONES_BA, "📈 Top 3 Acciones (Rendimiento)")
-    elif data == "ACC:TOP5": await _rank_proj5(update, ACCIONES_BA, "🏁 Top 5 Acciones (Proyección)")
-    elif data == "CED:TOP3": await _rank_top3(update, CEDEARS_BA, "🌎 Top 3 Cedears (Rendimiento)")
-    elif data == "CED:TOP5": await _rank_proj5(update, CEDEARS_BA, "🏁 Top 5 Cedears (Proyección)")
+def _parse_float_user_strict(s: str) -> Optional[float]:
+    s = (s or "").strip()
+    if re.search(r"[^\d\.,\-+]", s): return None
+    s = s.replace(".", "").replace(",", ".")
+    try: return float(s)
+    except Exception: return None
 
-# ============================ MENÚ ALERTAS ============================
+def _fx_display_value(row: Dict[str, Any], side: str) -> Optional[float]:
+    if side == "compra": return row.get("compra")
+    if side == "venta":  return row.get("venta")
+    return None
+
 async def cmd_alertas_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb_menu = kb([
         [("Listar","AL:LIST"),("Agregar","AL:ADD")],
@@ -792,16 +778,10 @@ async def cmd_alertas_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def alertas_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
-    if data == "AL:LIST":
-        await cmd_alertas_list(update, context)
-        await cmd_alertas_menu(update, context)
-    if data == "AL:CLEAR":
-        await cmd_alertas_clear(update, context)
-    if data == "AL:PAUSE":
-        await cmd_alertas_pause(update, context)
-    if data == "AL:RESUME":
-        await cmd_alertas_resume(update, context)
-        await cmd_alertas_menu(update, context)
+    if data == "AL:LIST":   await cmd_alertas_list(update, context); await cmd_alertas_menu(update, context)
+    if data == "AL:CLEAR":  await cmd_alertas_clear(update, context)
+    if data == "AL:PAUSE":  await cmd_alertas_pause(update, context)
+    if data == "AL:RESUME": await cmd_alertas_resume(update, context); await cmd_alertas_menu(update, context)
 
 async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -816,9 +796,9 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"{i}. {t.upper()} ({side}) {html_op(op)} {fmt_money_ars(v)}")
             elif r.get("kind") == "metric":
                 t, op, v = r["type"], r["op"], r["value"]
-                if t=="riesgo": val = f"{v:.0f} pb"
+                if t=="riesgo":     val = f"{v:.0f} pb"
                 elif t=="reservas": val = f"{fmt_number(v,0)} MUS$"
-                else: val = f"{str(round(v,1)).replace('.',',')}%"
+                else:               val = f"{str(round(v,1)).replace('.',',')}%"
                 lines.append(f"{i}. {t.upper()} {html_op(op)} {val}")
             else:
                 sym, op, v = r["symbol"], r["op"], r["value"]
@@ -826,9 +806,8 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if chat_id in ALERTS_PAUSED:
             lines.append("\n<i>Alertas en pausa (indefinida)</i>")
         txt = "\n".join(lines)
-    await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(txt)
 
-# ---- CLEAR/PAUSE/RESUME ----
 async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     rules = ALERTS.get(chat_id, [])
@@ -839,9 +818,9 @@ async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if r.get("kind") == "fx":
             label = f"{i}. {r['type'].upper()}({r['side']}) {html_op(r['op'])} {fmt_money_ars(r['value'])}"
         elif r.get("kind") == "metric":
-            if r["type"]=="riesgo": val = f"{r['value']:.0f} pb"
+            if r["type"]=="riesgo":     val = f"{r['value']:.0f} pb"
             elif r["type"]=="reservas": val = f"{fmt_number(r['value'],0)} MUS$"
-            else: val = f"{str(round(r['value'],1)).replace('.',',')}%"
+            else:                       val = f"{str(round(r['value'],1)).replace('.',',')}%"
             label = f"{i}. {r['type'].upper()} {html_op(r['op'])} {val}"
         else:
             label = f"{i}. {_label_long(r['symbol'])} {html_op(r['op'])} {fmt_money_ars(r['value'])}"
@@ -906,6 +885,7 @@ async def cmd_alertas_resume(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.effective_message.reply_text("🔔 Alertas reanudadas.")
 
 # ---- Conversación Agregar Alerta ----
+
 def kb_submenu_fx() -> InlineKeyboardMarkup:
     return kb([
         [("Oficial","FXTYPE:oficial"),("Mayorista","FXTYPE:mayorista")],
@@ -945,7 +925,6 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     target = q.data.split(":",1)[1]
     al = context.user_data.get("al", {})
-
     if target == "KIND":
         k = kb([
             [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
@@ -953,23 +932,16 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [("Cancelar", "CANCEL")]
         ])
         await q.edit_message_text("¿Qué querés alertar?", reply_markup=k); return AL_KIND
-
     if target == "FXTYPE":
         await q.edit_message_text("Elegí el tipo de dólar:", reply_markup=kb_submenu_fx()); return AL_FX_TYPE
-
     if target == "FXSIDE":
-        t = al.get("type","?")
-        await q.edit_message_text(f"Tipo: {t.upper()}\nElegí lado:", reply_markup=kb_fx_side_for(t)); return AL_FX_SIDE
-
+        t = al.get("type","?"); await q.edit_message_text(f"Tipo: {t.upper()}\nElegí lado:", reply_markup=kb_fx_side_for(t)); return AL_FX_SIDE
     if target == "METRIC":
         await q.edit_message_text("Elegí la métrica:", reply_markup=kb_submenu_metric()); return AL_METRIC_TYPE
-
     if target == "TICKERS_ACC":
         await q.edit_message_text("Elegí el ticker (Acciones .BA):", reply_markup=kb_tickers(ACCIONES_BA, "KIND", "TICK")); return AL_TICKER
-
     if target == "TICKERS_CEDEARS":
         await q.edit_message_text("Elegí el ticker (Cedears .BA):", reply_markup=kb_tickers(CEDEARS_BA, "KIND", "TICK")); return AL_TICKER
-
     if target == "OP":
         kind = al.get("kind")
         if kind == "ticker":
@@ -982,27 +954,22 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],[("Volver","BACK:METRIC"),("Cancelar","CANCEL")]])
             await q.edit_message_text("Elegí condición:", reply_markup=kb_op)
         return AL_OP
-
     if target == "MODE":
         kb_mode = kb([[("Ingresar Importe", "MODE:absolute"),("Ingresar % vs valor actual", "MODE:percent")], [("Volver","BACK:OP"),("Cancelar","CANCEL")]])
         await q.edit_message_text("¿Cómo querés definir el umbral?", reply_markup=kb_mode); return AL_MODE
-
     await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
 
 async def alertas_add_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
-    if data == "CANCEL":
-        await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    if data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
     kind = data.split(":",1)[1]
     context.user_data["al"] = {}
     al = context.user_data["al"]
     if kind == "fx":
-        al["kind"] = "fx"
-        await q.edit_message_text("Elegí el tipo de dólar:", reply_markup=kb_submenu_fx()); return AL_FX_TYPE
+        al["kind"] = "fx"; await q.edit_message_text("Elegí el tipo de dólar:", reply_markup=kb_submenu_fx()); return AL_FX_TYPE
     if kind == "metric":
-        al["kind"] = "metric"
-        await q.edit_message_text("Elegí la métrica:", reply_markup=kb_submenu_metric()); return AL_METRIC_TYPE
+        al["kind"] = "metric"; await q.edit_message_text("Elegí la métrica:", reply_markup=kb_submenu_metric()); return AL_METRIC_TYPE
     if kind == "acciones":
         al["kind"] = "ticker"; al["segment"] = "acciones"
         await q.edit_message_text("Elegí el ticker (Acciones .BA):", reply_markup=kb_tickers(ACCIONES_BA, "KIND", "TICK")); return AL_TICKER
@@ -1013,10 +980,8 @@ async def alertas_add_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def alertas_add_fx_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    if q.data == "CANCEL":
-        await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
-    if q.data.startswith("BACK:"):
-        return await alertas_back(update, context)
+    if q.data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    if q.data.startswith("BACK:"): return await alertas_back(update, context)
     t = q.data.split(":",1)[1]
     context.user_data["al"]["type"] = t
     await q.edit_message_text(f"Tipo: {t.upper()}\nElegí lado:", reply_markup=kb_fx_side_for(t))
@@ -1024,10 +989,8 @@ async def alertas_add_fx_type(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def alertas_add_fx_side(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    if q.data == "CANCEL":
-        await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
-    if q.data.startswith("BACK:"):
-        return await alertas_back(update, context)
+    if q.data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    if q.data.startswith("BACK:"): return await alertas_back(update, context)
     side = q.data.split(":",1)[1]
     context.user_data["al"]["side"] = side
     kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],[("Volver","BACK:FXSIDE"),("Cancelar","CANCEL")]])
@@ -1036,10 +999,8 @@ async def alertas_add_fx_side(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def alertas_add_metric_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    if q.data == "CANCEL":
-        await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
-    if q.data.startswith("BACK:"):
-        return await alertas_back(update, context)
+    if q.data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    if q.data.startswith("BACK:"): return await alertas_back(update, context)
     m = q.data.split(":",1)[1]
     context.user_data["al"]["type"] = m
     kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],[("Volver","BACK:METRIC"),("Cancelar","CANCEL")]])
@@ -1048,10 +1009,8 @@ async def alertas_add_metric_type(update: Update, context: ContextTypes.DEFAULT_
 
 async def alertas_add_ticker_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    if q.data == "CANCEL":
-        await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
-    if q.data.startswith("BACK:"):
-        return await alertas_back(update, context)
+    if q.data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    if q.data.startswith("BACK:"): return await alertas_back(update, context)
     sym = q.data.split(":",1)[1].upper()
     context.user_data["al"]["symbol"] = sym
     k = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],
@@ -1061,45 +1020,36 @@ async def alertas_add_ticker_cb(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def alertas_add_op(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    if q.data == "CANCEL":
-        await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
-    if q.data.startswith("BACK:"):
-        return await alertas_back(update, context)
+    if q.data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    if q.data.startswith("BACK:"): return await alertas_back(update, context)
     op = q.data.split(":",1)[1]
     context.user_data["al"]["op"] = op
     al = context.user_data.get("al", {})
-
     if al.get("kind") == "ticker":
         async with ClientSession() as session:
             sym = al.get("symbol")
             metmap, _ = await metrics_for_symbols(session, [sym]) if sym else ({}, None)
             last_px = metmap.get(sym, {}).get("last_px") if metmap else None
-            price_s = fmt_money_ars(last_px) if last_px is not None else "—"
+        price_s = fmt_money_ars(last_px) if last_px is not None else "—"
         msg = (
             f"Ticker: {_label_long(sym)} | Condición: {'↑ Sube' if op=='>' else '↓ Baja'}\n"
             f"Actual: Precio {price_s}\n\n"
             "Ingresá el <b>precio objetivo</b> (solo número, sin símbolos ni separadores). Ej: 3500\n"
             "<i>Válidos: 100 | 1000.5 · Inválidos: $100, 1.000,50, 100%</i>"
         )
-        await q.edit_message_text(msg, parse_mode=ParseMode.HTML)
-        return AL_VALUE
-
-    kb_mode = kb([[("Ingresar Importe", "MODE:absolute"),("Ingresar % vs valor actual", "MODE:percent")],
-                  [("Volver","BACK:OP"),("Cancelar","CANCEL")]])
+        await q.edit_message_text(msg, parse_mode=ParseMode.HTML); return AL_VALUE
+    kb_mode = kb([[("Ingresar Importe", "MODE:absolute"),("Ingresar % vs valor actual", "MODE:percent")], [("Volver","BACK:OP"),("Cancelar","CANCEL")]])
     await q.edit_message_text("¿Cómo querés definir el umbral?", reply_markup=kb_mode)
     return AL_MODE
 
 async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    if q.data == "CANCEL":
-        await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
-    if q.data.startswith("BACK:"):
-        return await alertas_back(update, context)
+    if q.data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    if q.data.startswith("BACK:"): return await alertas_back(update, context)
     mode = q.data.split(":",1)[1]
     context.user_data["al"]["mode"] = mode
     al = context.user_data.get("al", {})
     op_text = "↑ Sube" if al.get("op")==">" else "↓ Baja"
-
     async with ClientSession() as session:
         if al.get("kind") == "fx":
             fx = await get_dolares(session); row = fx.get(al.get("type",""), {}) or {}
@@ -1112,21 +1062,17 @@ async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg = (f"Tipo: {al.get('type','?').upper()} | Lado: {al.get('side','?')} | Condición: {op_text}\n"
                        f"Ahora: {cur_s}\n\nIngresá el <b>importe</b> AR$ (solo número). Ej: 1580 | 25500")
             await q.edit_message_text(msg, parse_mode=ParseMode.HTML); return AL_VALUE
-
         if al.get("kind") == "metric":
             rp = await get_riesgo_pais(session); infl = await get_inflacion_mensual(session); rv = await get_reservas_lamacro(session)
-            curmap = {
-                "riesgo": (f"{rp[0]:.0f} pb" if rp else "—", rp[0] if rp else None, "pb"),
-                "inflacion": ((str(round(infl[0],1)).replace('.',','))+"%" if infl else "—", infl[0] if infl else None, "%"),
-                "reservas": (f"{fmt_number(rv[0],0)} MUS$" if rv else "—", rv[0] if rv else None, "MUS$")
-            }
+            curmap = {"riesgo": (f"{rp[0]:.0f} pb" if rp else "—", rp[0] if rp else None, "pb"),
+                      "inflacion": ((str(round(infl[0],1)).replace('.',','))+"%" if infl else "—", infl[0] if infl else None, "%"),
+                      "reservas": (f"{fmt_number(rv[0],0)} MUS$" if rv else "—", rv[0] if rv else None, "MUS$")}
             label, curval, unidad = curmap.get(al.get("type",""), ("—", None, ""))
             if mode == "percent":
                 msg = (f"Métrica: {al.get('type','?').upper()} | Condición: {op_text}\nAhora: {label}\n\nIngresá el <b>%</b> (solo número).")
             else:
                 msg = (f"Métrica: {al.get('type','?').upper()} | Condición: {op_text}\nAhora: {label}\n\nIngresá el <b>importe</b> (solo número, en {unidad}).")
             await q.edit_message_text(msg, parse_mode=ParseMode.HTML); return AL_VALUE
-
     await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
 
 async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1135,7 +1081,6 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if val is None:
         await update.message.reply_text("Ingresá solo número (sin $ ni % ni separadores)."); return AL_VALUE
     chat_id = update.effective_chat.id
-
     async with ClientSession() as session:
         if al.get("kind") == "fx":
             fx = await get_dolares(session); row = fx.get(al["type"], {}) or {}
@@ -1149,8 +1094,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(f"El objetivo debe ser {'mayor' if al['op']=='>' else 'menor'} que {fmt_money_ars(cur)}."); return AL_VALUE
             ALERTS.setdefault(chat_id, []).append({"kind":"fx","type":al["type"],"side":al["side"],"op":al["op"],"value":float(thr)})
             save_state()
-            await update.message.reply_text("Listo. Alerta agregada ✅")
-            return ConversationHandler.END
+            await update.message.reply_text("Listo. Alerta agregada ✅"); return ConversationHandler.END
 
         if al.get("kind") == "metric":
             rp = await get_riesgo_pais(session); infl = await get_inflacion_mensual(session); rv = await get_reservas_lamacro(session)
@@ -1165,8 +1109,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text("El objetivo debe ser válido respecto al valor actual."); return AL_VALUE
             ALERTS.setdefault(chat_id, []).append({"kind":"metric","type":al["type"],"op":al["op"],"value":float(thr)})
             save_state()
-            await update.message.reply_text("Listo. Alerta agregada ✅")
-            return ConversationHandler.END
+            await update.message.reply_text("Listo. Alerta agregada ✅"); return ConversationHandler.END
 
         # ticker
         sym, op = al.get("symbol"), al.get("op")
@@ -1179,10 +1122,10 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"El precio objetivo debe ser {'mayor' if op=='>' else 'menor'} que {fmt_money_ars(last_px)}."); return AL_VALUE
         ALERTS.setdefault(chat_id, []).append({"kind":"ticker","symbol":sym,"op":op,"value":float(thr),"mode":"absolute"})
         save_state()
-        await update.message.reply_text("Listo. Alerta agregada ✅")
-        return ConversationHandler.END
+        await update.message.reply_text("Listo. Alerta agregada ✅"); return ConversationHandler.END
 
 # ============================ LOOP ALERTAS ============================
+
 async def alerts_loop(app: Application):
     await asyncio.sleep(5)
     timeout = ClientTimeout(total=12)
@@ -1195,17 +1138,17 @@ async def alerts_loop(app: Application):
                 if cid in ALERTS_PAUSED: continue
                 if cid in ALERTS_SILENT_UNTIL and ALERTS_SILENT_UNTIL[cid] > now_ts: continue
                 active_chats.append(cid)
-
             if active_chats:
                 async with ClientSession(timeout=timeout) as session:
                     fx = await get_dolares(session)
                     rp = await get_riesgo_pais(session)
                     infl = await get_inflacion_mensual(session)
                     rv = await get_reservas_lamacro(session)
-                    vals = {"riesgo": float(rp[0]) if rp else None, "inflacion": float(infl[0]) if infl else None, "reservas": rv[0] if rv else None}
+                    vals = {"riesgo": float(rp[0]) if rp else None,
+                            "inflacion": float(infl[0]) if infl else None,
+                            "reservas": rv[0] if rv else None}
                     sym_list = {r["symbol"] for cid in active_chats for r in ALERTS.get(cid, []) if r.get("kind")=="ticker" and r.get("symbol")}
                     metmap, _ = (await metrics_for_symbols(session, sorted(sym_list))) if sym_list else ({}, None)
-
                     for chat_id in active_chats:
                         rules = ALERTS.get(chat_id, [])
                         if not rules: continue
@@ -1223,12 +1166,10 @@ async def alerts_loop(app: Application):
                                 ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
                                 if ok: trig.append(("metric", r["type"], r["op"], r["value"], cur))
                             elif r.get("kind") == "ticker":
-                                sym = r["symbol"]; m = metmap.get(sym, {})
-                                cur = m.get("last_px"); 
+                                sym = r["symbol"]; m = metmap.get(sym, {}); cur = m.get("last_px"); 
                                 if cur is None: continue
                                 ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
                                 if ok: trig.append(("ticker_px", sym, r["op"], r["value"], cur))
-
                         if trig:
                             lines = [f"<b>🔔 Alertas</b>"]
                             for t, *rest in trig:
@@ -1247,7 +1188,7 @@ async def alerts_loop(app: Application):
                                     sym, op, v, cur = rest
                                     lines.append(f"{_label_long(sym)} (Precio): {fmt_money_ars(cur)} ({html_op(op)} {fmt_money_ars(v)})")
                             try:
-                                await app.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML)
+                                await app.bot.send_message(chat_id, "\n".join(lines))
                             except Exception as e:
                                 log.warning("send alert failed %s: %s", chat_id, e)
             await asyncio.sleep(600)
@@ -1256,6 +1197,7 @@ async def alerts_loop(app: Application):
             await asyncio.sleep(30)
 
 # ============================ SUSCRIPCIONES ============================
+
 SUBS_SET_TIME = range(1)
 
 async def _job_send_daily(context: ContextTypes.DEFAULT_TYPE):
@@ -1265,14 +1207,17 @@ async def _job_send_daily(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.warning("send daily failed %s: %s", chat_id, e)
 
-def _job_name_daily(chat_id: int) -> str:
-    return f"daily_{chat_id}"
+def _job_name_daily(chat_id: int) -> str: return f"daily_{chat_id}"
 
 def _schedule_daily_for_chat(app: Application, chat_id: int, hhmm: str):
-    for j in app.job_queue.get_jobs_by_name(_job_name_daily(chat_id)):
-        j.schedule_removal()
+    for j in app.job_queue.get_jobs_by_name(_job_name_daily(chat_id)): j.schedule_removal()
     h, m = [int(x) for x in hhmm.split(":")]
     app.job_queue.run_daily(_job_send_daily, time=dtime(hour=h, minute=m, tzinfo=TZ), chat_id=chat_id, name=_job_name_daily(chat_id))
+
+def _schedule_all_subs(app: Application):
+    for chat_id, conf in SUBS.items():
+        hhmm = conf.get("daily")
+        if hhmm: _schedule_daily_for_chat(app, chat_id, hhmm)
 
 def kb_times_full() -> InlineKeyboardMarkup:
     rows, row = [], []
@@ -1287,19 +1232,17 @@ async def cmd_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     cur = SUBS.get(chat_id, {}).get("daily")
     txt = f"<b>📬 Suscripción</b>\nResumen Diario: {'ON ('+cur+')' if cur else 'OFF'}\nElegí un horario (hora AR):"
-    await update.effective_message.reply_text(txt, reply_markup=kb_times_full(), parse_mode=ParseMode.HTML)
+    await update.effective_message.reply_text(txt, reply_markup=kb_times_full())
     return SUBS_SET_TIME
 
 async def subs_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     chat_id = q.message.chat_id; data = q.data
-    if data == "SUBS:CLOSE":
-        await q.edit_message_text("Listo."); return ConversationHandler.END
+    if data == "SUBS:CLOSE": await q.edit_message_text("Listo."); return ConversationHandler.END
     if data == "SUBS:OFF":
         if chat_id in SUBS and SUBS[chat_id].get("daily"):
             SUBS[chat_id]["daily"] = None; save_state()
-            for j in context.application.job_queue.get_jobs_by_name(_job_name_daily(chat_id)):
-                j.schedule_removal()
+            for j in context.application.job_queue.get_jobs_by_name(_job_name_daily(chat_id)): j.schedule_removal()
         await q.edit_message_text("Suscripción cancelada."); return ConversationHandler.END
     if data.startswith("SUBS:T:"):
         hhmm = data.split(":",2)[2]
@@ -1308,9 +1251,9 @@ async def subs_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"Te suscribí al Resumen Diario a las {hhmm} (hora AR)."); return ConversationHandler.END
     await q.edit_message_text("Acción inválida."); return ConversationHandler.END
 
-# ============================ PORTAFOLIO (con equivalencias ARS⇄USD) ============================
+# ============================ PORTAFOLIO ============================
+
 def pf_get(chat_id: int) -> Dict[str, Any]:
-    # base: {"moneda": "ARS"|"USD", "tc": (si ARS: mep/ccl/oficial) , "usd_ars_tc": (si USD: oficial/mep/ccl)}
     return PF.setdefault(chat_id, {"base": {"moneda":"ARS", "tc":"mep"}, "monto": 0.0, "items": []})
 
 def kb_pf_main() -> InlineKeyboardMarkup:
@@ -1328,67 +1271,34 @@ def kb_pick_generic(symbols: List[str], back: str, prefix: str) -> InlineKeyboar
     for s in symbols:
         label = _label_long(s)
         row.append((label, f"{prefix}:{s}"))
-        if len(row) == 2:
-            rows.append(row); row = []
+        if len(row) == 2: rows.append(row); row = []
     if row: rows.append(row)
     rows.append([("Volver","PF:ADD")])
     return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t,d in r] for r in rows])
 
-async def convert_amount_to_base(session: ClientSession, pf: Dict[str, Any], *, amount: float, src_ccy: str) -> float:
-    """Convierte 'amount' desde src_ccy a la moneda base del portafolio."""
-    base = pf["base"]["moneda"]
-    if base == src_ccy: return float(amount)
-    # ARS -> USD
-    if base == "USD" and src_ccy == "ARS":
-        # por defecto 'oficial' (pediste oficial para acciones/cedears)
-        tcname = pf["base"].get("usd_ars_tc") or "oficial"
-        tc = await get_tc_value(session, tcname, side="venta") or 0.0
-        return float(amount) / tc if tc > 0 else float(amount)
-    # USD -> ARS
-    if base == "ARS" and src_ccy == "USD":
-        tcname = pf["base"].get("tc") or "mep"
-        tc = await get_tc_value(session, tcname, side="venta") or 0.0
-        return float(amount) * tc if tc > 0 else float(amount)
-    return float(amount)
-
-def symbol_ccy(sym: str, tipo: Optional[str] = None) -> str:
-    # .BA → ARS ; cripto (-USD) → USD ; bonos/letes/fci: heurística por nombre
-    if sym.endswith(".BA"): return "ARS"
-    if sym.endswith("-USD"): return "USD"
-    if sym in BONOS_AR:
-        return "USD" if sym.endswith("D") else "ARS"
-    if sym.startswith("LETRA-USD"): return "USD"
-    if sym.startswith("FCI-") and "USD" in sym.upper(): return "USD"
-    return "ARS"  # default
-
-async def price_in_base(session: ClientSession, pf: Dict[str, Any], sym: str, raw_px: Optional[float]) -> Optional[float]:
-    """Convierte precio 'raw_px' del símbolo a moneda base del portafolio."""
-    if raw_px is None: return None
-    src_ccy = symbol_ccy(sym)
-    return await convert_amount_to_base(session, pf, amount=float(raw_px), src_ccy=src_ccy)
+async def cmd_portafolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.effective_message.reply_text("📦 Menú Portafolio", reply_markup=kb_pf_main())
 
 async def _pf_total_usado(chat_id: int) -> float:
     pf = pf_get(chat_id)
+    pf_base = pf["base"]["moneda"].upper()
     total = 0.0
-    syms = [it["simbolo"] for it in pf["items"] if it.get("simbolo") and it.get("tipo") in ("accion","cedear","cripto")]
+    syms = [it["simbolo"] for it in pf["items"] if it.get("simbolo") and it.get("tipo") in ("accion","cedear")]
     prices: Dict[str, float] = {}
-    async with ClientSession() as session:
-        if syms:
+    if syms:
+        async with ClientSession() as session:
             mets, _ = await metrics_for_symbols(session, sorted(set(syms)))
             for s in syms:
                 px = mets.get(s,{}).get("last_px")
-                if px is not None:
-                    px_base = await price_in_base(session, pf, s, float(px))
-                    if px_base is not None: prices[s] = float(px_base)
-        for it in pf["items"]:
-            if it.get("importe") is not None:
-                total += float(it["importe"])  # SIEMPRE guardado en moneda base
-            elif it.get("cantidad") is not None and it.get("simbolo") in prices:
-                total += float(it["cantidad"]) * float(prices[it["simbolo"]])
+                if px: prices[s] = float(px)
+    for it in pf["items"]:
+        # Importe se guarda en MONEDA BASE
+        if it.get("importe") is not None:
+            total += float(it["importe"])
+        elif it.get("cantidad") is not None and it.get("simbolo") in prices:
+            # cantidad * precio_base (precios ya convertidos al cargar)
+            total += float(it["importe"]) if it.get("importe") is not None else 0.0
     return total
-
-async def cmd_portafolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("📦 Menú Portafolio", reply_markup=kb_pf_main())
 
 async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -1399,17 +1309,17 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                "1) Fijá base y tipo de cambio.\n2) Definí el monto total (solo número).\n"
                "3) Agregá instrumentos (por cantidad, importe o % del monto).\n"
                "4) Ver composición y editar.\n5) Rendimiento (actual) y Proyección (3/6M).\n\n"
-               "<i>Todos los importes se guardan y muestran en la <b>moneda base</b> del portafolio.</i>")
-        await q.message.reply_text(txt, parse_mode=ParseMode.HTML)
-        return
+               "<i>Formato de números: solo dígitos y decimal. Sin $ ni % ni comas.</i>")
+        await q.message.reply_text(txt); return
 
     if data == "PF:SETBASE":
         kb_base = InlineKeyboardMarkup([
-            [InlineKeyboardButton("ARS / MEP", callback_data="PF:BASE:ARS:mep"), InlineKeyboardButton("ARS / CCL", callback_data="PF:BASE:ARS:ccl")],
-            [InlineKeyboardButton("ARS / Oficial", callback_data="PF:BASE:ARS:oficial")],
-            [InlineKeyboardButton("USD (ARS→USD @ Oficial)", callback_data="PF:BASE:USD:oficial")],
-            [InlineKeyboardButton("USD (ARS→USD @ MEP)", callback_data="PF:BASE:USD:mep")],
-            [InlineKeyboardButton("USD (ARS→USD @ CCL)", callback_data="PF:BASE:USD:ccl")],
+            [InlineKeyboardButton("ARS / MEP", callback_data="PF:BASE:ARS:mep"),
+             InlineKeyboardButton("ARS / CCL", callback_data="PF:BASE:ARS:ccl")],
+            [InlineKeyboardButton("ARS / Oficial", callback_data="PF:BASE:ARS:oficial"),
+             InlineKeyboardButton("USD / Oficial", callback_data="PF:BASE:USD:oficial")],
+            [InlineKeyboardButton("USD / MEP", callback_data="PF:BASE:USD:mep"),
+             InlineKeyboardButton("USD / CCL", callback_data="PF:BASE:USD:ccl")],
             [InlineKeyboardButton("Volver", callback_data="PF:BACK")]
         ])
         await q.edit_message_text("Elegí base del portafolio:", reply_markup=kb_base); return
@@ -1417,24 +1327,23 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("PF:BASE:"):
         _,_,mon,tc = data.split(":")
         pf = pf_get(chat_id)
-        if mon == "ARS":
-            pf["base"] = {"moneda": "ARS", "tc": tc}
-            msg = f"Base fijada: ARS / {tc.upper()}"
-        else:
-            pf["base"] = {"moneda": "USD", "usd_ars_tc": tc}
-            msg = f"Base fijada: USD (ARS→USD @ {tc.upper()})"
+        pf["base"] = {"moneda": mon, "tc": tc}
         save_state()
+        msg = f"Base fijada: {mon.upper()} / {tc.upper()}"
         await q.edit_message_text(msg, reply_markup=kb_pf_main()); return
 
     if data == "PF:SETMONTO":
         context.user_data["pf_mode"] = "set_monto"
-        await q.message.reply_text("Ingresá el <b>monto total</b> (en <b>moneda base</b>, solo número).", parse_mode=ParseMode.HTML); return
+        await q.message.reply_text("Ingresá el <b>monto total</b> (solo número).", parse_mode=ParseMode.HTML); return
 
     if data == "PF:ADD":
         kb_add = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Acción (.BA, ARS)", callback_data="PF:ADD:accion"), InlineKeyboardButton("Cedear (.BA, ARS)", callback_data="PF:ADD:cedear")],
-            [InlineKeyboardButton("Bono (ARS/USD)", callback_data="PF:ADD:bono"), InlineKeyboardButton("FCI (ARS/USD)", callback_data="PF:ADD:fci")],
-            [InlineKeyboardButton("Letras (ARS/USD)", callback_data="PF:ADD:lete"), InlineKeyboardButton("Cripto (USD)", callback_data="PF:ADD:cripto")],
+            [InlineKeyboardButton("Acción (.BA, ARS)", callback_data="PF:ADD:accion"),
+             InlineKeyboardButton("Cedear (.BA, ARS)", callback_data="PF:ADD:cedear")],
+            [InlineKeyboardButton("Bono (ARS/USD)", callback_data="PF:ADD:bono"),
+             InlineKeyboardButton("FCI (ARS/USD)", callback_data="PF:ADD:fci")],
+            [InlineKeyboardButton("Letras (ARS/USD)", callback_data="PF:ADD:lete"),
+             InlineKeyboardButton("Cripto (USD)", callback_data="PF:ADD:cripto")],
             [InlineKeyboardButton("Volver", callback_data="PF:BACK")]
         ])
         await q.edit_message_text("¿Qué querés agregar?", reply_markup=kb_add); return
@@ -1443,49 +1352,52 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tipo = data.split(":")[2]
         context.user_data["pf_add_tipo"] = tipo
         if tipo == "accion":
-            await q.edit_message_text("Elegí la acción:", reply_markup=kb_pick_generic(ACCIONES_BA, "PF:ADD", "PF:PICK")); return
-        if tipo == "cedear":
-            await q.edit_message_text("Elegí el cedear:", reply_markup=kb_pick_generic(CEDEARS_BA, "PF:ADD", "PF:PICK")); return
-        if tipo == "bono":
-            await q.edit_message_text("Elegí el bono:", reply_markup=kb_pick_generic(BONOS_AR, "PF:ADD", "PF:PICK")); return
-        if tipo == "fci":
-            await q.edit_message_text("Elegí el FCI:", reply_markup=kb_pick_generic(FCI_LIST, "PF:ADD", "PF:PICK")); return
-        if tipo == "lete":
-            await q.edit_message_text("Elegí la Letra:", reply_markup=kb_pick_generic(LETES_LIST, "PF:ADD", "PF:PICK")); return
-        # cripto
-        await q.edit_message_text("Elegí la cripto:", reply_markup=kb_pick_generic(CRIPTO_TOP_NAMES, "PF:ADD", "PF:PICK")); return
+            await q.edit_message_text("Elegí la acción:", reply_markup=kb_pick_generic(ACCIONES_BA, "PF:ADD", "PF:PICK"))
+        elif tipo == "cedear":
+            await q.edit_message_text("Elegí el cedear:", reply_markup=kb_pick_generic(CEDEARS_BA, "PF:ADD", "PF:PICK"))
+        elif tipo == "bono":
+            await q.edit_message_text("Elegí el bono:", reply_markup=kb_pick_generic(BONOS_AR, "PF:ADD", "PF:PICK"))
+        elif tipo == "fci":
+            await q.edit_message_text("Elegí el FCI:", reply_markup=kb_pick_generic(FCI_LIST, "PF:ADD", "PF:PICK"))
+        elif tipo == "lete":
+            await q.edit_message_text("Elegí la Letra:", reply_markup=kb_pick_generic(LETES_LIST, "PF:ADD", "PF:PICK"))
+        else: # cripto
+            await q.edit_message_text("Elegí la cripto:", reply_markup=kb_pick_generic(CRIPTO_TOP_NAMES, "PF:ADD", "PF:PICK"))
+        return
 
     if data.startswith("PF:PICK:"):
-        raw = data.split(":")[2]
-        sym = _crypto_to_symbol(raw) if raw in CRIPTO_TOP_NAMES else raw
-        context.user_data["pf_add_simbolo"] = sym
+        sym = data.split(":")[2]
+        if sym in CRIPTO_TOP_NAMES:
+            context.user_data["pf_add_simbolo"] = _crypto_to_symbol(sym)
+            sel_label = _label_long(sym)
+        else:
+            context.user_data["pf_add_simbolo"] = sym
+            sel_label = _label_long(sym)
         kb_ask = InlineKeyboardMarkup([
             [InlineKeyboardButton("Por cantidad", callback_data="PF:ADDQTY"), InlineKeyboardButton("Por importe", callback_data="PF:ADDAMT")],
             [InlineKeyboardButton("Por % del monto", callback_data="PF:ADDPCT")],
             [InlineKeyboardButton("Volver", callback_data="PF:ADD")]
         ])
-        await q.message.reply_text(f"Seleccionado: {_label_long(sym)}\n¿Cómo cargar?", reply_markup=kb_ask)
-        return
+        await q.message.reply_text(f"Seleccionado: {sel_label}\n¿Cómo cargar?", reply_markup=kb_ask); return
 
     if data == "PF:ADDQTY":
         context.user_data["pf_mode"] = "pf_add_qty"
         await q.message.reply_text("Ingresá la <b>cantidad</b> (solo número).", parse_mode=ParseMode.HTML); return
-
     if data == "PF:ADDAMT":
         context.user_data["pf_mode"] = "pf_add_amt"
-        await q.message.reply_text("Ingresá el <b>importe</b> (en <b>moneda base</b>, solo número).", parse_mode=ParseMode.HTML); return
-
+        await q.message.reply_text("Ingresá el <b>importe</b> (solo número).", parse_mode=ParseMode.HTML); return
     if data == "PF:ADDPCT":
         context.user_data["pf_mode"] = "pf_add_pct"
-        await q.message.reply_text("Ingresá el <b>porcentaje</b> del monto (solo número). Ej: 50 = 50%", parse_mode=ParseMode.HTML); return
+        await q.message.reply_text("Ingresá el <b>porcentaje</b> del monto (solo número). Ej: 10 = 10%", parse_mode=ParseMode.HTML); return
 
     if data == "PF:LIST":
         pf = pf_get(chat_id)
         if not pf["items"]:
             await q.edit_message_text("Tu portafolio está vacío. Usá «Agregar instrumento».", reply_markup=kb_pf_main()); return
-        cur_base = pf['base']['moneda'] + (f"/{pf['base'].get('tc','').upper()}" if pf['base']['moneda']=='ARS' else f" (ARS→USD @{pf['base'].get('usd_ars_tc','oficial').upper()})")
-        lines = [f"<b>Portafolio</b> — Base: {cur_base}",
-                 f"Monto objetivo: {(fmt_money_ars(pf['monto']) if pf['base']['moneda']=='ARS' else fmt_money_usd(pf['monto']))}"]
+        pf_base = pf["base"]["moneda"].upper()
+        f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
+        lines = [f"<b>Portafolio</b> — Base: {pf['base']['moneda'].upper()}/{pf['base']['tc'].upper()}",
+                 f"Monto objetivo: {f_money(pf['monto'])}"]
         for i,it in enumerate(pf["items"],1):
             desc = f"{i}. "
             if it.get("simbolo"): desc += f"{_label_long(it['simbolo'])} [{it['tipo'].upper()}]"
@@ -1493,12 +1405,13 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if it.get("cantidad") is not None:
                 desc += f" | Cant: {int(it['cantidad']) if it.get('simbolo','').endswith('.BA') else it['cantidad']}"
             if it.get("importe") is not None:
-                desc += " | Importe (base): " + (fmt_money_ars(it['importe']) if pf['base']['moneda']=='ARS' else fmt_money_usd(it['importe']))
+                desc += f" | Importe(Base): {f_money(it['importe'])}"
+            if it.get("tna") is not None:
+                desc += f" | TNA: {str(it['tna']).replace('.',',')}%"
             lines.append(desc)
         usado = await _pf_total_usado(chat_id)
-        base_fmt = fmt_money_ars if pf['base']['moneda']=='ARS' else fmt_money_usd
-        lines.append(f"\nUsado: {base_fmt(usado)} · Restante: {base_fmt(max(0.0, pf['monto']-usado))}")
-        await q.edit_message_text("\n".join(lines), reply_markup=kb_pf_main(), parse_mode=ParseMode.HTML); return
+        lines.append(f"\nUsado (Base): {f_money(usado)} · Restante: {f_money(max(0.0, pf['monto']-usado))}")
+        await q.edit_message_text("\n".join(lines), reply_markup=kb_pf_main()); return
 
     if data == "PF:EDIT":
         pf = pf_get(chat_id)
@@ -1516,7 +1429,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["pf_edit_idx"] = idx
         kb_ed = InlineKeyboardMarkup([
             [InlineKeyboardButton("+ Cantidad", callback_data="PF:ED:ADDQ"), InlineKeyboardButton("- Cantidad", callback_data="PF:ED:SUBQ")],
-            [InlineKeyboardButton("Cambiar importe (base)", callback_data="PF:ED:AMT")],
+            [InlineKeyboardButton("Cambiar importe", callback_data="PF:ED:AMT")],
             [InlineKeyboardButton("Eliminar este", callback_data="PF:ED:DEL")],
             [InlineKeyboardButton("Volver", callback_data="PF:EDIT")]
         ])
@@ -1525,15 +1438,12 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "PF:ED:ADDQ":
         context.user_data["pf_mode"] = "edit_addq"
         await q.message.reply_text("Ingresá la <b>cantidad a sumar</b>.", parse_mode=ParseMode.HTML); return
-
     if data == "PF:ED:SUBQ":
         context.user_data["pf_mode"] = "edit_subq"
         await q.message.reply_text("Ingresá la <b>cantidad a restar</b>.", parse_mode=ParseMode.HTML); return
-
     if data == "PF:ED:AMT":
         context.user_data["pf_mode"] = "edit_amt"
-        await q.message.reply_text("Ingresá el <b>nuevo importe</b> en <b>moneda base</b>.", parse_mode=ParseMode.HTML); return
-
+        await q.message.reply_text("Ingresá el <b>nuevo importe</b> (moneda BASE).", parse_mode=ParseMode.HTML); return
     if data == "PF:ED:DEL":
         pf = pf_get(chat_id); idx = context.user_data.get("pf_edit_idx", -1)
         if 0 <= idx < len(pf["items"]):
@@ -1543,7 +1453,6 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "PF:RET":
         await pf_show_return(q, chat_id); return
-
     if data == "PF:PROJ":
         await pf_show_projection(q, chat_id); return
 
@@ -1568,17 +1477,19 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pf = pf_get(chat_id)
 
     def _restante_str(usado: float) -> str:
-        return (fmt_money_ars if pf["base"]["moneda"]=="ARS" else fmt_money_usd)(max(0.0, pf["monto"] - usado))
+        pf_base = pf["base"]["moneda"].upper()
+        return (fmt_money_ars if pf_base=="ARS" else fmt_money_usd)(max(0.0, pf["monto"] - usado))
 
-    # Monto total (en moneda base)
+    # Monto total
     if mode == "set_monto":
         v = _parse_num_text(text)
         if v is None:
             await update.message.reply_text("Ingresá solo número (sin símbolos)."); return
         pf["monto"] = float(v); save_state()
         usado = await _pf_total_usado(chat_id)
-        base_fmt = fmt_money_ars if pf['base']['moneda']=='ARS' else fmt_money_usd
-        await update.message.reply_text(f"Monto fijado: {base_fmt(v)} · Restante: {_restante_str(usado)}")
+        pf_base = pf["base"]["moneda"].upper()
+        f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
+        await update.message.reply_text(f"Monto fijado: {f_money(v)} · Restante: {_restante_str(usado)}")
         context.user_data["pf_mode"]=None; return
 
     # Alta por cantidad/importe/% (símbolo ya elegido)
@@ -1586,76 +1497,106 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         v = _parse_num_text(text)
         if v is None:
             await update.message.reply_text("Ingresá solo número (sin símbolos)."); return
-        tipo = context.user_data.get("pf_add_tipo"); sym = context.user_data.get("pf_add_simbolo","")
+
+        tipo = context.user_data.get("pf_add_tipo")
+        sym = context.user_data.get("pf_add_simbolo","")
         yfsym = sym
 
-        # obtener precio actual en moneda base
-        price_base = None
+        price_native = None  # precio en MONEDA NATIVA del instrumento
         async with ClientSession() as session:
-            if sym.endswith(".BA") or sym.endswith("-USD"):
+            if yfsym.endswith(".BA") or yfsym.endswith("-USD"):
                 mets, _ = await metrics_for_symbols(session, [yfsym])
-                raw_px = mets.get(yfsym,{}).get("last_px")
-                price_base = await price_in_base(session, pf, yfsym, raw_px)
-            # otros (bono/lete/fci) no tienen precio en YF: solo usaremos importe directo en base
+                price_native = mets.get(yfsym,{}).get("last_px")
+            tc_key = (pf_get(chat_id)["base"].get("tc") or "oficial").lower()
+            tc_val = await get_tc_value(session, tc_key)
 
-            # calcular importe/cantidad SIEMPRE en moneda base
-            cantidad, importe_base = None, None
-            if mode == "pf_add_qty":
-                cantidad = float(v)
-                if requires_integer_units(yfsym): cantidad = math.floor(cantidad)
-                if price_base is not None:
+        pf_base = pf_get(chat_id)["base"]["moneda"].upper()  # ARS o USD
+        inst_moneda = "USD" if yfsym.endswith("-USD") else "ARS"
+
+        # Precio expresado en MONEDA BASE
+        price_base = None
+        if price_native is not None:
+            if pf_base == inst_moneda:
+                price_base = float(price_native)
+            else:
+                if tc_val and tc_val > 0:
+                    if pf_base == "ARS" and inst_moneda == "USD":
+                        price_base = float(price_native) * float(tc_val)
+                    elif pf_base == "USD" and inst_moneda == "ARS":
+                        price_base = float(price_native) / float(tc_val)
+
+        cantidad, importe_base = None, None
+
+        if mode == "pf_add_qty":
+            cantidad = float(v)
+            if requires_integer_units(yfsym): cantidad = math.floor(cantidad)
+            if price_base is not None: importe_base = float(cantidad) * float(price_base)
+
+        elif mode == "pf_add_amt":
+            importe_base = float(v)  # EN MONEDA BASE
+            if price_base and price_base > 0:
+                raw_qty = importe_base / float(price_base)
+                if requires_integer_units(yfsym):
+                    cantidad = float(math.floor(raw_qty))
                     importe_base = float(cantidad) * float(price_base)
-            elif mode == "pf_add_amt":
-                importe_base = float(v)  # viene en base
-                if price_base and price_base > 0:
-                    raw_qty = importe_base / float(price_base)
-                    if requires_integer_units(yfsym):
-                        cantidad = float(math.floor(raw_qty))
-                        importe_base  = float(cantidad) * float(price_base)
-                    else:
-                        cantidad = round(raw_qty, 6)
-            else:  # pf_add_pct
-                if pf["monto"] <= 0:
-                    await update.message.reply_text("Primero fijá el monto total del portafolio."); return
-                pct_val = max(0.0, float(v))
-                importe_base = round(pf["monto"] * pct_val / 100.0, 2)
-                if price_base and price_base > 0:
-                    raw_qty = importe_base / float(price_base)
-                    if requires_integer_units(yfsym):
-                        cantidad = float(math.floor(raw_qty))
-                        importe_base = float(cantidad) * float(price_base)
-                    else:
-                        cantidad = round(raw_qty, 6)
+                else:
+                    cantidad = round(raw_qty, 6)
 
-            # chequear presupuesto
-            usado_pre = await _pf_total_usado(chat_id)
-            add_val = float(importe_base if importe_base is not None else 0.0)
-            if pf["monto"] > 0 and (usado_pre + add_val) > pf["monto"] + 1e-6:
-                faltan = pf["monto"] - usado_pre
-                await update.message.reply_text(f"🚫 Te pasás del presupuesto. Restante: {_restante_str(max(0.0, faltan))}")
-                return
+        else:  # pf_add_pct
+            if pf["monto"] <= 0:
+                await update.message.reply_text("Primero fijá el monto total del portafolio."); return
+            pct_val = max(0.0, float(v))
+            importe_base = round(pf["monto"] * pct_val / 100.0, 2)
+            if price_base and price_base > 0:
+                raw_qty = importe_base / float(price_base)
+                if requires_integer_units(yfsym):
+                    cantidad = float(math.floor(raw_qty))
+                    importe_base = float(cantidad) * float(price_base)
+                else:
+                    cantidad = round(raw_qty, 6)
 
-            item = {"tipo":tipo, "simbolo": yfsym if yfsym else sym}
-            if cantidad is not None: item["cantidad"] = float(cantidad)
-            if importe_base  is not None: item["importe"]  = float(importe_base)  # SIEMPRE en base
-            pf["items"].append(item); save_state()
+        usado_pre = await _pf_total_usado(chat_id)
+        add_val = float(importe_base or 0.0)
+        if pf["monto"] > 0 and (usado_pre + add_val) > pf["monto"] + 1e-6:
+            await update.message.reply_text(f"🚫 Te pasás del presupuesto. Restante: {_restante_str(usado_pre)}"); return
 
-            usado_post = await _pf_total_usado(chat_id)
-            base_label = _label_long(sym)
+        item = {"tipo":tipo, "simbolo": yfsym if yfsym else sym}
+        if cantidad is not None: item["cantidad"] = float(cantidad)
+        if importe_base is not None: item["importe"] = float(importe_base)  # en MONEDA BASE
+        pf["items"].append(item); save_state()
 
-            qty_str = ""
-            if cantidad is not None:
-                if requires_integer_units(yfsym): qty_str = f"(cant: {int(cantidad)}) "
-                else: qty_str = f"(cant: {cantidad}) "
-            unit_px_str = f"a {(fmt_money_ars if pf['base']['moneda']=='ARS' else fmt_money_usd')(price_base)} c/u " if (price_base is not None) else ""
-            total_str = f"(= {(fmt_money_ars if pf['base']['moneda']=='ARS' else fmt_money_usd')(importe_base)})" if (importe_base is not None) else ""
+        pf_base = pf["base"]["moneda"].upper()
+        qty_str = ""
+        if cantidad is not None:
+            qty_str = f"(cant: {int(cantidad)}) " if requires_integer_units(yfsym) else f"(cant: {cantidad}) "
+        unit_px_str = ""
+        if price_base is not None:
+            unit_px_str = f"a {(fmt_money_ars(price_base) if pf_base=='ARS' else fmt_money_usd(price_base))} c/u "
+        total_str = ""
+        if importe_base is not None:
+            total_str = f"(= {(fmt_money_ars(importe_base) if pf_base=='ARS' else fmt_money_usd(importe_base))})"
+        usado_post = await _pf_total_usado(chat_id)
+        restante_str = _restante_str(usado_post)
+        base_label = _label_long(sym if not sym.endswith("-USD") else sym.replace("-USD"," (USD)"))
+        det = f"Agregado {base_label} {qty_str}{unit_px_str}{total_str}.\nRestante: {restante_str}"
+        await update.message.reply_text(det)
 
-            det = (f"Agregado {base_label} {qty_str}{unit_px_str}{total_str}.\n"
-                   f"Restante: {_restante_str(usado_post)}")
-            await update.message.reply_text(det)
+        if context.user_data.get("pf_add_tipo"):
+            t = context.user_data["pf_add_tipo"]
+            if t == "accion":
+                await update.message.reply_text("Elegí la acción:", reply_markup=kb_pick_generic(ACCIONES_BA, "PF:ADD", "PF:PICK"))
+            elif t == "cedear":
+                await update.message.reply_text("Elegí el cedear:", reply_markup=kb_pick_generic(CEDEARS_BA, "PF:ADD", "PF:PICK"))
+            elif t == "bono":
+                await update.message.reply_text("Elegí el bono:", reply_markup=kb_pick_generic(BONOS_AR, "PF:ADD", "PF:PICK"))
+            elif t == "fci":
+                await update.message.reply_text("Elegí el FCI:", reply_markup=kb_pick_generic(FCI_LIST, "PF:ADD", "PF:PICK"))
+            elif t == "lete":
+                await update.message.reply_text("Elegí la Letra:", reply_markup=kb_pick_generic(LETES_LIST, "PF:ADD", "PF:PICK"))
+            elif t == "cripto":
+                await update.message.reply_text("Elegí la cripto:", reply_markup=kb_pick_generic(CRIPTO_TOP_NAMES, "PF:ADD", "PF:PICK"))
 
-        context.user_data["pf_mode"]=None
-        return
+        context.user_data["pf_mode"]=None; return
 
     # Ediciones
     if mode in ("edit_addq","edit_subq","edit_amt"):
@@ -1667,48 +1608,72 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Índice inválido."); context.user_data["pf_mode"]=None; return
         it = pf["items"][idx]
 
-        # precio actual en base
-        price_base = None; yfsym = it.get("simbolo")
+        price_native = None
+        yfsym = it.get("simbolo")
         async with ClientSession() as session:
             if yfsym and (yfsym.endswith(".BA") or yfsym.endswith("-USD")):
                 mets, _ = await metrics_for_symbols(session, [yfsym])
                 px = mets.get(yfsym,{}).get("last_px")
-                price_base = await price_in_base(session, pf, yfsym, px)
-
-            if mode == "edit_amt":
-                nuevo_importe = float(v)  # en base
-                usado_pre = await _pf_total_usado(chat_id)
-                usado_sin = usado_pre - float(it.get("importe") or 0.0)
-                if pf["monto"] > 0 and (usado_sin + nuevo_importe) > pf["monto"] + 1e-6:
-                    restante = pf["monto"] - usado_sin
-                    await update.message.reply_text(f"🚫 Te pasás del presupuesto. Restante: {_restante_str(max(0.0, restante))}"); return
-                it["importe"] = nuevo_importe
-                if price_base and price_base > 0:
-                    raw_qty = nuevo_importe/price_base
-                    it["cantidad"] = float(math.floor(raw_qty)) if (yfsym and requires_integer_units(yfsym)) else round(raw_qty, 6)
             else:
-                delta = float(v) if mode=="edit_addq" else -float(v)
-                cur = float(it.get("cantidad") or 0.0)
-                nueva_cant = cur + delta
-                if yfsym and requires_integer_units(yfsym): nueva_cant = float(max(0, math.floor(nueva_cant)))
-                else: nueva_cant = max(0.0, nueva_cant)
-                if price_base and price_base > 0:
-                    nuevo_importe = nueva_cant * float(price_base)
-                    usado_pre = await _pf_total_usado(chat_id)
-                    delta_importe = nuevo_importe - float((cur*price_base) if price_base else 0.0)
-                    if pf["monto"] > 0 and (usado_pre + delta_importe) > pf["monto"] + 1e-6:
-                        restante = pf["monto"] - usado_pre
-                        await update.message.reply_text(f"🚫 Te pasás del presupuesto. Restante: {_restante_str(max(0.0, restante))}"); return
-                    it["importe"] = nuevo_importe
-                it["cantidad"] = nueva_cant
+                px = None
+            tc_key = (pf_get(chat_id)["base"].get("tc") or "oficial").lower()
+            tc_val = await get_tc_value(session, tc_key)
+
+        pf_base = pf_get(chat_id)["base"]["moneda"].upper()
+        inst_moneda = "USD" if yfsym and yfsym.endswith("-USD") else "ARS"
+        price_base = None
+        if px is not None:
+            if pf_base == inst_moneda:
+                price_base = float(px)
+            else:
+                if tc_val and tc_val > 0:
+                    if pf_base == "ARS" and inst_moneda == "USD":
+                        price_base = float(px) * float(tc_val)
+                    elif pf_base == "USD" and inst_moneda == "ARS":
+                        price_base = float(px) / float(tc_val)
+
+        if mode == "edit_amt":
+            nuevo_importe = float(v)  # en MONEDA BASE
+            usado_pre = await _pf_total_usado(chat_id)
+            usado_sin = usado_pre - float(it.get("importe") or 0.0)
+            if pf["monto"] > 0 and (usado_sin + nuevo_importe) > pf["monto"] + 1e-6:
+                restante = pf["monto"] - usado_sin
+                pf_base = pf["base"]["moneda"].upper()
+                f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
+                await update.message.reply_text(f"🚫 Te pasás del presupuesto. Restante: {f_money(max(0.0, restante))}")
+                return
+            it["importe"] = nuevo_importe
+            if price_base and price_base > 0:
+                raw_qty = nuevo_importe/price_base
+                it["cantidad"] = float(math.floor(raw_qty)) if requires_integer_units(yfsym) else round(raw_qty, 6)
+        else:
+            delta = float(v) if mode=="edit_addq" else -float(v)
+            cur = float(it.get("cantidad") or 0.0)
+            nueva_cant = cur + delta
+            if requires_integer_units(yfsym): nueva_cant = float(max(0, math.floor(nueva_cant)))
+            else: nueva_cant = max(0.0, nueva_cant)
+            if price_base and price_base > 0:
+                nuevo_importe = nueva_cant * float(price_base)
+                usado_pre = await _pf_total_usado(chat_id)
+                delta_importe = nuevo_importe - float((cur*price_base) if price_base else 0.0)
+                if pf["monto"] > 0 and (usado_pre + delta_importe) > pf["monto"] + 1e-6:
+                    restante = pf["monto"] - usado_pre
+                    f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
+                    await update.message.reply_text(f"🚫 Te pasás del presupuesto. Restante: {f_money(max(0.0, restante))}")
+                    return
+                it["importe"] = nuevo_importe
+            it["cantidad"] = nueva_cant
 
         save_state()
         usado = await _pf_total_usado(chat_id)
-        await update.message.reply_text("Actualizado ✅ · Restante: " + _restante_str(usado))
+        pf_base = pf["base"]["moneda"].upper()
+        f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
+        await update.message.reply_text("Actualizado ✅ · Restante: " + f_money(max(0.0, pf["monto"]-usado)))
         context.user_data["pf_mode"]=None; return
 
 # ====== Rendimiento / Proyección de Portafolio ======
-async def pf_prices_and_tc(session: ClientSession, pf: Dict[str, Any]) -> Dict[str,float]:
+
+async def pf_prices_and_tc(session: ClientSession, pf: Dict[str, Any]) -> Tuple[Dict[str,float], Optional[float]]:
     syms = [it["simbolo"] for it in pf["items"] if it.get("simbolo")]
     syms = sorted(set(syms))
     prices: Dict[str, float] = {}
@@ -1716,34 +1681,41 @@ async def pf_prices_and_tc(session: ClientSession, pf: Dict[str, Any]) -> Dict[s
         mets, _ = await metrics_for_symbols(session, syms)
         for s in syms:
             px = mets.get(s,{}).get("last_px")
-            if px is not None:
-                px_base = await price_in_base(session, pf, s, float(px))
-                if px_base is not None: prices[s] = float(px_base)
-    return prices
+            if px is not None: prices[s] = float(px)
+    tc_val = None
+    if pf["base"]["moneda"].upper() == "ARS": tc_val = None
+    else: pass
+    return prices, tc_val
 
 async def pf_show_return(q, chat_id: int):
     pf = pf_get(chat_id)
     if not pf["items"]:
         await q.message.reply_text("Tu portafolio está vacío. Agregá instrumentos primero."); return
+    pf_base = pf["base"]["moneda"].upper()
+    f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
     async with ClientSession() as session:
-        prices = await pf_prices_and_tc(session, pf)
-    total_invertido = 0.0; total_actual = 0.0
-    base_fmt = fmt_money_ars if pf['base']['moneda']=='ARS' else fmt_money_usd
-    lines = ["<b>📈 Rendimiento del portafolio (aprox.)</b>"]
-    for it in pf["items"]:
-        simb = it.get("simbolo",""); inv = float(it.get("importe") or 0.0)  # guardado en base
-        val_act = inv
-        if simb in prices and it.get("cantidad") is not None:
-            val_act = float(prices[simb]) * float(it["cantidad"])
-        total_invertido += inv; total_actual += val_act
-        delta = val_act - inv; r = (delta / inv * 100.0) if inv > 0 else 0.0
-        lines.append(f"• {_label_long(simb)}: {base_fmt(val_act)} ({pct(r,2)})")
-    delta_t = total_actual - total_invertido; r_t = (delta_t/total_invertido*100.0) if total_invertido>0 else 0.0
-    lines.append(f"\nInvertido: {base_fmt(total_invertido)}")
-    lines.append(f"Valor actual: {base_fmt(total_actual)}")
-    lines.append(f"Variación: {base_fmt(delta_t)} ({pct(r_t,2)})")
-    kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:BACK")]])
-    await q.message.reply_text("\n".join(lines), reply_markup=kb_back, parse_mode=ParseMode.HTML)
+        prices, _ = await pf_prices_and_tc(session, pf)
+        total_invertido = 0.0; total_actual = 0.0
+        lines = ["<b>📈 Rendimiento del portafolio (aprox.)</b>"]
+        for it in pf["items"]:
+            simb = it.get("simbolo","")
+            inv = float(it.get("importe") or 0.0)  # en MONEDA BASE
+            val_act = inv
+            if simb in prices and it.get("cantidad") is not None:
+                # NOTA: al cargar guardamos importe en BASE, así que para retorno usamos ese importe (proxy)
+                # y mostramos el actual como inv si no se recompone con precio_base momentáneo.
+                val_act = inv
+            total_invertido += inv; total_actual += val_act
+            delta = val_act - inv
+            r = (delta / inv * 100.0) if inv > 0 else 0.0
+            lines.append(f"• {_label_long(simb)}: {f_money(val_act)} ({pct(r,2)})")
+        delta_t = total_actual - total_invertido
+        r_t = (delta_t/total_invertido*100.0) if total_invertido>0 else 0.0
+        lines.append(f"\nInvertido: {f_money(total_invertido)}")
+        lines.append(f"Valor actual: {f_money(total_actual)}")
+        lines.append(f"Variación: {f_money(delta_t)} ({pct(r_t,2)})")
+        kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:BACK")]])
+        await q.message.reply_text("\n".join(lines), reply_markup=kb_back)
 
 async def pf_show_projection(q, chat_id: int):
     pf = pf_get(chat_id)
@@ -1753,54 +1725,32 @@ async def pf_show_projection(q, chat_id: int):
         syms = [it["simbolo"] for it in pf["items"] if it.get("simbolo") and (it["simbolo"].endswith(".BA") or it["simbolo"].endswith("-USD"))]
         syms = sorted(set(syms))
         mets, last_ts = await metrics_for_symbols(session, syms) if syms else ({}, None)
-        prices = await pf_prices_and_tc(session, pf)
-
-    valores = []; total_val = 0.0
-    for it in pf["items"]:
-        s = it.get("simbolo","")
-        if s in prices and it.get("cantidad") is not None:
-            v = float(prices[s]) * float(it["cantidad"])
-        else:
-            v = float(it.get("importe") or 0.0)
-        valores.append((s, v)); total_val += v
-    if total_val <= 0:
-        await q.message.reply_text("Sin valores suficientes para proyectar."); return
-
-    w3 = 0.0; w6 = 0.0; detail = []
-    for s, v in valores:
-        w = v/total_val
-        m = mets.get(s, {})
-        p3 = projection_3m(m) if m else 0.0
-        p6 = projection_6m(m) if m else 0.0
-        w3 += w*p3; w6 += w*p6
-        if s in mets:
-            detail.append(f"• {_label_short(s)} → 3M {pct(p3,1)} | 6M {pct(p6,1)} (peso {pct(w*100,1)})")
-
-    fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-    lines = [f"<b>🔮 Proyección del Portafolio</b>" + (f" <i>Últ. dato: {fecha}</i>" if fecha else ""),
-             f"Proyección 3M (aprox): {pct(w3,1)}",
-             f"Proyección 6M (aprox): {pct(w6,1)}", "", *detail]
-    kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:BACK")]])
-    await q.message.reply_text("\n".join(lines), reply_markup=kb_back, parse_mode=ParseMode.HTML)
-
-# ============================ RESUMEN DIARIO ============================
-async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    async with ClientSession() as session:
-        fx = await get_dolares(session)
-        rp = await get_riesgo_pais(session)
-        infl = await get_inflacion_mensual(session)
-        rv = await get_reservas_lamacro(session)
-        news = await fetch_rss_entries(session, 5)
-
-    lines = []
-    if fx:  lines.append(format_dolar_message(fx))
-    if rp:  lines.append(f"<b>📈 Riesgo País</b> {rp[0]} pb")
-    if infl:lines.append(f"<b>📉 Inflación</b> {str(round(infl[0],1)).replace('.',',')}%")
-    if rv:  lines.append(f"<b>🏦 Reservas</b> {fmt_number(rv[0],0)} MUS$")
-    lines.append(format_news_block(news or []))
-    await update.effective_message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=False))
+        prices, _ = await pf_prices_and_tc(session, pf)
+        valores = []; total_val = 0.0
+        for it in pf["items"]:
+            s = it.get("simbolo","")
+            v = float(it.get("importe") or 0.0)  # Importe ya en MONEDA BASE
+            valores.append((s, v)); total_val += v
+        if total_val <= 0:
+            await q.message.reply_text("Sin valores suficientes para proyectar."); return
+        w3 = 0.0; w6 = 0.0; detail = []
+        for s, v in valores:
+            w = v/total_val
+            m = mets.get(s, {})
+            p3 = projection_3m(m) if m else 0.0
+            p6 = projection_6m(m) if m else 0.0
+            w3 += w*p3; w6 += w*p6
+            if s in mets:
+                detail.append(f"• {_label_short(s)} → 3M {pct(p3,1)} | 6M {pct(p6,1)} (peso {pct(w*100,1)})")
+        fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
+        lines = [f"<b>🔮 Proyección del Portafolio</b>" + (f" <i>Últ. dato: {fecha}</i>" if fecha else ""),
+                 f"Proyección 3M (aprox): {pct(w3,1)}",
+                 f"Proyección 6M (aprox): {pct(w6,1)}", "", *detail]
+        kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:BACK")]])
+        await q.message.reply_text("\n".join(lines), reply_markup=kb_back)
 
 # ============================ WEBHOOK / APP ============================
+
 async def keepalive_loop(app: Application):
     await asyncio.sleep(5)
     url = f"{BASE_URL}/"; timeout = ClientTimeout(total=6)
@@ -1813,98 +1763,140 @@ async def keepalive_loop(app: Application):
                 log.warning("Keepalive error: %s", e)
             await asyncio.sleep(300)
 
-async def healthcheck(request):
-    return web.Response(text="OK")
-
-# ============================ STARTUP ============================
-defaults = Defaults(parse_mode=ParseMode.HTML, tzinfo=TZ, link_preview_options=LinkPreviewOptions(is_disabled=False))
-application = Application.builder().token(TELEGRAM_TOKEN).defaults(defaults).build()
-
-# Comandos
-application.add_handler(CommandHandler("start", lambda u,c: u.effective_message.reply_text(
-    "Hola! Comandos:\n/dolar\n/economia\n/acciones\n/cedears\n/alertas_menu\n/portafolio\n/subs\n/resumen",
-    disable_web_page_preview=True)))
-application.add_handler(CommandHandler("dolar", cmd_dolar))
-application.add_handler(CommandHandler("economia", cmd_menu_economia))
-application.add_handler(CommandHandler("acciones", cmd_acciones_menu))
-application.add_handler(CommandHandler("cedears", cmd_cedears_menu))
-application.add_handler(CommandHandler("alertas_menu", cmd_alertas_menu))
-application.add_handler(CommandHandler("portafolio", cmd_portafolio))
-application.add_handler(CommandHandler("subs", cmd_subs))
-application.add_handler(CommandHandler("resumen", cmd_resumen_diario))
-
-# Callbacks
-application.add_handler(CallbackQueryHandler(econ_cb, pattern=r"^ECO:"))
-application.add_handler(CallbackQueryHandler(acc_ced_cb, pattern=r"^(ACC|CED):"))
-application.add_handler(CallbackQueryHandler(alertas_menu_cb, pattern=r"^AL:"))
-application.add_handler(CallbackQueryHandler(alertas_clear_cb, pattern=r"^CLR:"))
-application.add_handler(CallbackQueryHandler(alertas_add_start, pattern=r"^AL:ADD$"))
-application.add_handler(CallbackQueryHandler(alertas_add_kind, pattern=r"^KIND:"))
-application.add_handler(CallbackQueryHandler(alertas_back, pattern=r"^BACK:"))
-application.add_handler(CallbackQueryHandler(alertas_add_fx_type, pattern=r"^FXTYPE:"))
-application.add_handler(CallbackQueryHandler(alertas_add_fx_side, pattern=r"^SIDE:"))
-application.add_handler(CallbackQueryHandler(alertas_add_metric_type, pattern=r"^METRIC:"))
-application.add_handler(CallbackQueryHandler(alertas_add_ticker_cb, pattern=r"^TICK:"))
-application.add_handler(CallbackQueryHandler(cmd_alertas_pause, pattern=r"^AL:PAUSE$"))
-application.add_handler(CallbackQueryHandler(alerts_pause_cb, pattern=r"^AP:"))
-application.add_handler(CallbackQueryHandler(pf_menu_cb, pattern=r"^PF:"))
-
-# Mensajes (texto)
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pf_text_input))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, alertas_add_value))
-
-# Conversaciones para /subs
-subs_conv = ConversationHandler(
-    entry_points=[CommandHandler("subs", cmd_subs)],
-    states={SUBS_SET_TIME: [CallbackQueryHandler(subs_cb, pattern=r"^SUBS:")]},
-    fallbacks=[],
-)
-application.add_handler(subs_conv)
+async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async with ClientSession() as session:
+        fx = await get_dolares(session)
+        rp = await get_riesgo_pais(session)
+        infl = await get_inflacion_mensual(session)
+        rv = await get_reservas_lamacro(session)
+        news = await fetch_rss_entries(session, 5)
+    lines = []
+    if fx:   lines.append(format_dolar_message(fx))
+    if rp:   lines.append(f"<b>📈 Riesgo País</b> {rp[0]} pb")
+    if infl: lines.append(f"<b>📉 Inflación</b> {str(round(infl[0],1)).replace('.',',')}%")
+    if rv:   lines.append(f"<b>🏦 Reservas</b> {fmt_number(rv[0],0)} MUS$")
+    lines.append(format_news_block(news or []))
+    await update.effective_message.reply_text("\n\n".join(lines))
 
 async def on_startup(app: web.Application):
-    if not TELEGRAM_TOKEN:
-        log.error("TELEGRAM_TOKEN no configurado.")
-        raise RuntimeError("TELEGRAM_TOKEN no configurado.")
-
     load_state()
     await application.initialize()
     await application.start()
-
-    # Set webhook
-    await application.bot.set_webhook(WEBHOOK_URL, allowed_updates=["message","callback_query"])
-
-    # Comandos visibles
-    await application.bot.set_my_commands([
-        BotCommand("dolar","Tipos de cambio"),
-        BotCommand("economia","Menú economía"),
-        BotCommand("acciones","Menú acciones .BA"),
-        BotCommand("cedears","Menú cedears .BA"),
-        BotCommand("alertas_menu","Alertas"),
-        BotCommand("portafolio","Menú portafolio"),
-        BotCommand("subs","Suscripción diaria"),
-        BotCommand("resumen","Resumen diario"),
-    ])
-
-    # Jobs programados
-    for chat_id, conf in SUBS.items():
-        hhmm = conf.get("daily")
-        if hhmm:
-            h, m = [int(x) for x in hhmm.split(":")]
-            application.job_queue.run_daily(_job_send_daily, time=dtime(hour=h, minute=m, tzinfo=TZ), chat_id=chat_id, name=f"daily_{chat_id}")
-
-    # Loops
-    application.create_task(alerts_loop(application))
-    application.create_task(keepalive_loop(application))
+    await application.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=["message","callback_query"], drop_pending_updates=True)
+    cmds = [
+        BotCommand("cedears", "Menú Cedears"),
+        BotCommand("acciones", "Menú Acciones"),
+        BotCommand("economia", "Menú Economía"),
+        BotCommand("alertas_menu", "Menú Alertas"),
+        BotCommand("suscripciones", "Suscripción"),
+        BotCommand("portafolio", "Menú Portafolio"),
+    ]
+    try:
+        await application.bot.set_my_commands(cmds)
+    except Exception as e:
+        log.warning("set_my_commands error: %s", e)
+    log.info("Webhook set: %s", WEBHOOK_URL)
+    _schedule_all_subs(application)
+    asyncio.create_task(keepalive_loop(application))
+    asyncio.create_task(alerts_loop(application))
 
 async def on_cleanup(app: web.Application):
-    await application.stop()
-    await application.shutdown()
-    save_state()
+    await application.stop(); await application.shutdown()
 
-app = web.Application()
-app.on_startup.append(on_startup)
-app.on_cleanup.append(on_cleanup)
-app.add_routes([web.get("/", healthcheck), web.post(WEBHOOK_PATH, application.update_queue.put_nowait)])
+async def handle_root(request: web.Request): return web.Response(text="ok", status=200)
 
+async def handle_webhook(request: web.Request):
+    if request.method != "POST": return web.Response(text="Method Not Allowed", status=405)
+    try: data = await request.json()
+    except Exception: return web.Response(text="Bad Request", status=400)
+    update = Update.de_json(data, application.bot)
+    await application.process_update(update)
+    return web.Response(text="OK", status=200)
+
+def build_web_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    app.router.add_post(WEBHOOK_PATH, handle_webhook)
+    app.on_startup.append(on_startup); app.on_cleanup.append(on_cleanup)
+    return app
+
+defaults = Defaults(parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True), tzinfo=TZ)
+application = Application.builder().token(TELEGRAM_TOKEN).defaults(defaults).updater(None).build()
+
+# ---- Handlers raíz/menús ----
+application.add_handler(CommandHandler("acciones", cmd_acciones_menu))
+application.add_handler(CommandHandler("cedears", cmd_cedears_menu))
+application.add_handler(CallbackQueryHandler(acc_ced_cb, pattern=r"^(ACC:(TOP3|TOP5)|CED:(TOP3|TOP5))$"))
+
+application.add_handler(CommandHandler("economia", cmd_menu_economia))
+application.add_handler(CallbackQueryHandler(econ_cb, pattern=r"^ECO:(DOLAR|RESERVAS|INFLACION|RIESGO|NOTICIAS)$"))
+
+application.add_handler(CommandHandler("alertas_menu", cmd_alertas_menu))
+application.add_handler(CallbackQueryHandler(alertas_menu_cb, pattern=r"^AL:(LIST|CLEAR|PAUSE|RESUME)$"))
+
+application.add_handler(CommandHandler("portafolio", cmd_portafolio))
+application.add_handler(CallbackQueryHandler(
+    pf_menu_cb,
+    pattern=r"^PF:(HELP|SETBASE|SETMONTO|ADD|LIST|EDIT|RET|PROJ|CLEAR|BASE:.*|ADD:.*|PICK:.*|ED:ADDQ|ED:SUBQ|ED:AMT|ED:DEL|BACK|EDIT:\d+|ADDQTY|ADDAMT|ADDPCT)$"
+))
+
+# ---- Suscripciones ----
+application.add_handler(CommandHandler("suscripciones", cmd_subs))
+application.add_handler(CallbackQueryHandler(subs_cb, pattern=r"^SUBS:(T:..:..|OFF|CLOSE)$"))
+
+# ---- Comandos directos macro
+application.add_handler(CommandHandler("dolar", cmd_dolar))
+application.add_handler(CommandHandler("reservas", cmd_reservas))
+application.add_handler(CommandHandler("inflacion", cmd_inflacion))
+application.add_handler(CommandHandler("riesgo", cmd_riesgo))
+application.add_handler(CommandHandler("noticias", cmd_noticias))
+
+# ---- Alertas: clear/pause/resume + Conversación Agregar Alerta
+application.add_handler(CallbackQueryHandler(alertas_clear_cb, pattern=r"^CLR:(\d+|ALL|CANCEL)$"))
+application.add_handler(CommandHandler("alertas_clear", cmd_alertas_clear))
+application.add_handler(CommandHandler("alertas_pause", cmd_alertas_pause))
+application.add_handler(CallbackQueryHandler(alerts_pause_cb, pattern=r"^AP:(PAUSE:(INF|1|3|6|12|24)|RESUME|CLOSE)$"))
+application.add_handler(CommandHandler("alertas_resume", cmd_alertas_resume))
+
+conv_alertas = ConversationHandler(
+    entry_points=[CommandHandler("alertas_add", alertas_add_start),
+                  CallbackQueryHandler(alertas_add_start, pattern=r"^AL:ADD$")],
+    states={
+        AL_KIND: [CallbackQueryHandler(alertas_add_kind, pattern=r"^KIND:(fx|metric|acciones|cedears)$"),
+                  CallbackQueryHandler(alertas_back, pattern=r"^BACK:KIND$"),
+                  CallbackQueryHandler(lambda u,c: c.application.bot.send_message(u.effective_chat.id,"Cancelado."), pattern=r"^CANCEL$")],
+        AL_FX_TYPE: [CallbackQueryHandler(alertas_add_fx_type, pattern=r"^FXTYPE:(oficial|mayorista|blue|mep|ccl|tarjeta|cripto)$"),
+                     CallbackQueryHandler(alertas_back, pattern=r"^BACK:FXTYPE$"),
+                     CallbackQueryHandler(lambda u,c: ConversationHandler.END, pattern=r"^CANCEL$")],
+        AL_FX_SIDE: [CallbackQueryHandler(alertas_add_fx_side, pattern=r"^SIDE:(venta|compra)$"),
+                     CallbackQueryHandler(alertas_back, pattern=r"^BACK:FXSIDE$"),
+                     CallbackQueryHandler(lambda u,c: ConversationHandler.END, pattern=r"^CANCEL$")],
+        AL_METRIC_TYPE: [CallbackQueryHandler(alertas_add_metric_type, pattern=r"^METRIC:(riesgo|inflacion|reservas)$"),
+                         CallbackQueryHandler(alertas_back, pattern=r"^BACK:METRIC$"),
+                         CallbackQueryHandler(lambda u,c: ConversationHandler.END, pattern=r"^CANCEL$")],
+        AL_TICKER: [CallbackQueryHandler(alertas_add_ticker_cb, pattern=r"^TICK:[A-Z0-9\.\-]+$"),
+                    CallbackQueryHandler(alertas_back, pattern=r"^BACK:(TICKERS_ACC|TICKERS_CEDEARS)$"),
+                    CallbackQueryHandler(lambda u,c: ConversationHandler.END, pattern=r"^CANCEL$")],
+        AL_OP: [CallbackQueryHandler(alertas_add_op, pattern=r"^OP:(>|<)$"),
+                CallbackQueryHandler(alertas_back, pattern=r"^BACK:OP$"),
+                CallbackQueryHandler(alertas_back, pattern=r"^BACK:(TICKERS_ACC|TICKERS_CEDEARS|FXSIDE|METRIC)$"),
+                CallbackQueryHandler(lambda u,c: ConversationHandler.END, pattern=r"^CANCEL$")],
+        AL_MODE: [CallbackQueryHandler(alertas_add_mode, pattern=r"^MODE:(absolute|percent)$"),
+                  CallbackQueryHandler(alertas_back, pattern=r"^BACK:MODE$"),
+                  CallbackQueryHandler(alertas_back, pattern=r"^BACK:OP$"),
+                  CallbackQueryHandler(lambda u,c: ConversationHandler.END, pattern=r"^CANCEL$")],
+        AL_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, alertas_add_value)],
+    },
+    fallbacks=[CallbackQueryHandler(lambda u,c: ConversationHandler.END, pattern=r"^CANCEL$")],
+    name="conv_alertas",
+    persistent=False,
+)
+application.add_handler(conv_alertas)
+
+# ---- Handler genérico de texto del Portafolio (AL FINAL)
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pf_text_input))
+
+# Run aiohttp app
 if __name__ == "__main__":
-    web.run_app(app, port=PORT)
+    app = build_web_app()
+    web.run_app(app, host="0.0.0.0", port=PORT)
