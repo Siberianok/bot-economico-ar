@@ -46,7 +46,7 @@ async def fetch_oficial_blue() -> list[Quote]:
     names = ("oficial", "blue", "mep", "ccb", "ccl")
     results: list[Quote] = []
     for name in names:
-        data = await http.fetch_json(f"{DOLARAPI_BASE}/cotizaciones/{name}")
+        data = await http.fetch_json(f"{DOLARAPI_BASE}/dolares/{name}")
         ts = data.get("fechaActualizacion")
         timestamp = datetime.fromisoformat(ts) if isinstance(ts, str) else None
         results.append(
