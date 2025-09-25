@@ -1,32 +1,32 @@
-from __future__ import annotations
-
-from datetime import datetime
-
-from .http import get_http_client
-from .models import ReserveStatus
+# bot_econ/data_sources/reserves.py
+# -*- coding: utf-8 -*-
+from typing import Optional, Tuple
+import re
+from . import http
 
 LAMACRO_RESERVAS_URL = "https://www.lamacro.ar/variables/1"
 
-
-async def fetch_reserves() -> ReserveStatus:
-    http = await get_http_client()
-    payload = await http.fetch_json(LAMACRO_RESERVAS_URL)
-    latest = payload.get("data", [{}])[-1]
-    total = _try_float(latest.get("valor"))
-    variation = _try_float(latest.get("variacion_diaria"))
-    date_str = latest.get("fecha")
-    date = datetime.fromisoformat(date_str) if isinstance(date_str, str) else None
-    return ReserveStatus(total=total, variation=variation, date=date)
-
-
-def _try_float(value: float | int | str | None) -> float | None:
-    if value is None:
+async def fetch_reserves() -> Optional[Tuple[float, Optional[str]]]:
+    """
+    Devuelve (valor_en_MUS$, fecha_dd/mm/aaaa) o None si falla.
+    Parsea la página HTML de LaMacro.
+    """
+    html = await http.fetch_text(LAMACRO_RESERVAS_URL)
+    if not html:
         return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        try:
-            return float(value)
-        except ValueError:
-            return None
-    return None
+
+    # Ejemplos a cubrir:
+    # "Último dato : 28.123,4" o "Valor actual : 28.123,4"
+    m_val = re.search(r"(?:Último dato|Valor actual)\s*:\s*([0-9\.\,]+)", html)
+    if not m_val:
+        return None
+
+    raw = m_val.group(1).replace(".", "").replace(",", ".")
+    try:
+        val = float(raw)
+    except Exception:
+        return None
+
+    m_date = re.search(r"([0-3]\d/[0-1]\d/\d{4})", html)
+    fecha = m_date.group(1) if m_date else None
+    return (val, fecha)
