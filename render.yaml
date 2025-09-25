@@ -4,7 +4,7 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot_econ_full_plus_rank_alerts.py
+    startCommand: python -m bot_econ.main
     envVars:
       - key: TELEGRAM_TOKEN          # cargalo en el panel de Render (Environment)
         sync: false
@@ -19,6 +19,8 @@ services:
         value: "10000"
       - key: STATE_PATH              # opcional pero recomendado para persistir estado
         value: /data/state.json
+      - key: REDIS_URL
+        sync: false
       - key: PYTHON_VERSION          # fija la versión de Python en Render
         value: 3.11.9
     disk:                            # opcional: persistencia entre deploys/restarts
