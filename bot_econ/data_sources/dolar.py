@@ -6,17 +6,28 @@ Fuentes de cotizaciones de dólares para Argentina.
 
 Expone:
     - fetch_dolar_quotes() -> dict[str, dict]
-        Devuelve un diccionario con claves:
-        {oficial, mayorista, blue, mep, ccl, tarjeta, cripto}
-        Cada valor: {"compra": float|None, "venta": float|None, "fuente": str, "fecha": str|None}
+        Devuelve:
+        {
+          "oficial": {"compra": float|None, "venta": float|None, "fuente": str, "fecha": str|None},
+          "mayorista": {...},
+          "blue": {...},
+          "mep": {...},
+          "ccl": {...},
+          "tarjeta": {...},
+          "cripto": {...}
+        }
+
+    - fetch_oficial_blue() -> dict[str, dict]
+        Compatibilidad para pipelines anteriores. Devuelve solo
+        {"oficial": {...}, "blue": {...}} (si están disponibles).
 
 Notas:
-    - Path de MEP en DolarAPI es /dolares/bolsa  ✅
-    - Path de CCL en DolarAPI es /dolares/contadoconliqui  ✅
+    - Path de MEP en DolarAPI es /dolares/bolsa
+    - Path de CCL en DolarAPI es /dolares/contadoconliqui
     - Para "cripto" usamos CriptoYa como fuente primaria.
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 import logging
 from . import http  # helper async con fetch_json / fetch_text
 
@@ -30,12 +41,19 @@ _DOLARAPI_PATHS: Dict[str, str] = {
     "oficial":   "/dolares/oficial",
     "mayorista": "/dolares/mayorista",
     "blue":      "/dolares/blue",
-    "mep":       "/dolares/bolsa",              # 👈 CORRECTO
-    "ccl":       "/dolares/contadoconliqui",    # 👈 CORRECTO
+    "mep":       "/dolares/bolsa",              # ✅ correcto
+    "ccl":       "/dolares/contadoconliqui",    # ✅ correcto
     "tarjeta":   "/dolares/tarjeta",
-    # "cripto":  No está estandarizado en DolarAPI; lo tomamos de CriptoYa
+    # "cripto":  no estandar en DolarAPI; tomamos CriptoYa
 }
 
+# -------------------------- helpers --------------------------
+
+def _coerce_float(x: Any) -> Optional[float]:
+    try:
+        return float(x) if x is not None else None
+    except Exception:
+        return None
 
 async def _fetch_from_dolarapi(kind: str) -> Optional[Dict[str, Any]]:
     """
@@ -56,23 +74,12 @@ async def _fetch_from_dolarapi(kind: str) -> Optional[Dict[str, Any]]:
     if not isinstance(data, dict):
         return None
 
-    # Algunos endpoints devuelven { compra, venta, fechaActualizacion/fecha }
-    compra = data.get("compra")
-    venta = data.get("venta")
+    compra = _coerce_float(data.get("compra"))
+    venta = _coerce_float(data.get("venta"))
     fecha = data.get("fechaActualizacion") or data.get("fecha")
-
-    try:
-        compra = float(compra) if compra is not None else None
-    except Exception:
-        compra = None
-
-    try:
-        venta = float(venta) if venta is not None else None
-    except Exception:
-        venta = None
-
+    if compra is None and venta is None:
+        return None
     return {"compra": compra, "venta": venta, "fuente": "DolarAPI", "fecha": fecha}
-
 
 async def _fetch_cripto_from_criptoya() -> Optional[Dict[str, Any]]:
     """
@@ -89,28 +96,26 @@ async def _fetch_cripto_from_criptoya() -> Optional[Dict[str, Any]]:
 
     # CriptoYa suele exponer: { "cripto": {"compra": x, "venta": y}, ... }
     cr = data.get("cripto") or data.get("crypto") or {}
-    compra = cr.get("compra") or cr.get("buy")
-    venta = cr.get("venta") or cr.get("sell")
-
-    try:
-        compra = float(compra) if compra is not None else None
-    except Exception:
-        compra = None
-    try:
-        venta = float(venta) if venta is not None else None
-    except Exception:
-        venta = None
+    compra = _coerce_float(cr.get("compra") or cr.get("buy"))
+    venta  = _coerce_float(cr.get("venta")  or cr.get("sell"))
 
     if compra is None and venta is None:
         return None
-
     return {"compra": compra, "venta": venta, "fuente": "CriptoYa", "fecha": None}
 
+def _safe_from_criptoya_block(block: Any) -> Tuple[Optional[float], Optional[float]]:
+    if not isinstance(block, dict):
+        return (None, None)
+    c = _coerce_float(block.get("compra") or block.get("buy"))
+    v = _coerce_float(block.get("venta")  or block.get("sell"))
+    return (c, v)
+
+# -------------------------- API pública --------------------------
 
 async def fetch_dolar_quotes() -> Dict[str, Dict[str, Any]]:
     """
     Punto de entrada utilizado por metrics_pipeline.fetch_summary().
-    Arma un mapa con todas las cotizaciones relevantes.
+    Devuelve todas las cotizaciones relevantes.
     """
     out: Dict[str, Dict[str, Any]] = {}
 
@@ -125,44 +130,40 @@ async def fetch_dolar_quotes() -> Dict[str, Dict[str, Any]]:
     if cripto:
         out["cripto"] = cripto
 
-    # 3) Fallback simple: si algo faltó, intentamos rellenar con CriptoYa.
-    #    (CriptoYa también devuelve 'mep' y 'ccl' en algunos casos)
+    # 3) Fallbacks desde CriptoYa cuando DolarAPI no devuelve algo
     try:
         cy = await http.fetch_json(CRYPTOYA_DOLAR_URL)
     except Exception:
         cy = None
 
-    def _safe_get(block: Any) -> (Optional[float], Optional[float]):
-        if not isinstance(block, dict):
-            return (None, None)
-        c = block.get("compra") or block.get("buy")
-        v = block.get("venta") or block.get("sell")
-        try:
-            c = float(c) if c is not None else None
-        except Exception:
-            c = None
-        try:
-            v = float(v) if v is not None else None
-        except Exception:
-            v = None
-        return (c, v)
-
     if isinstance(cy, dict):
-        # mep
+        # mep / ccl
         if "mep" not in out:
-            c, v = _safe_get(cy.get("mep"))
+            c, v = _safe_from_criptoya_block(cy.get("mep"))
             if c is not None or v is not None:
                 out["mep"] = {"compra": c, "venta": v, "fuente": "CriptoYa", "fecha": None}
-        # ccl
         if "ccl" not in out:
-            c, v = _safe_get(cy.get("ccl"))
+            c, v = _safe_from_criptoya_block(cy.get("ccl"))
             if c is not None or v is not None:
                 out["ccl"] = {"compra": c, "venta": v, "fuente": "CriptoYa", "fecha": None}
-        # oficial/blue mayorista (si faltaran)
+        # oficial/blue/mayorista
         for alias in ("oficial", "mayorista", "blue"):
             if alias not in out:
-                c, v = _safe_get(cy.get(alias))
+                c, v = _safe_from_criptoya_block(cy.get(alias))
                 if c is not None or v is not None:
                     out[alias] = {"compra": c, "venta": v, "fuente": "CriptoYa", "fecha": None}
 
+    return out
+
+async def fetch_oficial_blue() -> Dict[str, Dict[str, Any]]:
+    """
+    Compatibilidad con pipelines viejos.
+    Devuelve solo oficial y blue (si existen).
+    """
+    quotes = await fetch_dolar_quotes()
+    out: Dict[str, Dict[str, Any]] = {}
+    if "oficial" in quotes:
+        out["oficial"] = quotes["oficial"]
+    if "blue" in quotes:
+        out["blue"] = quotes["blue"]
     return out
