@@ -1,29 +1,20 @@
 services:
-  - type: web
+  - type: worker
     name: bot-economico-ar
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python -m bot_econ.main
     envVars:
-      - key: TELEGRAM_TOKEN          # cargalo en el panel de Render (Environment)
+      - key: TELEGRAM_TOKEN
         sync: false
-      - key: WEBHOOK_SECRET          # elegí algo único, sin "/"
-        value: tgwebhook-secret
-      - key: BASE_URL                # Render completa con la URL pública del servicio
-        fromService:
-          type: web
-          name: bot-economico-ar
-          property: url
-      - key: PORT
-        value: "10000"
-      - key: STATE_PATH              # opcional pero recomendado para persistir estado
+      - key: STATE_PATH
         value: /data/state.json
+      - key: PYTHON_VERSION
+        value: 3.11.9
       - key: REDIS_URL
         sync: false
-      - key: PYTHON_VERSION          # fija la versión de Python en Render
-        value: 3.11.9
-    disk:                            # opcional: persistencia entre deploys/restarts
+    disk:
       name: data
       mountPath: /data
       sizeGB: 1
