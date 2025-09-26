@@ -1,7 +1,7 @@
 # bot_econ_full_plus_rank_alerts.py
 # -*- coding: utf-8 -*-
 
-import os, asyncio, logging, re, html as _html, json, math, io, signal
+import os, asyncio, logging, re, html as _html, json, math, io, signal, csv, unicodedata
 import urllib.request
 import urllib.error
 from time import time
@@ -112,6 +112,47 @@ TICKER_NAME = {
 NAME_ABBR = {k: (v.split()[0] if ".BA" in k else v.split()[0]) for k,v in TICKER_NAME.items()}
 def bono_moneda(sym: str) -> str: return "USD" if sym.endswith("D") else "ARS"
 
+def _sanitize_match(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text or "")
+    stripped = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return re.sub(r"[^A-Z0-9]", "", stripped.upper())
+
+PF_SYMBOL_LOOKUP: Dict[str, Tuple[str, str]] = {}
+PF_SYMBOL_SANITIZED_LOOKUP: Dict[str, Tuple[str, str]] = {}
+PF_NAME_LOOKUP: Dict[str, Tuple[str, str]] = {}
+
+def _register_pf_symbol(symbol: str, tipo: str):
+    key = symbol.upper()
+    PF_SYMBOL_LOOKUP[key] = (symbol, tipo)
+    PF_SYMBOL_SANITIZED_LOOKUP[_sanitize_match(symbol)] = (symbol, tipo)
+    if symbol.endswith(".BA"):
+        base = symbol[:-3]
+        PF_SYMBOL_LOOKUP[base.upper()] = (symbol, tipo)
+        PF_SYMBOL_SANITIZED_LOOKUP[_sanitize_match(base)] = (symbol, tipo)
+
+for sym in ACCIONES_BA:
+    _register_pf_symbol(sym, "accion")
+for sym in CEDEARS_BA:
+    _register_pf_symbol(sym, "cedear")
+for sym in BONOS_AR:
+    _register_pf_symbol(sym, "bono")
+for sym in FCI_LIST:
+    _register_pf_symbol(sym, "fci")
+for sym in LETES_LIST:
+    _register_pf_symbol(sym, "lete")
+for cname in CRIPTO_TOP_NAMES:
+    csym = _crypto_to_symbol(cname)
+    _register_pf_symbol(csym, "cripto")
+    PF_SYMBOL_LOOKUP[cname.upper()] = (csym, "cripto")
+    PF_SYMBOL_SANITIZED_LOOKUP[_sanitize_match(cname)] = (csym, "cripto")
+
+for sym, name in TICKER_NAME.items():
+    entry = PF_SYMBOL_LOOKUP.get(sym.upper())
+    if entry:
+        PF_NAME_LOOKUP[_sanitize_match(name)] = entry
+
+CEDEARS_SET = {sym.upper() for sym in CEDEARS_BA}
+
 def label_with_currency(sym: str) -> str:
     if sym.endswith(".BA"):
         base = f"{TICKER_NAME.get(sym, sym)} ({sym})"
@@ -127,6 +168,30 @@ def label_with_currency(sym: str) -> str:
     return sym
 
 def requires_integer_units(sym: str) -> bool: return sym.endswith(".BA")
+
+def pf_guess_symbol(raw: str) -> Optional[Tuple[str, str]]:
+    if not raw:
+        return None
+    query = raw.strip()
+    if not query:
+        return None
+    key = query.upper()
+    entry = PF_SYMBOL_LOOKUP.get(key)
+    if entry:
+        return entry
+    sanitized = _sanitize_match(query)
+    entry = PF_SYMBOL_SANITIZED_LOOKUP.get(sanitized)
+    if entry:
+        return entry
+    entry = PF_NAME_LOOKUP.get(sanitized)
+    if entry:
+        return entry
+    if key.endswith(".BA"):
+        tipo = "cedear" if key in CEDEARS_SET else "accion"
+        return key, tipo
+    if key.endswith("-USD"):
+        return key, "cripto"
+    return None
 
 def instrument_currency(sym: str, tipo: str) -> str:
     s = (sym or "").upper()
@@ -1477,8 +1542,64 @@ def kb_pf_main() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Agregar instrumento", callback_data="PF:ADD")],
         [InlineKeyboardButton("Ver composición", callback_data="PF:LIST"), InlineKeyboardButton("Editar instrumento", callback_data="PF:EDIT")],
         [InlineKeyboardButton("Rendimiento", callback_data="PF:RET"), InlineKeyboardButton("Proyección", callback_data="PF:PROJ")],
+        [InlineKeyboardButton("Exportar", callback_data="PF:EXPORT")],
         [InlineKeyboardButton("Eliminar portafolio", callback_data="PF:CLEAR")],
     ])
+
+def kb_pf_add_methods() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Por cantidad", callback_data="PF:ADDQTY"), InlineKeyboardButton("Por importe", callback_data="PF:ADDAMT")],
+        [InlineKeyboardButton("Por % del monto", callback_data="PF:ADDPCT")],
+        [InlineKeyboardButton("Volver", callback_data="PF:ADD")],
+    ])
+
+async def pf_main_menu_text(chat_id: int) -> str:
+    pf = pf_get(chat_id)
+    base_conf = pf.get("base", {})
+    base = (base_conf.get("moneda") or "ARS").upper()
+    tc = (base_conf.get("tc") or "oficial").upper()
+    monto = float(pf.get("monto") or 0.0)
+    f_money = fmt_money_ars if base == "ARS" else fmt_money_usd
+    _, _, total_invertido, total_actual, tc_val = await pf_market_snapshot(pf)
+    restante = max(0.0, monto - total_invertido)
+    lines = ["<b>📦 Menú Portafolio</b>"]
+    lines.append(f"Base: {base} / {tc}")
+    lines.append(f"Monto objetivo: {f_money(monto)}")
+    lines.append(f"Valor invertido: {f_money(total_invertido)}")
+    lines.append(f"Restante: {f_money(restante)}")
+    if pf.get("items"):
+        lines.append(f"Valor actual estimado: {f_money(total_actual)}")
+    lines.append(f"Instrumentos cargados: {len(pf.get('items', []))}")
+    if tc_val:
+        lines.append(f"Tipo de cambio ref. ({tc}): {fmt_money_ars(tc_val)} por USD")
+    return "\n".join(lines)
+
+async def pf_refresh_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    text = await pf_main_menu_text(chat_id)
+    kb_main = kb_pf_main()
+    msg_id = context.user_data.get("pf_menu_msg_id") if isinstance(context.user_data, dict) else None
+    if msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb_main,
+            )
+        except Exception:
+            pass
+        else:
+            context.user_data["pf_menu_msg_id"] = msg_id
+            return
+    sent = await context.bot.send_message(
+        chat_id,
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb_main,
+        disable_web_page_preview=True,
+    )
+    context.user_data["pf_menu_msg_id"] = sent.message_id
 
 def kb_pick_generic(symbols: List[str], back: str, prefix: str) -> InlineKeyboardMarkup:
     rows = []; row = []
@@ -1491,7 +1612,15 @@ def kb_pick_generic(symbols: List[str], back: str, prefix: str) -> InlineKeyboar
     return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t,d in r] for r in rows])
 
 async def cmd_portafolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text("📦 Menú Portafolio", reply_markup=kb_pf_main())
+    chat_id = update.effective_chat.id
+    text = await pf_main_menu_text(chat_id)
+    msg = await update.effective_message.reply_text(
+        text,
+        reply_markup=kb_pf_main(),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+    context.user_data["pf_menu_msg_id"] = msg.message_id
 
 # --- helper para mandar "debajo del menú" ---
 async def _send_below_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: Optional[str]=None, photo_bytes: Optional[bytes]=None, reply_markup=None):
@@ -1511,6 +1640,7 @@ async def _pf_total_usado(chat_id: int) -> float:
 async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     chat_id = q.message.chat_id; data = q.data
+    context.user_data["pf_menu_msg_id"] = q.message.message_id
 
     if data == "PF:HELP":
         txt = ("<b>Cómo armar tu portafolio</b>\n\n"
@@ -1538,8 +1668,8 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pf["base"] = {"moneda": mon, "tc": tc}
         save_state()
         msg = f"Base fijada: {mon.upper()} / {tc.upper()}"
-        await q.edit_message_text("📦 Menú Portafolio", reply_markup=kb_pf_main())
-        await _send_below_menu(context, chat_id, text=msg); 
+        await pf_refresh_menu(context, chat_id)
+        await _send_below_menu(context, chat_id, text=msg);
         return
 
     if data == "PF:SETMONTO":
@@ -1554,12 +1684,19 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("FCI (ARS/USD)", callback_data="PF:ADD:fci")],
             [InlineKeyboardButton("Letras (ARS/USD)", callback_data="PF:ADD:lete"),
              InlineKeyboardButton("Cripto (USD)", callback_data="PF:ADD:cripto")],
+            [InlineKeyboardButton("Buscar ticker", callback_data="PF:SEARCH")],
             [InlineKeyboardButton("Volver", callback_data="PF:BACK")]
         ])
         if q.message and (q.message.text or "").startswith("📦 Menú Portafolio"):
             await _send_below_menu(context, chat_id, text="¿Qué querés agregar?", reply_markup=kb_add)
         else:
             await q.edit_message_text("¿Qué querés agregar?", reply_markup=kb_add)
+        return
+
+    if data == "PF:SEARCH":
+        context.user_data["pf_mode"] = "pf_search_symbol"
+        context.user_data["pf_add_message_id"] = q.message.message_id
+        await _send_below_menu(context, chat_id, text="Ingresá el <b>ticker o nombre</b> del instrumento.")
         return
 
     if data.startswith("PF:ADD:"):
@@ -1577,6 +1714,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Elegí la Letra:", reply_markup=kb_pick_generic(LETES_LIST, "PF:ADD", "PF:PICK"))
         else:
             await q.edit_message_text("Elegí la cripto:", reply_markup=kb_pick_generic(CRIPTO_TOP_NAMES, "PF:ADD", "PF:PICK"))
+        context.user_data["pf_add_message_id"] = q.message.message_id
         return
 
     if data.startswith("PF:PICK:"):
@@ -1587,11 +1725,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             context.user_data["pf_add_simbolo"] = sym
             sel_label = _label_long(sym)
-        kb_ask = InlineKeyboardMarkup([
-            [InlineKeyboardButton("Por cantidad", callback_data="PF:ADDQTY"), InlineKeyboardButton("Por importe", callback_data="PF:ADDAMT")],
-            [InlineKeyboardButton("Por % del monto", callback_data="PF:ADDPCT")],
-            [InlineKeyboardButton("Volver", callback_data="PF:ADD")]
-        ])
+        kb_ask = kb_pf_add_methods()
         await _send_below_menu(context, chat_id, text=f"Seleccionado: {sel_label}\n¿Cómo cargar?")
         await q.edit_message_reply_markup(reply_markup=kb_ask)
         return
@@ -1649,7 +1783,9 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pf = pf_get(chat_id); idx = context.user_data.get("pf_edit_idx", -1)
         if 0 <= idx < len(pf["items"]):
             pf["items"].pop(idx); save_state()
-            await _send_below_menu(context, chat_id, text="Instrumento eliminado."); return
+            await _send_below_menu(context, chat_id, text="Instrumento eliminado.")
+            await pf_refresh_menu(context, chat_id)
+            return
         await _send_below_menu(context, chat_id, text="Índice inválido."); return
 
     if data == "PF:RET":
@@ -1659,10 +1795,70 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pf_show_projection_below(context, chat_id)
         return
 
+    if data == "PF:EXPORT":
+        pf = pf_get(chat_id)
+        if not pf.get("items"):
+            await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. No hay datos para exportar.")
+            return
+        snapshot, last_ts, total_invertido, total_actual, tc_val = await pf_market_snapshot(pf)
+        base_conf = pf.get("base", {})
+        base = (base_conf.get("moneda") or "ARS").upper()
+        tc_name = (base_conf.get("tc") or "oficial").upper()
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "symbol",
+            "nombre",
+            "tipo",
+            "cantidad",
+            "precio_base",
+            "importe_base",
+            "valor_actual_estimado",
+            "moneda_base",
+            "tc_nombre",
+            "tc_valor",
+            "fecha_valuacion",
+        ])
+        fecha_val = datetime.fromtimestamp(last_ts, TZ).strftime("%Y-%m-%d") if last_ts else ""
+        for entry in snapshot:
+            sym = entry.get("symbol") or ""
+            qty = entry.get("cantidad")
+            writer.writerow([
+                sym,
+                entry.get("label") or sym or entry.get("tipo") or "",
+                entry.get("tipo") or "",
+                qty if qty is not None else "",
+                entry.get("precio_base") if entry.get("precio_base") is not None else "",
+                entry.get("invertido"),
+                entry.get("valor_actual"),
+                base,
+                tc_name,
+                tc_val if tc_val is not None else "",
+                fecha_val,
+            ])
+        csv_bytes = buf.getvalue().encode("utf-8")
+        filename = f"portafolio_{datetime.now(TZ).strftime('%Y%m%d_%H%M')}.csv"
+        f_money = fmt_money_ars if base == "ARS" else fmt_money_usd
+        caption_lines = [f"Base {base}/{tc_name}"]
+        caption_lines.append(f"Valor invertido: {f_money(total_invertido)}")
+        caption_lines.append(f"Valor actual estimado: {f_money(total_actual)}")
+        caption_lines.append(f"Instrumentos: {len(snapshot)}")
+        if tc_val:
+            caption_lines.append(f"TC ref.: {fmt_money_ars(tc_val)} por USD")
+        if fecha_val:
+            caption_lines.append(f"Datos al {fecha_val}")
+        await context.bot.send_document(
+            chat_id=chat_id,
+            document=io.BytesIO(csv_bytes),
+            filename=filename,
+            caption="\n".join(caption_lines),
+        )
+        return
+
     if data == "PF:CLEAR":
         PF[chat_id] = {"base": {"moneda":"ARS","tc":"mep"}, "monto": 0.0, "items": []}; save_state()
         await _send_below_menu(context, chat_id, text="Portafolio eliminado.")
-        await q.edit_message_text("📦 Menú Portafolio", reply_markup=kb_pf_main()); 
+        await pf_refresh_menu(context, chat_id)
         return
 
     if data == "PF:BACK":
@@ -1685,6 +1881,31 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
     pf = pf_get(chat_id)
 
+    if mode == "pf_search_symbol":
+        guess = pf_guess_symbol(text)
+        if not guess:
+            await update.message.reply_text("No encontré el instrumento. Probá con el ticker completo (ej. GGAL.BA).")
+            return
+        sym, tipo = guess
+        context.user_data["pf_add_simbolo"] = sym
+        context.user_data["pf_add_tipo"] = tipo
+        label_sym = sym
+        if sym.endswith("-USD"):
+            base_sym = sym[:-4]
+            if base_sym in CRIPTO_TOP_NAMES:
+                label_sym = base_sym
+        sel_label = _label_long(label_sym)
+        kb_ask = kb_pf_add_methods()
+        await _send_below_menu(context, chat_id, text=f"Seleccionado: {sel_label}\n¿Cómo cargar?")
+        msg_id = context.user_data.get("pf_add_message_id")
+        if msg_id:
+            try:
+                await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id, reply_markup=kb_ask)
+            except Exception:
+                pass
+        context.user_data["pf_mode"] = None
+        return
+
     def _restante_str(usado: float) -> str:
         pf_base = pf["base"]["moneda"].upper()
         return (fmt_money_ars if pf_base=="ARS" else fmt_money_usd)(max(0.0, pf["monto"] - usado))
@@ -1699,6 +1920,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pf_base = pf["base"]["moneda"].upper()
         f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
         await update.message.reply_text(f"Monto fijado: {f_money(v)} · Restante: {_restante_str(usado)}")
+        await pf_refresh_menu(context, chat_id)
         context.user_data["pf_mode"]=None; return
 
     # Alta por cantidad/importe/% (símbolo ya elegido)
@@ -1789,6 +2011,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         base_label = _label_long(sym if not sym.endswith("-USD") else sym.replace("-USD"," (USD)"))
         det = f"Agregado {base_label} {qty_str}{unit_px_str}{total_str}.\nRestante: {restante_str}"
         await update.message.reply_text(det)
+        await pf_refresh_menu(context, chat_id)
         context.user_data["pf_mode"]=None; return
 
     # Ediciones
@@ -1859,6 +2082,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         usado = await _pf_total_usado(chat_id)
         f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
         await update.message.reply_text("Actualizado ✅ · Restante: " + f_money(max(0.0, pf["monto"]-usado)))
+        await pf_refresh_menu(context, chat_id)
         context.user_data["pf_mode"]=None; return
 
 # --- Composición: texto + torta (debajo del menú) ---
