@@ -1,7 +1,7 @@
 # bot_econ_full_plus_rank_alerts.py
 # -*- coding: utf-8 -*-
 
-import os, asyncio, logging, re, html as _html, json, math, io
+import os, asyncio, logging, re, html as _html, json, math, io, signal
 from time import time
 from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime
@@ -1918,23 +1918,63 @@ async def main():
     load_state()
     application = build_application()
     _schedule_all_subs(application)
-    alerts_task = asyncio.create_task(alerts_loop(application))
-    keepalive_task = asyncio.create_task(keepalive_loop())
-    try:
-        await application.bot.set_my_commands(BOT_COMMANDS)
-        # webhook (python-telegram-bot corre su propio aiohttp server)
-        await application.bot.set_webhook(url=WEBHOOK_URL)
-        await application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=WEBHOOK_SECRET,
-            webhook_url=WEBHOOK_URL,
-            drop_pending_updates=True,
-        )
-    finally:
-        alerts_task.cancel()
-        keepalive_task.cancel()
-        await asyncio.gather(alerts_task, keepalive_task, return_exceptions=True)
+
+    alerts_task = None
+    keepalive_task = None
+    updater_started = False
+    app_started = False
+
+    async with application:
+        alerts_task = asyncio.create_task(alerts_loop(application))
+        keepalive_task = asyncio.create_task(keepalive_loop())
+        try:
+            await application.bot.set_my_commands(BOT_COMMANDS)
+            await application.updater.start_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path=WEBHOOK_SECRET,
+                webhook_url=WEBHOOK_URL,
+                drop_pending_updates=True,
+            )
+            updater_started = True
+
+            await application.start()
+            app_started = True
+
+            loop = asyncio.get_running_loop()
+            stop_future = loop.create_future()
+            stop_signals = (signal.SIGINT, signal.SIGTERM)
+            for sig in stop_signals:
+                try:
+                    loop.add_signal_handler(sig, stop_future.cancel)
+                except NotImplementedError:
+                    pass
+            try:
+                await stop_future
+            except asyncio.CancelledError:
+                pass
+            finally:
+                for sig in stop_signals:
+                    try:
+                        loop.remove_signal_handler(sig)
+                    except (NotImplementedError, RuntimeError, ValueError):
+                        pass
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if alerts_task:
+                alerts_task.cancel()
+            if keepalive_task:
+                keepalive_task.cancel()
+            if alerts_task or keepalive_task:
+                await asyncio.gather(
+                    *(t for t in (alerts_task, keepalive_task) if t),
+                    return_exceptions=True,
+                )
+            if updater_started:
+                await application.updater.stop()
+            if app_started:
+                await application.stop()
 
 if __name__ == "__main__":
     try:
