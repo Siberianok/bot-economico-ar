@@ -13,64 +13,56 @@ from .telegram.handlers import TelegramBot
 
 def _run_webhook() -> None:
     """
-    Inicia el bot con servidor HTTP interno y registra el Webhook en Telegram.
-    Requiere:
-      - TELEGRAM_TOKEN (lo usa TelegramBot internamente)
-      - BASE_URL (Render la completa desde render.yaml -> fromService:url)
-      - WEBHOOK_SECRET (valor sin '/'; define la ruta del webhook)
-      - PORT (Render expone este puerto; por defecto 10000)
+    Ejecuta el bot en modo Webhook (recomendado en Render).
+    Usa:
+      - BASE_URL
+      - WEBHOOK_SECRET
+      - PORT
     """
     configure_logging()
     config = AppConfig.load()
 
-    # Si tenés Redis, lo configuramos. Si no, seguimos con storage en archivo/memoria.
-    # (Antes era obligatorio; ahora solo avisamos para no bloquear el arranque.)
-    if getattr(config, "redis_url", None):
+    if not config.telegram_token:
+        raise RuntimeError("TELEGRAM_TOKEN es obligatorio para el bot.")
+    if not config.base_url:
+        raise RuntimeError("BASE_URL es obligatorio (Render lo inyecta).")
+    if not config.webhook_secret:
+        raise RuntimeError("WEBHOOK_SECRET es obligatorio.")
+    if not config.port:
+        raise RuntimeError("PORT es obligatorio.")
+
+    if config.redis_url:
         configure_storage(config)
-    else:
-        logging.getLogger(__name__).warning(
-            "REDIS_URL no está configurado. Uso almacenamiento local (STATE_PATH)."
-        )
 
     state = StateService(config)
     pipeline = MetricsPipeline()
     bot = TelegramBot(config, pipeline, state)
-    app = bot.build_application()  # acá se registran handlers y jobs propios
+    app = bot.build_application()
 
-    # === Variables para Webhook ===
-    base_url = (os.getenv("BASE_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
-    if not base_url:
-        raise RuntimeError(
-            "Falta BASE_URL (Render la completa automáticamente en render.yaml)."
-        )
-    webhook_secret = os.getenv("WEBHOOK_SECRET", "tgwebhook-secret").strip().strip("/")
-    port = int(os.getenv("PORT", "10000"))
-
-    webhook_path = f"/{webhook_secret}"
-    webhook_url = f"{base_url}{webhook_path}"
-
-    log = logging.getLogger(__name__)
-    log.info(
-        "Iniciando Webhook | listen=0.0.0.0 | port=%s | path=%s | url=%s",
-        port,
+    webhook_path = f"/{config.webhook_secret}"
+    logging.getLogger(__name__).info(
+        "Iniciando Webhook | listen=%s | port=%s | path=%s | url=%s",
+        "0.0.0.0",
+        config.port,
         webhook_path,
-        webhook_url,
+        f"{config.base_url}{webhook_path}",
     )
 
-    # Levanta el servidor HTTP interno y registra el webhook en Telegram.
+    # run_webhook se ocupa de registrar setWebhook
     app.run_webhook(
         listen="0.0.0.0",
-        port=port,
-        url_path=webhook_secret,   # la ruta interna expuesta (sin slash inicial)
-        webhook_url=webhook_url,   # URL pública completa para Telegram
-        drop_pending_updates=True, # evita duplicados al reiniciar
+        port=int(config.port),
+        url=f"{config.base_url}{webhook_path}",
+        webhook_path=webhook_path,
+        drop_pending_updates=True,   # limpia cola vieja
+        allowed_updates=None,        # aceptar todo
     )
 
 
 def main() -> None:
     try:
         _run_webhook()
-    except KeyboardInterrupt:  # pragma: no cover - CLI exit
+    except KeyboardInterrupt:
         logging.getLogger(__name__).info("Bot detenido por el usuario")
 
 
