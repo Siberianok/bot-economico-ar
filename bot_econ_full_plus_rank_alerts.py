@@ -1157,74 +1157,80 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================ LOOP ALERTAS ============================
 
 async def alerts_loop(app: Application):
-    await asyncio.sleep(5)
-    timeout = ClientTimeout(total=12)
-    while True:
-        try:
-            now_ts = datetime.now(TZ).timestamp()
-            active_chats = []
-            for cid, rules in ALERTS.items():
-                if not rules: continue
-                if cid in ALERTS_PAUSED: continue
-                if cid in ALERTS_SILENT_UNTIL and ALERTS_SILENT_UNTIL[cid] > now_ts: continue
-                active_chats.append(cid)
-            if active_chats:
-                async with ClientSession(timeout=timeout) as session:
-                    fx = await get_dolares(session)
-                    rp = await get_riesgo_pais(session)
-                    infl = await get_inflacion_mensual(session)
-                    rv = await get_reservas_lamacro(session)
-                    vals = {"riesgo": float(rp[0]) if rp else None,
-                            "inflacion": float(infl[0]) if infl else None,
-                            "reservas": rv[0] if rv else None}
-                    sym_list = {r["symbol"] for cid in active_chats for r in ALERTS.get(cid, []) if r.get("kind")=="ticker" and r.get("symbol")}
-                    metmap, _ = (await metrics_for_symbols(session, sorted(sym_list))) if sym_list else ({}, None)
-                    for chat_id in active_chats:
-                        rules = ALERTS.get(chat_id, [])
-                        if not rules: continue
-                        trig = []
-                        for r in rules:
-                            if r.get("kind") == "fx":
-                                row = fx.get(r["type"], {}) or {}
-                                cur = _fx_display_value(row, r["side"])
-                                if cur is None: continue
-                                ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
-                                if ok: trig.append(("fx", r["type"], r["side"], r["op"], r["value"], cur))
-                            elif r.get("kind") == "metric":
-                                cur = vals.get(r["type"])
-                                if cur is None: continue
-                                ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
-                                if ok: trig.append(("metric", r["type"], r["op"], r["value"], cur))
-                            elif r.get("kind") == "ticker":
-                                sym = r["symbol"]; m = metmap.get(sym, {}); cur = m.get("last_px")
-                                if cur is None: continue
-                                ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
-                                if ok: trig.append(("ticker_px", sym, r["op"], r["value"], cur))
-                        if trig:
-                            lines = [f"<b>🔔 Alertas</b>"]
-                            for t, *rest in trig:
-                                if t == "fx":
-                                    tipo, side, op, v, cur = rest
-                                    lines.append(f"{tipo.upper()} ({side}): {fmt_money_ars(cur)} ({html_op(op)} {fmt_money_ars(v)})")
-                                elif t == "metric":
-                                    tipo, op, v, cur = rest
-                                    if tipo=="riesgo":
-                                        lines.append(f"Riesgo País: {cur:.0f} pb ({html_op(op)} {v:.0f} pb)")
-                                    elif tipo=="inflacion":
-                                        lines.append(f"Inflación Mensual: {str(round(cur,1)).replace('.',',')}% ({html_op(op)} {str(round(v,1)).replace('.',',')}%)")
-                                    elif tipo=="reservas":
-                                        lines.append(f"Reservas: {fmt_number(cur,0)} MUS$ ({html_op(op)} {fmt_number(v,0)} MUS$)")
-                                else:
-                                    sym, op, v, cur = rest
-                                    lines.append(f"{_label_long(sym)} (Precio): {fmt_money_ars(cur)} ({html_op(op)} {fmt_money_ars(v)})")
-                            try:
-                                await app.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML)
-                            except Exception as e:
-                                log.warning("send alert failed %s: %s", chat_id, e)
-            await asyncio.sleep(600)
-        except Exception as e:
-            log.warning("alerts_loop error: %s", e)
-            await asyncio.sleep(30)
+    try:
+        await asyncio.sleep(5)
+        timeout = ClientTimeout(total=12)
+        while True:
+            try:
+                now_ts = datetime.now(TZ).timestamp()
+                active_chats = []
+                for cid, rules in ALERTS.items():
+                    if not rules: continue
+                    if cid in ALERTS_PAUSED: continue
+                    if cid in ALERTS_SILENT_UNTIL and ALERTS_SILENT_UNTIL[cid] > now_ts: continue
+                    active_chats.append(cid)
+                if active_chats:
+                    async with ClientSession(timeout=timeout) as session:
+                        fx = await get_dolares(session)
+                        rp = await get_riesgo_pais(session)
+                        infl = await get_inflacion_mensual(session)
+                        rv = await get_reservas_lamacro(session)
+                        vals = {"riesgo": float(rp[0]) if rp else None,
+                                "inflacion": float(infl[0]) if infl else None,
+                                "reservas": rv[0] if rv else None}
+                        sym_list = {r["symbol"] for cid in active_chats for r in ALERTS.get(cid, []) if r.get("kind")=="ticker" and r.get("symbol")}
+                        metmap, _ = (await metrics_for_symbols(session, sorted(sym_list))) if sym_list else ({}, None)
+                        for chat_id in active_chats:
+                            rules = ALERTS.get(chat_id, [])
+                            if not rules: continue
+                            trig = []
+                            for r in rules:
+                                if r.get("kind") == "fx":
+                                    row = fx.get(r["type"], {}) or {}
+                                    cur = _fx_display_value(row, r["side"])
+                                    if cur is None: continue
+                                    ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
+                                    if ok: trig.append(("fx", r["type"], r["side"], r["op"], r["value"], cur))
+                                elif r.get("kind") == "metric":
+                                    cur = vals.get(r["type"])
+                                    if cur is None: continue
+                                    ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
+                                    if ok: trig.append(("metric", r["type"], r["op"], r["value"], cur))
+                                elif r.get("kind") == "ticker":
+                                    sym = r["symbol"]; m = metmap.get(sym, {}); cur = m.get("last_px")
+                                    if cur is None: continue
+                                    ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
+                                    if ok: trig.append(("ticker_px", sym, r["op"], r["value"], cur))
+                            if trig:
+                                lines = [f"<b>🔔 Alertas</b>"]
+                                for t, *rest in trig:
+                                    if t == "fx":
+                                        tipo, side, op, v, cur = rest
+                                        lines.append(f"{tipo.upper()} ({side}): {fmt_money_ars(cur)} ({html_op(op)} {fmt_money_ars(v)})")
+                                    elif t == "metric":
+                                        tipo, op, v, cur = rest
+                                        if tipo=="riesgo":
+                                            lines.append(f"Riesgo País: {cur:.0f} pb ({html_op(op)} {v:.0f} pb)")
+                                        elif tipo=="inflacion":
+                                            lines.append(f"Inflación Mensual: {str(round(cur,1)).replace('.',',')}% ({html_op(op)} {str(round(v,1)).replace('.',',')}%)")
+                                        elif tipo=="reservas":
+                                            lines.append(f"Reservas: {fmt_number(cur,0)} MUS$ ({html_op(op)} {fmt_number(v,0)} MUS$)")
+                                    else:
+                                        sym, op, v, cur = rest
+                                        lines.append(f"{_label_long(sym)} (Precio): {fmt_money_ars(cur)} ({html_op(op)} {fmt_money_ars(v)})")
+                                try:
+                                    await app.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML)
+                                except Exception as e:
+                                    log.warning("send alert failed %s: %s", chat_id, e)
+                await asyncio.sleep(600)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning("alerts_loop error: %s", e)
+                await asyncio.sleep(30)
+    except asyncio.CancelledError:
+        log.info("alerts_loop cancelado")
+        raise
 
 # ============================ SUSCRIPCIONES ============================
 
@@ -1815,16 +1821,34 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ============================ WEBHOOK / APP ============================
 
 async def keepalive_loop():
-    await asyncio.sleep(5)
-    url = f"{BASE_URL}/"; timeout = ClientTimeout(total=6)
-    async with ClientSession(timeout=timeout) as session:
-        while True:
-            try:
-                async with session.get(url) as resp:
-                    logging.info("Keepalive %s -> %s", url, resp.status)
-            except Exception as e:
-                logging.warning("Keepalive error: %s", e)
-            await asyncio.sleep(300)
+    try:
+        await asyncio.sleep(5)
+        url = f"{BASE_URL}/"; timeout = ClientTimeout(total=6)
+        async with ClientSession(timeout=timeout) as session:
+            while True:
+                try:
+                    async with session.get(url) as resp:
+                        logging.info("Keepalive %s -> %s", url, resp.status)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logging.warning("Keepalive error: %s", e)
+                await asyncio.sleep(300)
+    except asyncio.CancelledError:
+        logging.info("keepalive_loop cancelado")
+        raise
+
+BOT_COMMANDS = [
+    BotCommand("start","Menú principal"),
+    BotCommand("economia","Menú de economía"),
+    BotCommand("acciones","Menú acciones .BA"),
+    BotCommand("cedears","Menú CEDEARs .BA"),
+    BotCommand("alertas_menu","Configurar alertas"),
+    BotCommand("portafolio","Menú portafolio"),
+    BotCommand("subs","Suscripción a resumen diario"),
+    BotCommand("resumen","Resumen de hoy al instante"),
+]
+
 
 def build_application() -> Application:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -1888,36 +1912,29 @@ def build_application() -> Application:
     # Resumen diario on-demand
     app.add_handler(CommandHandler("resumen", cmd_resumen_diario))
 
-    # Bot commands visibles
-    app.bot.set_my_commands([
-        BotCommand("start","Menú principal"),
-        BotCommand("economia","Menú de economía"),
-        BotCommand("acciones","Menú acciones .BA"),
-        BotCommand("cedears","Menú CEDEARs .BA"),
-        BotCommand("alertas_menu","Configurar alertas"),
-        BotCommand("portafolio","Menú portafolio"),
-        BotCommand("subs","Suscripción a resumen diario"),
-        BotCommand("resumen","Resumen de hoy al instante"),
-    ])
-
     return app
 
 async def main():
     load_state()
     application = build_application()
     _schedule_all_subs(application)
-    # loops de fondo
-    application.create_task(alerts_loop(application))
-    application.create_task(keepalive_loop())
-    # webhook (python-telegram-bot corre su propio aiohttp server)
-    await application.bot.set_webhook(url=WEBHOOK_URL, allowed_updates=application.defaults.allowed_updates)
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_SECRET,
-        webhook_url=WEBHOOK_URL,
-        drop_pending_updates=True,
-    )
+    alerts_task = asyncio.create_task(alerts_loop(application))
+    keepalive_task = asyncio.create_task(keepalive_loop())
+    try:
+        await application.bot.set_my_commands(BOT_COMMANDS)
+        # webhook (python-telegram-bot corre su propio aiohttp server)
+        await application.bot.set_webhook(url=WEBHOOK_URL)
+        await application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=WEBHOOK_SECRET,
+            webhook_url=WEBHOOK_URL,
+            drop_pending_updates=True,
+        )
+    finally:
+        alerts_task.cancel()
+        keepalive_task.cancel()
+        await asyncio.gather(alerts_task, keepalive_task, return_exceptions=True)
 
 if __name__ == "__main__":
     try:
