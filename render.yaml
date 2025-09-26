@@ -4,17 +4,9 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python -m bot_econ.main
+    startCommand: python bot_econ_full_plus_rank_alerts.py
     envVars:
-      - key: TELEGRAM_TOKEN
-        sync: false
-      - key: STATE_PATH
-        value: /data/state.json
-      - key: PYTHON_VERSION
-        value: 3.11.9
-      - key: REDIS_URL
-        sync: false
-    disk:
-      name: data
-      mountPath: /data
-      sizeGB: 1
+      - key: BOT_TOKEN
+        sync: false  # set this in Render dashboard
+      - key: ALERTS_DB_PATH
+        value: /var/tmp/alerts.db
