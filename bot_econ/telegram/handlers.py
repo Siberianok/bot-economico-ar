@@ -1,6 +1,7 @@
 # bot_econ/telegram/handlers.py
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, List
 
@@ -11,13 +12,15 @@ from telegram.ext import (
     ApplicationBuilder,
     CallbackContext,
     CommandHandler,
+    MessageHandler,
+    filters,
 )
 
 from ..config import AppConfig
 from ..services.metrics_pipeline import MetricsPipeline
 from ..services.state_service import StateService
 
-# Import tolerante: si no existe en http.py, definimos un no-op
+# Import tolerante: si no existe, hacemos no-op
 try:
     from ..data_sources.http import close_http_client  # type: ignore
 except Exception:
@@ -29,8 +32,8 @@ log = logging.getLogger(__name__)
 
 class TelegramBot:
     """
-    Arma la Application de python-telegram-bot (v20+), registra comandos y
-    configura jobs (prewarm). La ejecución (polling/webhook) la hace main.py.
+    Arma la Application de python-telegram-bot (v20+), registra comandos y jobs.
+    La ejecución webhook/polling la hace main.py.
     """
 
     def __init__(self, config: AppConfig, pipeline: MetricsPipeline, state: StateService) -> None:
@@ -38,7 +41,7 @@ class TelegramBot:
         self._pipeline = pipeline
         self._state = state
 
-    # ========= Handlers básicos =========
+    # ========= Handlers =========
 
     async def _cmd_start(self, update: Update, context: CallbackContext) -> None:
         txt = (
@@ -47,6 +50,7 @@ class TelegramBot:
             "• /start – ayuda\n"
             "• /ping – prueba rápida\n"
             "• /resumen – resumen económico del día\n"
+            "• /whinfo – diagnóstico del webhook\n"
         )
         await update.effective_message.reply_text(txt)
 
@@ -59,7 +63,7 @@ class TelegramBot:
             lines: List[str] = ["<b>Resumen económico</b>"]
             if data.dolar:
                 d = data.dolar
-                # Mostramos algunos tipos si están disponibles
+
                 def fmt(v: Any) -> str:
                     try:
                         return f"${float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
@@ -94,40 +98,62 @@ class TelegramBot:
             log.warning("cmd_resumen error: %s", e)
             await update.effective_message.reply_text("No pude armar el resumen ahora 😕. Probá de nuevo en un rato.")
 
-    # ========= Jobs =========
+    async def _cmd_whinfo(self, update: Update, context: CallbackContext) -> None:
+        """Diagnóstico del webhook directamente desde el bot."""
+        try:
+            info = await context.bot.get_webhook_info()
+            payload = {
+                "url": info.url,
+                "has_custom_certificate": info.has_custom_certificate,
+                "pending_update_count": info.pending_update_count,
+                "ip_address": info.ip_address,
+                "last_error_date": info.last_error_date,
+                "last_error_message": info.last_error_message,
+                "max_connections": info.max_connections,
+                "allowed_updates": info.allowed_updates,
+            }
+            txt = "<b>Webhook info</b>\n<pre>" + _pretty(payload) + "</pre>"
+            await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.warning("whinfo error: %s", e)
+            await update.effective_message.reply_text("No pude leer WebhookInfo.")
 
     async def _prewarm(self, context: CallbackContext) -> None:
-        """
-        Llamado periódicamente para calentar cachés de fuentes.
-        No envía mensajes; solo dispara fetch en paralelo.
-        """
         try:
             await self._pipeline.fetch_summary()
             log.info("Prewarm OK")
         except Exception as e:
-            # No levantamos excepción: queremos que el job siga vivo
             log.error("Prewarm failed", exc_info=e)
 
-    # ========= Hooks de ciclo de vida =========
+    # Catch-all: si llega cualquier cosa, contestamos (prueba rápida)
+    async def _fallback_echo(self, update: Update, context: CallbackContext) -> None:
+        try:
+            text = update.effective_message.text or ""
+            if text.startswith("/"):
+                await update.effective_message.reply_text("Comando no reconocido. Probá /start.")
+            else:
+                await update.effective_message.reply_text("Te leo perfecto. Probá /resumen o /whinfo.")
+        except Exception:
+            pass
+
+    # ========= Hooks =========
 
     async def _on_startup(self, app: Application) -> None:
-        # Seteamos comandos del bot (lista en la UI de Telegram)
         cmds = [
             BotCommand("start", "Ayuda"),
             BotCommand("ping", "Prueba rápida"),
             BotCommand("resumen", "Resumen económico del día"),
+            BotCommand("whinfo", "Diagnóstico del webhook"),
         ]
         try:
             await app.bot.set_my_commands(cmds)
         except Exception as e:
             log.warning("set_my_commands falló: %s", e)
 
-        # Job de prewarm cada 5 minutos
         app.job_queue.run_repeating(self._prewarm, interval=300, first=5, name="_prewarm")
         log.info("Startup hook completado")
 
     async def _on_shutdown(self, app: Application) -> None:
-        # Cerramos HTTP client si existe
         try:
             await close_http_client()
         except Exception:
@@ -137,10 +163,6 @@ class TelegramBot:
     # ========= Wiring =========
 
     def build_application(self) -> Application:
-        """
-        Construye y devuelve la Application ya configurada con handlers y hooks.
-        La ejecución (polling/webhook) la maneja main.py.
-        """
         app = (
             ApplicationBuilder()
             .token(self._config.telegram_token)
@@ -148,13 +170,22 @@ class TelegramBot:
             .build()
         )
 
-        # Handlers de comandos básicos
         app.add_handler(CommandHandler("start", self._cmd_start))
         app.add_handler(CommandHandler("ping", self._cmd_ping))
         app.add_handler(CommandHandler("resumen", self._cmd_resumen))
+        app.add_handler(CommandHandler("whinfo", self._cmd_whinfo))
 
-        # Hooks
-        app.post_init = self._on_startup  # llamado al iniciar
-        app.post_shutdown = self._on_shutdown  # llamado al apagar
+        # catch-all al final
+        app.add_handler(MessageHandler(filters.ALL, self._fallback_echo))
+
+        app.post_init = self._on_startup
+        app.post_shutdown = self._on_shutdown
 
         return app
+
+
+def _pretty(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
+    except Exception:
+        return str(obj)
