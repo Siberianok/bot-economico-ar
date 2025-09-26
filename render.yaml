@@ -4,9 +4,9 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot_econ_full_plus_rank_alerts.py
+    startCommand: python legacy/bot_econ_full_plus_rank_alerts.py
     envVars:
-      - key: BOT_TOKEN
-        sync: false  # set this in Render dashboard
-      - key: ALERTS_DB_PATH
-        value: /var/tmp/alerts.db
+      - key: TELEGRAM_TOKEN
+        sync: false          # Cargalo en el panel de Render → Environment
+      - key: PYTHON_VERSION
+        value: 3.11.9
