@@ -883,17 +883,44 @@ def dec_and_maybe_show(update: Update, context: ContextTypes.DEFAULT_TYPE, name:
         return show_func(update, context)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "¡Bienvenido! 📊\n\n"
-        "Menús rápidos:\n"
-        "• /economia — Dólares, Reservas, Inflación, Riesgo y Noticias\n"
-        "• /acciones — Top/Proyección de acciones .BA\n"
-        "• /cedears — Top/Proyección de CEDEARs\n"
-        "• /alertas_menu — Crear/pausar alertas\n"
-        "• /portafolio — Armar y proyectar tu cartera\n"
-        "• /subs — Resumen diario programado\n"
+    intro = (
+        "<b>¡Hola! Soy tu asistente de mercados argentinos.</b>\n"
+        "<i>Seguimiento de dólar, bonos, acciones, portafolio y alertas en un mismo lugar.</i>\n\n"
+        "Elegí una opción rápida o usá los comandos clásicos:\n"
+        "• /economia — Panel macro: dólares, reservas, inflación, riesgo y noticias\n"
+        "• /acciones — Rankings y proyecciones de acciones .BA\n"
+        "• /cedears — Rankings y proyecciones de CEDEARs\n"
+        "• /alertas_menu — Gestioná alertas personalizadas\n"
+        "• /portafolio — Armá y analizá tu cartera\n"
+        "• /subs — Suscripción al resumen diario\n"
     )
-    await update.effective_message.reply_text(text)
+
+    kb_rows = [
+        [
+            InlineKeyboardButton("💵 Dólar y Reservas", callback_data="ECO:DOLAR"),
+            InlineKeyboardButton("📰 Noticias", callback_data="ECO:NOTICIAS"),
+        ],
+        [
+            InlineKeyboardButton("📈 Acciones Top 3", callback_data="ACC:TOP3"),
+            InlineKeyboardButton("🏁 Acciones Proyección", callback_data="ACC:TOP5"),
+        ],
+        [
+            InlineKeyboardButton("🌎 Cedears Top 3", callback_data="CED:TOP3"),
+            InlineKeyboardButton("🌐 Cedears Proyección", callback_data="CED:TOP5"),
+        ],
+        [
+            InlineKeyboardButton("🔔 Mis alertas", callback_data="AL:LIST"),
+            InlineKeyboardButton("🧾 Resumen diario", callback_data="ST:SUBS"),
+        ],
+        [InlineKeyboardButton("💼 Portafolio", callback_data="PF:MENU")],
+    ]
+
+    await update.effective_message.reply_text(
+        intro,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(kb_rows),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
 
 async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
@@ -1516,6 +1543,12 @@ async def cmd_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(txt, reply_markup=kb_times_full(), parse_mode=ParseMode.HTML)
     return SUBS_SET_TIME
 
+
+async def subs_start_from_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    return await cmd_subs(update, context)
+
 async def subs_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     chat_id = q.message.chat_id; data = q.data
@@ -1578,6 +1611,10 @@ async def _pf_total_usado(chat_id: int) -> float:
 async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     chat_id = q.message.chat_id; data = q.data
+
+    if data == "PF:MENU":
+        await cmd_portafolio(update, context)
+        return
 
     if data == "PF:HELP":
         txt = ("<b>Cómo armar tu portafolio</b>\n\n"
@@ -2399,7 +2436,10 @@ def build_application() -> Application:
 
     # Suscripciones
     subs_conv = ConversationHandler(
-        entry_points=[CommandHandler("subs", cmd_subs)],
+        entry_points=[
+            CommandHandler("subs", cmd_subs),
+            CallbackQueryHandler(subs_start_from_cb, pattern="^ST:SUBS$"),
+        ],
         states={SUBS_SET_TIME: [CallbackQueryHandler(subs_cb, pattern="^SUBS:")]},
         fallbacks=[],
         per_chat=True,
