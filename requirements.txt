@@ -1,4 +1,5 @@
 python-telegram-bot==20.8
 httpx==0.26.*
+aiohttp==3.9.*
 certifi
 tzdata
