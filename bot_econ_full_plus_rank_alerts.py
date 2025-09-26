@@ -123,6 +123,31 @@ def label_with_currency(sym: str) -> str:
 
 def requires_integer_units(sym: str) -> bool: return sym.endswith(".BA")
 
+def instrument_currency(sym: str, tipo: str) -> str:
+    s = (sym or "").upper()
+    t = (tipo or "").lower()
+    if s.endswith("-USD"): return "USD"
+    if t == "cripto": return "USD"
+    if t == "bono": return bono_moneda(sym)
+    if t in ("fci", "lete"):
+        return "USD" if "USD" in s else "ARS"
+    if s.endswith(".BA"): return "ARS"
+    if t in ("cedear", "accion"): return "ARS"
+    return "ARS"
+
+def price_to_base(price: Optional[float], inst_currency: str, base_currency: str, tc_val: Optional[float]) -> Optional[float]:
+    if price is None:
+        return None
+    if base_currency == inst_currency:
+        return float(price)
+    if tc_val is None or tc_val <= 0:
+        return None
+    if base_currency == "ARS" and inst_currency == "USD":
+        return float(price) * float(tc_val)
+    if base_currency == "USD" and inst_currency == "ARS":
+        return float(price) / float(tc_val)
+    return None
+
 # ============================ LOGGING ============================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -199,6 +224,20 @@ def fmt_money_usd(n: Optional[float], nd: int = 2) -> str:
 def pct(n: Optional[float], nd: int = 2) -> str:
     try: return f"{n:+.{nd}f}%".replace(".", ",")
     except Exception: return "—"
+
+def pct_plain(n: Optional[float], nd: int = 1) -> str:
+    try: return f"{n:.{nd}f}%".replace(".", ",")
+    except Exception: return "—"
+
+def format_quantity(sym: str, qty: Optional[float]) -> Optional[str]:
+    if qty is None: return None
+    try:
+        if requires_integer_units(sym):
+            return str(int(round(qty)))
+        s = f"{qty:.4f}"
+        return s.rstrip("0").rstrip(".")
+    except Exception:
+        return str(qty) if qty is not None else None
 
 def anchor(href: str, text: str) -> str: return f'<a href="{_html.escape(href, True)}">{_html.escape(text)}</a>'
 def html_op(op: str) -> str: return "↑" if op == ">" else "↓"
@@ -357,6 +396,8 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         if len(pairs) < 30: return None
         ts = [p[0] for p in pairs]; closes = [p[1] for p in pairs]
         idx_last = len(closes)-1; last = closes[idx_last]; t_last = ts[idx_last]
+        prev = closes[idx_last-1] if idx_last >= 1 else None
+        last_chg = ((last/prev - 1.0)*100.0) if (prev is not None and prev > 0) else None
 
         def first_on_or_after(tcut):
             for i, t in enumerate(ts):
@@ -403,12 +444,14 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         s200_last = sma200[idx_last] if idx_last < len(sma200) else None
         trend_flag = 1 if (s200_last and last > s200_last) else (-1 if s200_last else 0)
         return {"1m": ret1, "3m": ret3, "6m": ret6, "last_ts": int(t_last), "vol_ann": vol_ann,
-                "dd6m": dd6, "hi52": hi52, "slope50": slope50, "trend_flag": float(trend_flag), "last_px": float(last)}
+                "dd6m": dd6, "hi52": hi52, "slope50": slope50, "trend_flag": float(trend_flag),
+                "last_px": float(last), "prev_px": float(prev) if prev else None, "last_chg": last_chg}
     except Exception:
         return None
 
 async def _yf_metrics_1y(session: ClientSession, symbol: str) -> Dict[str, Optional[float]]:
-    out = {"6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None, "dd6m": None, "hi52": None, "slope50": None, "trend_flag": None, "last_px": None}
+    out = {"6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None, "dd6m": None, "hi52": None, "slope50": None,
+           "trend_flag": None, "last_px": None, "prev_px": None, "last_chg": None}
     for interval in ("1d", "1wk"):
         res = await _yf_chart_1y(session, symbol, interval)
         if res:
@@ -417,7 +460,8 @@ async def _yf_metrics_1y(session: ClientSession, symbol: str) -> Dict[str, Optio
     return out
 
 async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tuple[Dict[str, Dict[str, Optional[float]]], Optional[int]]:
-    out = {s: {"6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None, "dd6m": None, "hi52": None, "slope50": None, "trend_flag": None, "last_px": None} for s in symbols}
+    out = {s: {"6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None, "dd6m": None, "hi52": None,
+               "slope50": None, "trend_flag": None, "last_px": None, "prev_px": None, "last_chg": None} for s in symbols}
     sem = asyncio.Semaphore(4)
     async def work(sym: str):
         async with sem:
@@ -597,23 +641,77 @@ def format_proj_dual(title: str, fecha: Optional[str], rows: List[Tuple[str, flo
 
 def _nz(x: Optional[float], fb: float) -> float: return float(x) if x is not None else fb
 
+def _expected_daily_return(m: Dict[str, Optional[float]]) -> float:
+    components: List[Tuple[float, float]] = []
+    for months, key, weight in ((1, "1m", 0.5), (3, "3m", 0.3), (6, "6m", 0.2)):
+        val = m.get(key)
+        if val is None:
+            continue
+        try:
+            lr = math.log1p(float(val) / 100.0) / (21 * months)
+            components.append((lr, weight))
+        except Exception:
+            continue
+    if components:
+        wtot = sum(w for _, w in components)
+        mu = sum(lr * w for lr, w in components) / wtot if wtot else 0.0
+    else:
+        mu = 0.0
+
+    vol_ann = m.get("vol_ann")
+    if vol_ann is not None:
+        try:
+            vol_daily = (float(vol_ann) / 100.0) / math.sqrt(252)
+            mu -= 0.5 * (vol_daily ** 2)
+        except Exception:
+            pass
+
+    slope = m.get("slope50")
+    if slope is not None:
+        try:
+            mu += (float(slope) / 100.0) * 0.003
+        except Exception:
+            pass
+
+    trend_flag = m.get("trend_flag")
+    if trend_flag is not None:
+        try:
+            mu += float(trend_flag) * 0.0005
+        except Exception:
+            pass
+
+    hi52 = m.get("hi52")
+    if hi52 is not None:
+        try:
+            hi_adj = -float(hi52) / 100.0
+            hi_adj = max(-0.25, min(0.25, hi_adj))
+            mu += hi_adj * 0.01
+        except Exception:
+            pass
+
+    dd6 = m.get("dd6m")
+    if dd6 is not None:
+        try:
+            mu -= max(0.0, float(dd6) - 12.0) / 100.0 * 0.003
+        except Exception:
+            pass
+
+    return mu
+
 def projection_3m(m: Dict[str, Optional[float]]) -> float:
-    r6, r3, r1 = _nz(m.get("6m"), -80.0), _nz(m.get("3m"), -40.0), _nz(m.get("1m"), -15.0)
-    momentum = 0.1*r6 + 0.65*r3 + 0.25*r1
-    trend = 2.2*_nz(m.get("trend_flag"), 0.0) + 0.28*_nz(m.get("slope50"), 0.0)
-    hi52 = 0.18*_nz(m.get("hi52"), 0.0)
-    risk = -0.055*_nz(m.get("vol_ann"), 40.0) - 0.045*_nz(m.get("dd6m"), 30.0)
-    meanrev = -0.06*max(0.0, abs(r1)-12.0)
-    return momentum + trend + hi52 + risk + meanrev
+    mu = _expected_daily_return(m)
+    return (math.exp(mu * 63) - 1.0) * 100.0
 
 def projection_6m(m: Dict[str, Optional[float]]) -> float:
-    r6, r3, r1 = _nz(m.get("6m"), -100.0), _nz(m.get("3m"), -50.0), _nz(m.get("1m"), -20.0)
-    momentum = 0.6*r6 + 0.3*r3 + 0.1*r1
-    trend = 3.1*_nz(m.get("trend_flag"), 0.0) + 0.22*_nz(m.get("slope50"), 0.0)
-    hi52 = 0.22*_nz(m.get("hi52"), 0.0)
-    risk = -0.06*_nz(m.get("vol_ann"), 40.0) - 0.05*_nz(m.get("dd6m"), 30.0)
-    meanrev = -0.05*max(0.0, abs(r1)-15.0)
-    return momentum + trend + hi52 + risk + meanrev
+    mu = _expected_daily_return(m)
+    vol_ann = m.get("vol_ann")
+    if vol_ann is not None:
+        try:
+            penalty = (float(vol_ann) / 100.0) ** 2 * 0.0005
+            mu -= penalty
+        except Exception:
+            pass
+    return (math.exp(mu * 126) - 1.0) * 100.0
 
 async def _rank_top3(update: Update, symbols: List[str], title: str):
     async with ClientSession() as session:
@@ -1690,32 +1788,106 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Composición: texto + torta (debajo del menú) ---
 
-def _pie_image_from_items(pf: Dict[str, Any]) -> Optional[bytes]:
+async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[int], float, float, Optional[float]]:
+    items = pf.get("items", [])
+    base_currency = (pf.get("base", {}).get("moneda") or "ARS").upper()
+    tc_name = (pf.get("base", {}).get("tc") or "").lower()
+    async with ClientSession() as session:
+        tc_val = await get_tc_value(session, tc_name) if tc_name else None
+        symbols = sorted({it.get("simbolo") for it in items if it.get("simbolo")})
+        mets, last_ts = await metrics_for_symbols(session, symbols) if symbols else ({}, None)
+
+    enriched: List[Dict[str, Any]] = []
+    total_invertido = 0.0
+    total_actual = 0.0
+    for it in items:
+        sym = it.get("simbolo", "")
+        tipo = it.get("tipo", "")
+        qty = float(it["cantidad"]) if it.get("cantidad") is not None else None
+        invertido = float(it.get("importe") or 0.0)
+        met = mets.get(sym, {}) if sym in mets else {}
+        if met and met.get("last_px") is None:
+            met = {}
+        inst_cur = instrument_currency(sym, tipo) if sym else base_currency
+        price_native = met.get("last_px") if met else None
+        price_base = price_to_base(price_native, inst_cur, base_currency, tc_val) if price_native is not None else None
+        derived_qty = False
+        if qty is None and price_base and price_base > 0 and invertido > 0:
+            qty = invertido / price_base
+            derived_qty = True
+        valor_actual = invertido
+        if qty is not None and price_base is not None:
+            valor_actual = float(qty) * float(price_base)
+        total_invertido += invertido
+        total_actual += valor_actual
+        label = _label_long(sym) if sym else (tipo.upper() if tipo else "Instrumento")
+        enriched.append({
+            "raw": it,
+            "symbol": sym,
+            "tipo": tipo,
+            "label": label,
+            "cantidad": qty,
+            "cantidad_derivada": derived_qty,
+            "invertido": invertido,
+            "valor_actual": valor_actual,
+            "precio_base": price_base,
+            "metrics": met,
+            "inst_currency": inst_cur,
+            "daily_change": met.get("last_chg") if met else None,
+        })
+
+    for entry in enriched:
+        entry["peso"] = (entry["valor_actual"] / total_actual) if total_actual > 0 else 0.0
+
+    return enriched, last_ts, total_invertido, total_actual, tc_val
+
+def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, Any]]] = None) -> Optional[bytes]:
     if not HAS_MPL:
         return None
-    vals = []
-    labels = []
-    total = 0.0
-    for it in pf["items"]:
-        v = float(it.get("importe") or 0.0)
-        if v > 0:
-            labels.append(_label_short(it.get("simbolo","")))
-            vals.append(v)
-            total += v
-    if total <= 0: return None
-    # combinar menores a 3% como "Otros"
-    vals2, labels2 = [], []
+
+    pairs: List[Tuple[str, float]] = []
+    if snapshot:
+        for entry in snapshot:
+            val = float(entry.get("valor_actual") or 0.0)
+            if val > 0:
+                label = entry.get("label") or entry.get("symbol") or "Instrumento"
+                pairs.append((label, val))
+    else:
+        for it in pf.get("items", []):
+            val = float(it.get("importe") or 0.0)
+            if val > 0:
+                sym = it.get("simbolo", "")
+                label = _label_short(sym) if sym else (it.get("tipo", "").upper() or "Instrumento")
+                pairs.append((label, val))
+
+    pairs = [(lbl, val) for lbl, val in pairs if val > 0]
+    if not pairs:
+        return None
+
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    total = sum(val for _, val in pairs)
+    if total <= 0:
+        return None
+
+    vals2: List[float] = []
+    labels2: List[str] = []
     otros = 0.0
-    for v,l in zip(vals, labels):
-        if v/total < 0.03:
-            otros += v
-        else:
-            vals2.append(v); labels2.append(l)
+    if len(pairs) > 6:
+        for lbl, val in pairs:
+            if val / total < 0.03:
+                otros += val
+            else:
+                labels2.append(lbl); vals2.append(val)
+    else:
+        for lbl, val in pairs:
+            labels2.append(lbl); vals2.append(val)
     if otros > 0:
-        vals2.append(otros); labels2.append("Otros")
-    fig = plt.figure(figsize=(5,5), dpi=160)
-    plt.pie(vals2, labels=labels2, autopct=lambda p: f"{p:.1f}%" if p >= 3 else "")
+        labels2.append("Otros"); vals2.append(otros)
+
+    fig = plt.figure(figsize=(5, 5), dpi=160)
+    plt.pie(vals2, labels=labels2, autopct=lambda p: f"{p:.1f}%", startangle=90)
     plt.title("Composición del Portafolio")
+    plt.axis('equal')
     buf = io.BytesIO()
     fig.tight_layout()
     fig.savefig(buf, format="png")
@@ -1729,22 +1901,37 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
     if not pf["items"]:
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Usá «Agregar instrumento»."); return
-    lines = [f"<b>Portafolio</b> — Base: {pf['base']['moneda'].upper()}/{pf['base']['tc'].upper()}",
-             f"Monto objetivo: {f_money(pf['monto'])}"]
-    for i,it in enumerate(pf["items"],1):
-        desc = f"{i}. "
-        if it.get("simbolo"): desc += f"{_label_long(it['simbolo'])} [{it['tipo'].upper()}]"
-        else: desc += it.get("tipo","").upper()
-        if it.get("cantidad") is not None:
-            desc += f" | Cant: {int(it['cantidad']) if it.get('simbolo','').endswith('.BA') else it['cantidad']}"
-        if it.get("importe") is not None:
-            desc += f" | Importe(Base): {f_money(it['importe'])}"
-        lines.append(desc)
-    usado = await _pf_total_usado(chat_id)
-    lines.append(f"\nUsado (Base): {f_money(usado)} · Restante: {f_money(max(0.0, pf['monto']-usado))}")
+    snapshot, last_ts, total_invertido, total_actual, tc_val = await pf_market_snapshot(pf)
+    fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
+    header = f"<b>Portafolio</b> — Base: {pf['base']['moneda'].upper()}/{pf['base']['tc'].upper()}"
+    if fecha:
+        header += f" <i>Datos al {fecha}</i>"
+    lines = [header, f"Monto objetivo: {f_money(pf['monto'])}"]
+    lines.append(f"Valor invertido: {f_money(total_invertido)}")
+    lines.append(f"Valor actual estimado: {f_money(total_actual)}")
+    delta = total_actual - total_invertido
+    if total_invertido > 0:
+        lines.append(f"Variación estimada: {f_money(delta)} ({pct(delta/total_invertido*100.0,2)})")
+    restante = max(0.0, pf['monto'] - total_invertido)
+    lines.append(f"Restante del objetivo: {f_money(restante)}")
+    if tc_val:
+        lines.append(f"Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD")
+    lines.append("")
+    for i, entry in enumerate(snapshot, 1):
+        linea = f"{i}. {entry['label']}"
+        linea += f" · Valor: {f_money(entry['valor_actual'])}"
+        if entry['invertido'] > 0:
+            r_ind = (entry['valor_actual']/entry['invertido']-1.0)*100.0
+            linea += f" ({pct(r_ind,2)} vs {f_money(entry['invertido'])})"
+        qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
+        if qty_txt:
+            linea += f" · Cant: {qty_txt}"
+        if entry.get('peso'):
+            linea += f" · Peso: {pct_plain(entry['peso']*100.0,1)}"
+        lines.append(linea)
     await _send_below_menu(context, chat_id, text="\n".join(lines))
     # torta
-    img = _pie_image_from_items(pf)
+    img = _pie_image_from_items(pf, snapshot)
     if img:
         await _send_below_menu(context, chat_id, photo_bytes=img)
 
@@ -1756,22 +1943,57 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Agregá instrumentos primero."); return
     pf_base = pf["base"]["moneda"].upper()
     f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
-    # Nota: como guardamos importes en base, usamos eso como proxy del valor actual (conservador)
-    total_invertido = 0.0; total_actual = 0.0
-    lines = ["<b>📈 Rendimiento del portafolio (aprox.)</b>"]
-    for it in pf["items"]:
-        simb = it.get("simbolo","")
-        inv = float(it.get("importe") or 0.0)
-        val_act = inv
-        total_invertido += inv; total_actual += val_act
-        delta = val_act - inv
-        r = (delta / inv * 100.0) if inv > 0 else 0.0
-        lines.append(f"• {_label_long(simb)}: {f_money(val_act)} ({pct(r,2)})")
+    snapshot, last_ts, total_invertido, total_actual, tc_val = await pf_market_snapshot(pf)
+    fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
+    header = "<b>📈 Rendimiento del portafolio</b>"
+    if fecha:
+        header += f" <i>Datos al {fecha}</i>"
+    lines = [header]
+    if tc_val:
+        lines.append(f"Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD")
+
+    port_daily_vals = [entry['peso'] * entry['daily_change'] for entry in snapshot if entry.get('daily_change') is not None]
+    if port_daily_vals:
+        daily_sum = sum(port_daily_vals)
+        lines.append(f"Variación diaria estimada: {pct(daily_sum,2)}")
+
+    for entry in snapshot:
+        label = entry['label']
+        valor_actual = entry['valor_actual']
+        invertido = entry['invertido']
+        delta = valor_actual - invertido
+        ret_pct = (delta / invertido * 100.0) if invertido > 0 else None
+        detail = f"• {label}: {f_money(valor_actual)}"
+        if ret_pct is not None:
+            detail += f" ({pct(ret_pct,2)} | Δ {f_money(delta)})"
+        elif invertido > 0:
+            detail += f" (Δ {f_money(delta)})"
+        qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
+        if qty_txt:
+            detail += f" · Cant: {qty_txt}"
+        if entry.get('precio_base') is not None:
+            detail += f" · Px: {f_money(entry['precio_base'])}"
+        daily = entry.get('daily_change')
+        if daily is not None:
+            detail += f" · Día: {pct(daily,2)}"
+        if entry.get('peso'):
+            detail += f" · Peso: {pct_plain(entry['peso']*100.0,1)}"
+        lines.append(detail)
+
     delta_t = total_actual - total_invertido
-    r_t = (delta_t/total_invertido*100.0) if total_invertido>0 else 0.0
-    lines.append(f"\nInvertido: {f_money(total_invertido)}")
-    lines.append(f"Valor actual: {f_money(total_actual)}")
-    lines.append(f"Variación: {f_money(delta_t)} ({pct(r_t,2)})")
+    lines.append("")
+    lines.append(f"Invertido: {f_money(total_invertido)}")
+    lines.append(f"Valor actual estimado: {f_money(total_actual)}")
+    if total_invertido > 0:
+        lines.append(f"Variación total: {f_money(delta_t)} ({pct((delta_t/total_invertido)*100.0,2)})")
+    else:
+        lines.append(f"Variación total: {f_money(delta_t)}")
+
+    sin_datos = [entry['label'] for entry in snapshot if not entry.get('metrics')]
+    if sin_datos:
+        lines.append("")
+        lines.append("Sin datos recientes para: " + ", ".join(sin_datos) + ". Se mantiene el valor cargado.")
+
     await _send_below_menu(context, chat_id, text="\n".join(lines))
 
 # --- Proyección (debajo del menú) ---
@@ -1780,31 +2002,51 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     pf = pf_get(chat_id)
     if not pf["items"]:
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Agregá instrumentos primero."); return
-    async with ClientSession() as session:
-        syms = [it["simbolo"] for it in pf["items"] if it.get("simbolo") and (it["simbolo"].endswith(".BA") or it["simbolo"].endswith("-USD"))]
-        syms = sorted(set(syms))
-        mets, last_ts = await metrics_for_symbols(session, syms) if syms else ({}, None)
-        valores = []; total_val = 0.0
-        for it in pf["items"]:
-            s = it.get("simbolo","")
-            v = float(it.get("importe") or 0.0)
-            valores.append((s, v)); total_val += v
-        if total_val <= 0:
-            await _send_below_menu(context, chat_id, text="Sin valores suficientes para proyectar."); return
-        w3 = 0.0; w6 = 0.0; detail = []
-        for s, v in valores:
-            w = v/total_val
-            m = mets.get(s, {})
-            p3 = projection_3m(m) if m else 0.0
-            p6 = projection_6m(m) if m else 0.0
-            w3 += w*p3; w6 += w*p6
-            if s in mets:
-                detail.append(f"• {_label_short(s)} → 3M {pct(p3,1)} | 6M {pct(p6,1)} (peso {pct(w*100,1)})")
-        fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-        lines = [f"<b>🔮 Proyección del Portafolio</b>" + (f" <i>Últ. dato: {fecha}</i>" if fecha else ""),
-                 f"Proyección 3M (aprox): {pct(w3,1)}",
-                 f"Proyección 6M (aprox): {pct(w6,1)}", "", *detail]
-        await _send_below_menu(context, chat_id, text="\n".join(lines))
+    snapshot, last_ts, _, total_actual, tc_val = await pf_market_snapshot(pf)
+    if total_actual <= 0:
+        await _send_below_menu(context, chat_id, text="Sin valores suficientes para proyectar."); return
+
+    fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
+    pf_base = pf["base"]["moneda"].upper()
+    f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
+
+    w3 = 0.0
+    w6 = 0.0
+    detail: List[str] = []
+    for entry in snapshot:
+        metrics = entry.get('metrics') or {}
+        weight = entry.get('peso') or 0.0
+        if not metrics:
+            continue
+        p3 = projection_3m(metrics)
+        p6 = projection_6m(metrics)
+        w3 += weight * p3
+        w6 += weight * p6
+        short_label = _label_short(entry['symbol']) if entry.get('symbol') else entry['label']
+        detail.append(f"• {short_label} → 3M {pct(p3,2)} | 6M {pct(p6,2)} (peso {pct_plain(weight*100.0,1)})")
+
+    forecast3 = total_actual * (1.0 + w3/100.0)
+    forecast6 = total_actual * (1.0 + w6/100.0)
+
+    header = "<b>🔮 Proyección del Portafolio</b>"
+    if fecha:
+        header += f" <i>Datos al {fecha}</i>"
+    lines = [header, f"Valor actual estimado: {f_money(total_actual)}"]
+    lines.append(f"Proyección 3M: {pct(w3,2)} → {f_money(forecast3)}")
+    lines.append(f"Proyección 6M: {pct(w6,2)} → {f_money(forecast6)}")
+    if tc_val:
+        lines.append(f"Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD")
+
+    if detail:
+        lines.append("")
+        lines.extend(detail)
+
+    sin_datos = [entry['label'] for entry in snapshot if not entry.get('metrics')]
+    if sin_datos:
+        lines.append("")
+        lines.append("Sin datos de mercado para: " + ", ".join(sin_datos) + ". Se asumió variación 0%.")
+
+    await _send_below_menu(context, chat_id, text="\n".join(lines))
 
 # ============================ RESUMEN DIARIO ============================
 
