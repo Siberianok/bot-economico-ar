@@ -19,7 +19,7 @@ try:
 except Exception:
     plt = None
 
-from aiohttp import ClientSession, ClientTimeout
+from aiohttp import ClientSession, ClientTimeout, web
 from telegram import (
     Update, LinkPreviewOptions, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton,
 )
@@ -1838,6 +1838,27 @@ async def keepalive_loop():
         logging.info("keepalive_loop cancelado")
         raise
 
+
+def setup_health_routes(application: Application) -> None:
+    updater = getattr(application, "updater", None)
+    if not updater:
+        logging.warning("No updater disponible para configurar healthchecks")
+        return
+
+    webhook_app = getattr(updater, "webhook_app", None)
+    if not isinstance(webhook_app, web.Application):
+        logging.warning("Webhook app no disponible para configurar healthchecks")
+        return
+
+    async def _health(_: web.Request) -> web.Response:
+        return web.json_response({"status": "ok"})
+
+    for path in ("/", "/healthz"):
+        try:
+            webhook_app.router.add_get(path, _health)
+        except (RuntimeError, ValueError) as exc:
+            logging.debug("No se pudo registrar ruta %s: %s", path, exc)
+
 BOT_COMMANDS = [
     BotCommand("start","Menú principal"),
     BotCommand("economia","Menú de economía"),
@@ -1918,6 +1939,7 @@ async def main():
     load_state()
     application = build_application()
     _schedule_all_subs(application)
+    setup_health_routes(application)
 
     alerts_task = None
     keepalive_task = None
