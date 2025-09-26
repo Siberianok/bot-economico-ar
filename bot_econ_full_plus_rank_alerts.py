@@ -657,7 +657,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /alertas_menu — Crear/pausar alertas\n"
         "• /portafolio — Armar y proyectar tu cartera\n"
         "• /subs — Resumen diario programado\n"
-        "• /resumen — Resumen de hoy al instante\n"
     )
     await update.effective_message.reply_text(text)
 
@@ -1124,7 +1123,9 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(f"El objetivo debe ser {'mayor' if al['op']=='>' else 'menor'} que {fmt_money_ars(cur)}."); return AL_VALUE
             ALERTS.setdefault(chat_id, []).append({"kind":"fx","type":al["type"],"side":al["side"],"op":al["op"],"value":float(thr)})
             save_state()
-            await update.message.reply_text("Listo. Alerta agregada ✅"); return ConversationHandler.END
+            await update.message.reply_text("Listo. Alerta agregada ✅")
+            await cmd_alertas_menu(update, context)
+            return ConversationHandler.END
 
         if al.get("kind") == "metric":
             rp = await get_riesgo_pais(session); infl = await get_inflacion_mensual(session); rv = await get_reservas_lamacro(session)
@@ -1139,7 +1140,9 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text("El objetivo debe ser válido respecto al valor actual."); return AL_VALUE
             ALERTS.setdefault(chat_id, []).append({"kind":"metric","type":al["type"],"op":al["op"],"value":float(thr)})
             save_state()
-            await update.message.reply_text("Listo. Alerta agregada ✅"); return ConversationHandler.END
+            await update.message.reply_text("Listo. Alerta agregada ✅")
+            await cmd_alertas_menu(update, context)
+            return ConversationHandler.END
 
         # ticker
         sym, op = al.get("symbol"), al.get("op")
@@ -1152,7 +1155,9 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"El precio objetivo debe ser {'mayor' if op=='>' else 'menor'} que {fmt_money_ars(last_px)}."); return AL_VALUE
         ALERTS.setdefault(chat_id, []).append({"kind":"ticker","symbol":sym,"op":op,"value":float(thr),"mode":"absolute"})
         save_state()
-        await update.message.reply_text("Listo. Alerta agregada ✅"); return ConversationHandler.END
+        await update.message.reply_text("Listo. Alerta agregada ✅")
+        await cmd_alertas_menu(update, context)
+        return ConversationHandler.END
 
 # ============================ LOOP ALERTAS ============================
 
@@ -1378,7 +1383,11 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("Cripto (USD)", callback_data="PF:ADD:cripto")],
             [InlineKeyboardButton("Volver", callback_data="PF:BACK")]
         ])
-        await q.edit_message_text("¿Qué querés agregar?", reply_markup=kb_add); return
+        if q.message and (q.message.text or "").startswith("📦 Menú Portafolio"):
+            await _send_below_menu(context, chat_id, text="¿Qué querés agregar?", reply_markup=kb_add)
+        else:
+            await q.edit_message_text("¿Qué querés agregar?", reply_markup=kb_add)
+        return
 
     if data.startswith("PF:ADD:"):
         tipo = data.split(":")[2]
@@ -1484,7 +1493,11 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "PF:BACK":
-        await q.edit_message_text("📦 Menú Portafolio", reply_markup=kb_pf_main()); return
+        try:
+            await q.delete_message()
+        except Exception:
+            await q.edit_message_reply_markup(reply_markup=None)
+        return
 
 def _parse_num_text(s: str) -> Optional[float]:
     if re.search(r"[^\d\.,\-+]", s): return None
@@ -1860,14 +1873,12 @@ def setup_health_routes(application: Application) -> None:
             logging.debug("No se pudo registrar ruta %s: %s", path, exc)
 
 BOT_COMMANDS = [
-    BotCommand("start","Menú principal"),
     BotCommand("economia","Menú de economía"),
     BotCommand("acciones","Menú acciones .BA"),
     BotCommand("cedears","Menú CEDEARs .BA"),
     BotCommand("alertas_menu","Configurar alertas"),
     BotCommand("portafolio","Menú portafolio"),
     BotCommand("subs","Suscripción a resumen diario"),
-    BotCommand("resumen","Resumen de hoy al instante"),
 ]
 
 
