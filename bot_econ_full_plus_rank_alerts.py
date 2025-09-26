@@ -650,10 +650,32 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         if (t,l) not in picked: picked.append((t,l))
     return picked[:limit]
 
-def format_news_block(news: List[Tuple[str, str]]) -> str:
-    if not news: return "<b>📰 Noticias</b>\n—"
-    body = "\n\n".join([f"{i}. {anchor(l, t)}\n{_impact_lines(t)}" for i,(t,l) in enumerate(news, 1)])
-    return "<b>📰 Noticias</b>\n" + body
+def _short_title(text: str, limit: int = 32) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def format_news_block(news: List[Tuple[str, str]]) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    if not news:
+        return "<b>📰 Noticias</b>\n—", None
+
+    body_lines = []
+    rows: List[List[InlineKeyboardButton]] = []
+    current_row: List[InlineKeyboardButton] = []
+    for title, link in news:
+        body_lines.append(f"• {anchor(link, title)}\n{_impact_lines(title)}")
+        btn = InlineKeyboardButton(_short_title(title, 36), url=link)
+        current_row.append(btn)
+        if len(current_row) == 2:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+
+    markup = InlineKeyboardMarkup(rows) if rows else None
+    body = "\n\n".join(body_lines)
+    return "<b>📰 Noticias</b>\n" + body, markup
 
 # ============================ FORMATS & RANKINGS ============================
 
@@ -792,10 +814,30 @@ async def _rank_top3(update: Update, symbols: List[str], title: str):
     async with ClientSession() as session:
         mets, last_ts = await metrics_for_symbols(session, symbols)
         fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-        pairs = sorted([(sym, m["6m"]) for sym,m in mets.items() if m.get("6m") is not None], key=lambda x: x[1], reverse=True)
-        top_syms = [sym for sym,_ in pairs[:3]]
+        pairs = sorted([(sym, m["6m"]) for sym, m in mets.items() if m.get("6m") is not None], key=lambda x: x[1], reverse=True)
+        top_syms = [sym for sym, _ in pairs[:3]]
         msg = format_top3_table(title, fecha, top_syms, mets)
-        await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+        await update.effective_message.reply_text(
+            msg,
+            parse_mode=ParseMode.HTML,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+
+        if HAS_MPL and pairs:
+            chart_rows = []
+            for sym, value in pairs[:3]:
+                if value is None:
+                    continue
+                chart_rows.append((_label_short(sym), [float(value)]))
+            subtitle = f"Datos al {fecha}" if fecha else None
+            img = _bar_image_from_rank(
+                chart_rows,
+                title=f"{title} — Rendimiento 6M",
+                subtitle=subtitle,
+            )
+            if img:
+                await update.effective_message.reply_photo(photo=img)
+
 
 async def _rank_proj5(update: Update, symbols: List[str], title: str):
     async with ClientSession() as session:
@@ -803,11 +845,31 @@ async def _rank_proj5(update: Update, symbols: List[str], title: str):
         fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
         rows = []
         for sym, m in mets.items():
-            if m.get("6m") is None: continue
+            if m.get("6m") is None:
+                continue
             rows.append((sym, projection_3m(m), projection_6m(m)))
         rows.sort(key=lambda x: x[2], reverse=True)
-        msg = format_proj_dual(title, fecha, rows[:5])
-        await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+        top_rows = rows[:5]
+        msg = format_proj_dual(title, fecha, top_rows)
+        await update.effective_message.reply_text(
+            msg,
+            parse_mode=ParseMode.HTML,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+
+        if HAS_MPL and top_rows:
+            chart_rows = []
+            for sym, p3, p6 in top_rows:
+                chart_rows.append((_label_short(sym), [p3, p6]))
+            subtitle = f"Datos al {fecha}" if fecha else None
+            img = _bar_image_from_rank(
+                chart_rows,
+                title=f"{title} — Proyecciones",
+                subtitle=subtitle,
+                series_labels=["Proy. 3M", "Proy. 6M"],
+            )
+            if img:
+                await update.effective_message.reply_photo(photo=img)
 
 # ============================ COMANDOS / MENÚS ============================
 
@@ -821,17 +883,44 @@ def dec_and_maybe_show(update: Update, context: ContextTypes.DEFAULT_TYPE, name:
         return show_func(update, context)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "¡Bienvenido! 📊\n\n"
-        "Menús rápidos:\n"
-        "• /economia — Dólares, Reservas, Inflación, Riesgo y Noticias\n"
-        "• /acciones — Top/Proyección de acciones .BA\n"
-        "• /cedears — Top/Proyección de CEDEARs\n"
-        "• /alertas_menu — Crear/pausar alertas\n"
-        "• /portafolio — Armar y proyectar tu cartera\n"
-        "• /subs — Resumen diario programado\n"
+    intro = (
+        "<b>¡Hola! Soy tu asistente de mercados argentinos.</b>\n"
+        "<i>Seguimiento de dólar, bonos, acciones, portafolio y alertas en un mismo lugar.</i>\n\n"
+        "Elegí una opción rápida o usá los comandos clásicos:\n"
+        "• /economia — Panel macro: dólares, reservas, inflación, riesgo y noticias\n"
+        "• /acciones — Rankings y proyecciones de acciones .BA\n"
+        "• /cedears — Rankings y proyecciones de CEDEARs\n"
+        "• /alertas_menu — Gestioná alertas personalizadas\n"
+        "• /portafolio — Armá y analizá tu cartera\n"
+        "• /subs — Suscripción al resumen diario\n"
     )
-    await update.effective_message.reply_text(text)
+
+    kb_rows = [
+        [
+            InlineKeyboardButton("💵 Dólar y Reservas", callback_data="ECO:DOLAR"),
+            InlineKeyboardButton("📰 Noticias", callback_data="ECO:NOTICIAS"),
+        ],
+        [
+            InlineKeyboardButton("📈 Acciones Top 3", callback_data="ACC:TOP3"),
+            InlineKeyboardButton("🏁 Acciones Proyección", callback_data="ACC:TOP5"),
+        ],
+        [
+            InlineKeyboardButton("🌎 Cedears Top 3", callback_data="CED:TOP3"),
+            InlineKeyboardButton("🌐 Cedears Proyección", callback_data="CED:TOP5"),
+        ],
+        [
+            InlineKeyboardButton("🔔 Mis alertas", callback_data="AL:LIST"),
+            InlineKeyboardButton("🧾 Resumen diario", callback_data="ST:SUBS"),
+        ],
+        [InlineKeyboardButton("💼 Portafolio", callback_data="PF:MENU")],
+    ]
+
+    await update.effective_message.reply_text(
+        intro,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(kb_rows),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
 
 async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
@@ -907,8 +996,13 @@ async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         news = await fetch_rss_entries(session, limit=5)
-    txt = format_news_block(news or [])
-    await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    txt, kb = format_news_block(news or [])
+    await update.effective_message.reply_text(
+        txt,
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+        link_preview_options=LinkPreviewOptions(prefer_small_media=True),
+    )
 
 async def cmd_menu_economia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_menu_counter(context, "economia", 5)
@@ -1449,6 +1543,12 @@ async def cmd_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(txt, reply_markup=kb_times_full(), parse_mode=ParseMode.HTML)
     return SUBS_SET_TIME
 
+
+async def subs_start_from_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    return await cmd_subs(update, context)
+
 async def subs_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     chat_id = q.message.chat_id; data = q.data
@@ -1511,6 +1611,10 @@ async def _pf_total_usado(chat_id: int) -> float:
 async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     chat_id = q.message.chat_id; data = q.data
+
+    if data == "PF:MENU":
+        await cmd_portafolio(update, context)
+        return
 
     if data == "PF:HELP":
         txt = ("<b>Cómo armar tu portafolio</b>\n\n"
@@ -1916,6 +2020,94 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
 
     return enriched, last_ts, total_invertido, total_actual, tc_val
 
+def _bar_image_from_rank(
+    rows: List[Tuple[str, List[Optional[float]]]],
+    title: str,
+    subtitle: Optional[str] = None,
+    series_labels: Optional[List[str]] = None,
+) -> Optional[bytes]:
+    if not HAS_MPL:
+        return None
+
+    clean_rows: List[Tuple[str, List[Optional[float]]]] = []
+    for label, values in rows:
+        vals = [float(v) if v is not None else None for v in values]
+        if any(v is not None for v in vals):
+            clean_rows.append((label, vals))
+
+    if not clean_rows:
+        return None
+
+    n_series = len(clean_rows[0][1]) if clean_rows[0][1] else 0
+    if n_series == 0:
+        return None
+
+    for _, vals in clean_rows:
+        if len(vals) != n_series:
+            return None
+
+    palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    fig, ax = plt.subplots(figsize=(6, 4), dpi=160)
+    x_positions = list(range(len(clean_rows)))
+    width = 0.75 / max(1, n_series)
+
+    for idx in range(n_series):
+        heights = [vals[idx] if vals[idx] is not None else 0.0 for _, vals in clean_rows]
+        present_flags = [vals[idx] is not None for _, vals in clean_rows]
+        offsets = [x + (idx - (n_series - 1) / 2) * width for x in x_positions]
+        bars = ax.bar(
+            offsets,
+            heights,
+            width=width,
+            color=palette[idx % len(palette)],
+            label=series_labels[idx] if series_labels and idx < len(series_labels) else None,
+        )
+
+        for bar, val, present in zip(bars, heights, present_flags):
+            if not present:
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    0.2,
+                    "s/d",
+                    ha="center",
+                    va="bottom",
+                    fontsize=8,
+                    color="#666666",
+                )
+                continue
+
+            y = bar.get_height()
+            va = "bottom" if y >= 0 else "top"
+            offset = 0.6 if y >= 0 else -0.6
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                y + offset,
+                f"{val:.1f}%",
+                ha="center",
+                va=va,
+                fontsize=8,
+                color="#1a1a1a",
+            )
+
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels([label for label, _ in clean_rows], rotation=15, ha="right")
+    ax.axhline(0, color="#444444", linewidth=0.8)
+    ax.set_ylabel("Variación %")
+    ax.set_title(title + (f"\n{subtitle}" if subtitle else ""))
+    if series_labels:
+        ax.legend()
+    ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
 def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, Any]]] = None) -> Optional[bytes]:
     if not HAS_MPL:
         return None
@@ -2143,7 +2335,7 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if rv:
         partes.append(f"<b>🏦 Reservas</b> {fmt_number(rv[0],0)} MUS$" + (f" <i>({rv[1]})</i>" if rv[1] else ""))
     if news:
-        partes.append(format_news_block(news))
+        partes.append(format_news_block(news)[0])
 
     txt = "\n\n".join(partes) if partes else "Sin datos para el resumen ahora."
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
@@ -2244,7 +2436,10 @@ def build_application() -> Application:
 
     # Suscripciones
     subs_conv = ConversationHandler(
-        entry_points=[CommandHandler("subs", cmd_subs)],
+        entry_points=[
+            CommandHandler("subs", cmd_subs),
+            CallbackQueryHandler(subs_start_from_cb, pattern="^ST:SUBS$"),
+        ],
         states={SUBS_SET_TIME: [CallbackQueryHandler(subs_cb, pattern="^SUBS:")]},
         fallbacks=[],
         per_chat=True,
