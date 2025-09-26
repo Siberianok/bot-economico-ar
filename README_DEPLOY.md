@@ -7,8 +7,10 @@
 - `render.yaml` — blueprint de Render (servicio tipo Worker).
 
 ## 2) Variables de entorno
-- `BOT_TOKEN` — el token del bot de Telegram (NO hardcodear).  
-- (opcional) `ALERTS_DB_PATH` — ruta del SQLite para alertas (por defecto `./alerts.db`). En Render esta guía usa `/var/tmp/alerts.db` para minimizar pérdidas por redeploy.
+- `BOT_TOKEN` — el token del bot de Telegram (NO hardcodear).
+- (opcional) `STATE_PATH` — ruta del archivo JSON donde se persiste el estado (`alerts`, `subs` y `pf`). Por defecto el bot usa `./state.json`, pero en Render conviene apuntarlo a `/var/tmp/state.json` (o a un volumen persistente) para minimizar pérdidas por redeploy.
+- (opcional) `UPSTASH_REDIS_REST_URL` y `UPSTASH_REDIS_REST_TOKEN` — si se definen, el bot persistirá todo en Upstash usando su API HTTP.
+- (opcional) `UPSTASH_STATE_KEY` — clave del registro JSON dentro de Upstash (default `bot-econ-state`).
 
 ## 3) Deploy rápido (desde un repo)
 1. Subí estos 3 archivos a un repositorio (GitHub/GitLab).
@@ -17,7 +19,7 @@
 4. En *Environment variables*, agregá `BOT_TOKEN` con tu token real.
 5. Deploy.
 
-> Plan Free: Render puede reiniciar el worker de vez en cuando. Las alertas se persisten en SQLite local; si el contenedor se reinicia, el archivo en `/var/tmp` suele sobrevivir al *restart* del proceso, pero no a un *redeploy*. Para persistencia “fuerte”, migrá a una pequeña base externa (p.ej. PostgreSQL Free Tier) con `sqlite3` → `psycopg2` (cambios mínimos).
+> Plan Free: Render puede reiniciar el worker de vez en cuando. Con Upstash configurado el estado queda fuera de Render; si no, se escribe en un JSON local (`STATE_PATH`). El archivo en `/var/tmp` suele sobrevivir a reinicios suaves, pero no a *redeploys* completos. Para persistencia “fuerte”, usá Upstash o un volumen/bucket externo.
 
 ## 4) Comandos finales
 - `/dolar` — Tipos de cambio (Blue, MEP, CCL, Cripto, Oficial, Mayorista).  

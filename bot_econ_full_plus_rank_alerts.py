@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 
 import os, asyncio, logging, re, html as _html, json, math, io, signal
+import urllib.request
+import urllib.error
 from time import time
 from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime
@@ -37,6 +39,9 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "tgwebhook").strip().strip("/")
 PORT = int(os.getenv("PORT", "10000"))
 BASE_URL = os.getenv("BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "http://localhost")).rstrip("/")
 ENV_STATE_PATH = os.getenv("STATE_PATH", "state.json")
+UPSTASH_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("UPSTASH_URL") or "").strip()
+UPSTASH_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("UPSTASH_TOKEN") or "").strip()
+UPSTASH_STATE_KEY = os.getenv("UPSTASH_STATE_KEY", "bot-econ-state").strip()
 
 if not TELEGRAM_TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN/BOT_TOKEN no configurado.")
@@ -148,27 +153,97 @@ def _writable_path(candidate: str) -> str:
             log.warning("No puedo escribir estado: %s", e)
             return fallback
 
-STATE_PATH = _writable_path(ENV_STATE_PATH)
+USE_UPSTASH = bool(UPSTASH_URL and UPSTASH_TOKEN)
+STATE_PATH = _writable_path(ENV_STATE_PATH) if not USE_UPSTASH else None
 ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 SUBS: Dict[int, Dict[str, Any]] = {}
 PF: Dict[int, Dict[str, Any]] = {}
 
+
+def _upstash_request(path: str, *, method: str = "GET", data: Optional[str] = None) -> Dict[str, Any]:
+    if not USE_UPSTASH:
+        raise RuntimeError("Upstash no configurado")
+    url = f"{UPSTASH_URL.rstrip('/')}/{path.lstrip('/')}"
+    req = urllib.request.Request(url, method=method)
+    req.add_header("Authorization", f"Bearer {UPSTASH_TOKEN}")
+    if data is not None:
+        req.data = data.encode("utf-8")
+        req.add_header("Content-Type", "text/plain; charset=utf-8")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+        raise RuntimeError(f"Upstash HTTP {e.code}: {detail}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Upstash connection error: {e}") from e
+    try:
+        return json.loads(body)
+    except Exception as e:
+        raise RuntimeError(f"Upstash invalid response: {body}") from e
+
+
+def _load_state_from_upstash() -> Optional[Dict[str, Any]]:
+    try:
+        resp = _upstash_request(f"get/{UPSTASH_STATE_KEY}")
+    except Exception as e:
+        log.warning("No pude leer estado de Upstash: %s", e)
+        return None
+    raw = resp.get("result") if isinstance(resp, dict) else None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        log.warning("Estado Upstash inválido: %s", e)
+        return None
+
+
+def _save_state_to_upstash(payload: Dict[str, Any]) -> None:
+    data = json.dumps(payload, ensure_ascii=False)
+    try:
+        _upstash_request(f"set/{UPSTASH_STATE_KEY}", method="POST", data=data)
+    except Exception as e:
+        log.warning("No pude guardar estado en Upstash: %s", e)
+
+
 def load_state():
     global ALERTS, SUBS, PF
-    try:
-        with open(STATE_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        ALERTS = {int(k): v for k,v in data.get("alerts", {}).items()}
-        SUBS = {int(k): v for k,v in data.get("subs", {}).items()}
-        PF = {int(k): v for k,v in data.get("pf", {}).items()}
-        log.info("State loaded. alerts=%d subs=%d pf=%d", sum(len(v) for v in ALERTS.values()), len(SUBS), len(PF))
-    except Exception:
+    data: Optional[Dict[str, Any]] = None
+    if USE_UPSTASH:
+        data = _load_state_from_upstash()
+    if data is None and not USE_UPSTASH:
+        try:
+            with open(STATE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = None
+    if data:
+        ALERTS = {int(k): v for k, v in data.get("alerts", {}).items()}
+        SUBS = {int(k): v for k, v in data.get("subs", {}).items()}
+        PF = {int(k): v for k, v in data.get("pf", {}).items()}
+        log.info(
+            "State loaded. alerts=%d subs=%d pf=%d",
+            sum(len(v) for v in ALERTS.values()),
+            len(SUBS),
+            len(PF),
+        )
+    else:
         log.info("No previous state found.")
 
+
 def save_state():
+    payload = {"alerts": ALERTS, "subs": SUBS, "pf": PF}
+    if USE_UPSTASH:
+        _save_state_to_upstash(payload)
+        return
     try:
         with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump({"alerts": ALERTS, "subs": SUBS, "pf": PF}, f, ensure_ascii=False)
+            json.dump(payload, f, ensure_ascii=False)
     except Exception as e:
         log.warning("save_state error: %s", e)
 
