@@ -1,5 +1,6 @@
 python-telegram-bot==20.8
-httpx==0.26.*
 aiohttp==3.9.*
+APScheduler==3.10.*
+httpx==0.26.*
 certifi
 tzdata
