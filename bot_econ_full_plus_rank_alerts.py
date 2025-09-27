@@ -1207,11 +1207,20 @@ async def alertas_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_alertas_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb_pause = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Pausar (Indefinida)","AP:PAUSE:INF")],
-        [InlineKeyboardButton("Pausar 1h","AP:PAUSE:1"),InlineKeyboardButton("Pausar 3h","AP:PAUSE:3")],
-        [InlineKeyboardButton("Pausar 6h","AP:PAUSE:6"),InlineKeyboardButton("Pausar 12h","AP:PAUSE:12")],
-        [InlineKeyboardButton("Pausar 24h","AP:PAUSE:24"),InlineKeyboardButton("Reanudar","AP:RESUME")],
-        [InlineKeyboardButton("Cerrar","AP:CLOSE")]
+        [InlineKeyboardButton("Pausar (Indefinida)", callback_data="AP:PAUSE:INF")],
+        [
+            InlineKeyboardButton("Pausar 1h", callback_data="AP:PAUSE:1"),
+            InlineKeyboardButton("Pausar 3h", callback_data="AP:PAUSE:3"),
+        ],
+        [
+            InlineKeyboardButton("Pausar 6h", callback_data="AP:PAUSE:6"),
+            InlineKeyboardButton("Pausar 12h", callback_data="AP:PAUSE:12"),
+        ],
+        [
+            InlineKeyboardButton("Pausar 24h", callback_data="AP:PAUSE:24"),
+            InlineKeyboardButton("Reanudar", callback_data="AP:RESUME"),
+        ],
+        [InlineKeyboardButton("Cerrar", callback_data="AP:CLOSE")],
     ])
     await update.effective_message.reply_text("Pausa de alertas:", reply_markup=kb_pause)
 
