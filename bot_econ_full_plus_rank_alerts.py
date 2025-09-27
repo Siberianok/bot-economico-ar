@@ -2601,16 +2601,39 @@ def setup_health_routes(application: Application) -> None:
         return
 
     webhook_app = getattr(updater, "webhook_app", None)
-    if not isinstance(webhook_app, web.Application):
+    if webhook_app is None:
+        logging.warning("Webhook app no disponible para configurar healthchecks")
+        return
+
+    if hasattr(webhook_app, "app"):
+        inner_app = getattr(webhook_app, "app", None)
+    else:
+        inner_app = webhook_app
+
+    if not isinstance(inner_app, web.Application):
         logging.warning("Webhook app no disponible para configurar healthchecks")
         return
 
     async def _health(_: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
 
+    router = inner_app.router
+
     for path in ("/", "/healthz"):
+        already_registered = False
+        for route in router.routes():
+            resource = getattr(route, "resource", None)
+            canonical = getattr(resource, "canonical", None) if resource else None
+            if canonical != path:
+                continue
+            method = getattr(route, "method", None)
+            if method in (None, "*", "GET"):
+                already_registered = True
+                break
+        if already_registered:
+            continue
         try:
-            webhook_app.router.add_get(path, _health)
+            router.add_get(path, _health)
         except (RuntimeError, ValueError) as exc:
             logging.debug("No se pudo registrar ruta %s: %s", path, exc)
 
