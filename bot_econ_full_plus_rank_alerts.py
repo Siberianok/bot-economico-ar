@@ -2695,7 +2695,6 @@ async def main():
     load_state()
     application = build_application()
     _schedule_all_subs(application)
-    setup_health_routes(application)
 
     alerts_task = None
     keepalive_task = None
@@ -2714,6 +2713,7 @@ async def main():
                 webhook_url=WEBHOOK_URL,
                 drop_pending_updates=True,
             )
+            setup_health_routes(application)
             updater_started = True
 
             await application.start()
