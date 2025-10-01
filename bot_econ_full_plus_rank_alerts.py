@@ -9,7 +9,7 @@ from time import time
 from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Tuple, Any, Optional, Set
+from typing import Dict, List, Tuple, Any, Optional, Set, Callable
 from urllib.parse import urlparse
 
 # ====== matplotlib opcional (no rompe si no está instalado) ======
@@ -2642,6 +2642,64 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
     buf.seek(0)
     return buf.read()
 
+
+def _projection_bar_image(
+    points: List[Tuple[str, Optional[float]]],
+    formatter: Callable[[Optional[float]], str],
+    title: str,
+    subtitle: Optional[str] = None,
+) -> Optional[bytes]:
+    if not HAS_MPL:
+        return None
+
+    cleaned: List[Tuple[str, float]] = []
+    for label, value in points:
+        if value is None:
+            continue
+        try:
+            cleaned.append((label, float(value)))
+        except (TypeError, ValueError):
+            continue
+
+    if len(cleaned) < 2:
+        return None
+
+    labels = [label for label, _ in cleaned]
+    values = [val for _, val in cleaned]
+    max_val = max(values)
+
+    fig, ax = plt.subplots(figsize=(6, 4), dpi=160)
+    colors = ["#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b"]
+    bars = ax.bar(range(len(values)), values, color=colors[: len(values)])
+
+    offset = max_val * 0.02 if max_val else 1.0
+    for bar, val in zip(bars, values):
+        label = formatter(val)
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            val + offset,
+            label,
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            rotation=90 if len(label) > 12 else 0,
+        )
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Monto estimado")
+    ax.set_title(title + (f"\n{subtitle}" if subtitle else ""))
+    ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
 async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     pf = pf_get(chat_id)
     pf_base = pf["base"]["moneda"].upper()
@@ -2679,6 +2737,9 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         if entry.get('peso'):
             linea += f" · Peso: {pct_plain(entry['peso']*100.0,1)}"
         lines.append(linea)
+    if not HAS_MPL:
+        lines.append("")
+        lines.append("ℹ️ Instalá matplotlib para ver la composición en gráficos.")
     await _send_below_menu(context, chat_id, text="\n".join(lines))
     # torta
     img = _pie_image_from_items(pf, snapshot)
@@ -2706,10 +2767,13 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         lines.append(tc_line)
 
     port_daily_vals = [entry['peso'] * entry['daily_change'] for entry in snapshot if entry.get('daily_change') is not None]
+    daily_sum: Optional[float] = None
     if port_daily_vals:
         daily_sum = sum(port_daily_vals)
         lines.append(f"Variación diaria estimada: {pct(daily_sum,2)}")
 
+    include_daily = any(entry.get('daily_change') is not None for entry in snapshot)
+    chart_rows: List[Tuple[str, List[Optional[float]]]] = []
     for entry in snapshot:
         label = entry['label']
         valor_actual = entry['valor_actual']
@@ -2733,6 +2797,13 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
             detail += f" · Peso: {pct_plain(entry['peso']*100.0,1)}"
         lines.append(detail)
 
+        short_label = _label_short(entry['symbol']) if entry.get('symbol') else label
+        values: List[Optional[float]] = [ret_pct]
+        if include_daily:
+            values.append(daily if daily is not None else None)
+        if any(v is not None for v in values):
+            chart_rows.append((short_label, values))
+
     delta_t = total_actual - total_invertido
     lines.append("")
     lines.append(f"Invertido: {f_money(total_invertido)}")
@@ -2747,7 +2818,28 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         lines.append("")
         lines.append("Sin datos recientes para: " + ", ".join(sin_datos) + ". Se mantiene el valor cargado.")
 
+    if not HAS_MPL:
+        lines.append("")
+        lines.append("ℹ️ Instalá matplotlib para ver el gráfico de rendimiento.")
+
     await _send_below_menu(context, chat_id, text="\n".join(lines))
+
+    total_values: List[Optional[float]] = []
+    total_values.append((delta_t / total_invertido * 100.0) if total_invertido > 0 else None)
+    if include_daily:
+        total_values.append(daily_sum if daily_sum is not None else None)
+    if any(v is not None for v in total_values):
+        chart_rows.append(("Portafolio", total_values))
+
+    series_labels = ["Acumulado %"] + (["Diario %"] if include_daily else [])
+    img = _bar_image_from_rank(
+        chart_rows,
+        "Rendimiento por instrumento",
+        "Variación porcentual estimada",
+        series_labels,
+    )
+    if img:
+        await _send_below_menu(context, chat_id, photo_bytes=img)
 
 # --- Proyección (debajo del menú) ---
 
@@ -2802,7 +2894,24 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         lines.append("")
         lines.append("Sin datos de mercado para: " + ", ".join(sin_datos) + ". Se asumió variación 0%.")
 
+    if not HAS_MPL:
+        lines.append("")
+        lines.append("ℹ️ Instalá matplotlib para ver la proyección en gráficos.")
+
     await _send_below_menu(context, chat_id, text="\n".join(lines))
+
+    img = _projection_bar_image(
+        [
+            ("Actual", total_actual),
+            ("3M", forecast3),
+            ("6M", forecast6),
+        ],
+        f_money,
+        "Proyección del portafolio",
+        "Valores estimados",
+    )
+    if img:
+        await _send_below_menu(context, chat_id, photo_bytes=img)
 
 # ============================ RESUMEN DIARIO ============================
 
