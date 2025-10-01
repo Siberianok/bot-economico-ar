@@ -721,15 +721,20 @@ def _short_title(text: str, limit: int = 32) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
-def format_news_block(news: List[Tuple[str, str]]) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
-    if not news:
-        return "<b>📰 Noticias</b>\n—", None
+def _format_news_item(title: str, link: str) -> str:
+    return f"• {anchor(link, title)}\n{_impact_lines(title)}"
 
-    body_lines = []
+
+def _build_news_layout(news: List[Tuple[str, str]]) -> Tuple[str, Optional[InlineKeyboardMarkup], List[str]]:
+    header = "<b>📰 Noticias</b>"
+    if not news:
+        return header, None, []
+
     rows: List[List[InlineKeyboardButton]] = []
     current_row: List[InlineKeyboardButton] = []
+    body_lines: List[str] = []
     for title, link in news:
-        body_lines.append(f"• {anchor(link, title)}\n{_impact_lines(title)}")
+        body_lines.append(_format_news_item(title, link))
         btn = InlineKeyboardButton(_short_title(title, 36), url=link)
         current_row.append(btn)
         if len(current_row) == 2:
@@ -739,8 +744,13 @@ def format_news_block(news: List[Tuple[str, str]]) -> Tuple[str, Optional[Inline
         rows.append(current_row)
 
     markup = InlineKeyboardMarkup(rows) if rows else None
-    body = "\n\n".join(body_lines)
-    return "<b>📰 Noticias</b>\n" + body, markup
+    return header, markup, body_lines
+
+
+def format_news_block(news: List[Tuple[str, str]]) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+    header, markup, body_lines = _build_news_layout(news)
+    body = "\n\n".join(body_lines) if body_lines else "—"
+    return f"{header}\n{body}", markup
 
 # ============================ FORMATS & RANKINGS ============================
 
@@ -1063,13 +1073,20 @@ async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         news = await fetch_rss_entries(session, limit=5)
-    txt, kb = format_news_block(news or [])
+    header, kb, items = _build_news_layout(news or [])
+    header_body = f"{header}\n—" if not items else header
     await update.effective_message.reply_text(
-        txt,
+        header_body,
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
-        link_preview_options=LinkPreviewOptions(prefer_small_media=True),
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
+    for item in items:
+        await update.effective_message.reply_text(
+            item,
+            parse_mode=ParseMode.HTML,
+            link_preview_options=LinkPreviewOptions(prefer_small_media=True),
+        )
 
 async def cmd_menu_economia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_menu_counter(context, "economia", 5)
