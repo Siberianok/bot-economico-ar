@@ -18,9 +18,15 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from matplotlib import colors as mcolors
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    import numpy as np
     HAS_MPL = True
 except Exception:
     plt = None
+    mcolors = None
+    Poly3DCollection = None
+    np = None
 
 from aiohttp import ClientSession, ClientTimeout, web
 from telegram import (
@@ -2631,12 +2637,121 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
     if otros > 0:
         labels2.append("Otros"); vals2.append(otros)
 
-    fig = plt.figure(figsize=(5, 5), dpi=160)
-    plt.pie(vals2, labels=labels2, autopct=lambda p: f"{p:.1f}%", startangle=90)
-    plt.title("Composición del Portafolio")
-    plt.axis('equal')
+    fig = plt.figure(figsize=(8, 5.5), dpi=160)
+    ax = fig.add_subplot(121, projection="3d")
+    ax.view_init(elev=35, azim=140)
+    ax.set_axis_off()
+
+    def _shade(color: Any, factor: float) -> Any:
+        base = mcolors.to_rgba(color)
+        shaded = tuple(min(1.0, max(0.0, c * factor)) for c in base[:3])
+        return shaded
+
+    radius = 1.0
+    height = 0.3
+    start_angle = 0.0
+    cmap = plt.get_cmap("tab20c")
+    colors = cmap(np.linspace(0, 1, len(vals2))) if len(vals2) else []
+
+    for idx, (label, value) in enumerate(zip(labels2, vals2)):
+        fraction = value / total
+        theta1 = start_angle
+        theta2 = start_angle + fraction * 2 * math.pi
+        theta = np.linspace(theta1, theta2, 40)
+        x = radius * np.cos(theta)
+        y = radius * np.sin(theta)
+        top = [(0.0, 0.0, height)] + list(zip(x, y, np.full_like(x, height)))
+        bottom = [(0.0, 0.0, 0.0)] + list(zip(x, y, np.zeros_like(x)))
+
+        face_color = colors[idx]
+        top_color = _shade(face_color, 1.15)
+        side_color = _shade(face_color, 0.8)
+
+        ax.add_collection3d(
+            Poly3DCollection([top], facecolors=top_color, edgecolors="white", linewidths=0.4, alpha=0.95)
+        )
+        ax.add_collection3d(
+            Poly3DCollection([bottom], facecolors=_shade(face_color, 0.6), edgecolors="white", linewidths=0.4, alpha=0.95)
+        )
+
+        for i in range(len(theta) - 1):
+            side = [
+                (x[i], y[i], 0.0),
+                (x[i + 1], y[i + 1], 0.0),
+                (x[i + 1], y[i + 1], height),
+                (x[i], y[i], height),
+            ]
+            ax.add_collection3d(
+                Poly3DCollection([side], facecolors=side_color, edgecolors="white", linewidths=0.2, alpha=0.95)
+            )
+
+        radial_start = [
+            (0.0, 0.0, 0.0),
+            (x[0], y[0], 0.0),
+            (x[0], y[0], height),
+            (0.0, 0.0, height),
+        ]
+        radial_end = [
+            (0.0, 0.0, 0.0),
+            (x[-1], y[-1], 0.0),
+            (x[-1], y[-1], height),
+            (0.0, 0.0, height),
+        ]
+        ax.add_collection3d(
+            Poly3DCollection([radial_start], facecolors=side_color, edgecolors="white", linewidths=0.3, alpha=0.95)
+        )
+        ax.add_collection3d(
+            Poly3DCollection([radial_end], facecolors=side_color, edgecolors="white", linewidths=0.3, alpha=0.95)
+        )
+
+        mid = (theta1 + theta2) / 2.0
+        label_r = radius * 0.68
+        lx = label_r * math.cos(mid)
+        ly = label_r * math.sin(mid)
+        pct_txt = pct_plain(fraction * 100.0, 1)
+        ax.text(
+            lx,
+            ly,
+            height + 0.05,
+            f"{label}\n{pct_txt}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#1a1a1a",
+        )
+
+        start_angle = theta2
+
+    ax.set_xlim(-1.2, 1.2)
+    ax.set_ylim(-1.2, 1.2)
+    ax.set_zlim(0, height + 0.4)
+
+    base_currency = pf.get("base", {}).get("moneda", "ARS").upper()
+    f_money = fmt_money_ars if base_currency == "ARS" else fmt_money_usd
+
+    ax_info = fig.add_subplot(122)
+    ax_info.axis("off")
+    ax_info.set_xlim(0, 1)
+    ax_info.set_ylim(0, 1)
+
+    ax_info.text(0.0, 0.95, "Detalle por instrumento", fontsize=12, fontweight="bold")
+    line_spacing = 0.8 / max(1, len(labels2))
+    y = 0.9
+    for label, value in zip(labels2, vals2):
+        pct_value = value / total * 100.0
+        ax_info.text(
+            0.0,
+            y,
+            f"{label}: {pct_plain(pct_value,1)} · {f_money(value)}",
+            fontsize=10,
+        )
+        y -= line_spacing
+
+    ax_info.text(0.0, max(0.05, y - line_spacing), f"Total: {f_money(total)}", fontsize=10, fontweight="bold")
+
+    fig.suptitle("Composición del Portafolio", fontsize=14, fontweight="bold")
     buf = io.BytesIO()
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(buf, format="png")
     plt.close(fig)
     buf.seek(0)
@@ -2669,20 +2784,49 @@ def _projection_bar_image(
     max_val = max(values)
 
     fig, ax = plt.subplots(figsize=(6, 4), dpi=160)
-    colors = ["#1f77b4", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b"]
-    bars = ax.bar(range(len(values)), values, color=colors[: len(values)])
+    palette = ["#3478bc", "#34a853", "#fbbc04", "#a142f4", "#f26f5e"]
+    bars = ax.bar(range(len(values)), values, color=palette[: len(values)])
 
-    offset = max_val * 0.02 if max_val else 1.0
+    max_display = max_val if max_val else 1.0
+    inner_margin = max_display * 0.04
+    top_margin = max_display * 0.08
     for bar, val in zip(bars, values):
         label = formatter(val)
+        text_x = bar.get_x() + bar.get_width() / 2
+        height = bar.get_height()
+        rotation = 90 if len(label) > 12 else 0
+
+        if height <= 0:
+            ax.text(
+                text_x,
+                height + top_margin,
+                label,
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                rotation=rotation,
+                color="#1a1a1a",
+            )
+            continue
+
+        if height >= max_display * 0.18:
+            text_y = height - inner_margin
+            va = "top"
+            color = "#ffffff"
+        else:
+            text_y = height + inner_margin
+            va = "bottom"
+            color = "#1a1a1a"
+
         ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            val + offset,
+            text_x,
+            text_y,
             label,
             ha="center",
-            va="bottom",
+            va=va,
             fontsize=8,
-            rotation=90 if len(label) > 12 else 0,
+            rotation=rotation,
+            color=color,
         )
 
     ax.set_xticks(range(len(labels)))
@@ -2692,6 +2836,107 @@ def _projection_bar_image(
     ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
+
+    ax.set_ylim(0, max_display * 1.1)
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
+def _return_bar_image(
+    points: List[Tuple[str, Optional[float]]],
+    title: str,
+    subtitle: Optional[str] = None,
+    formatter: Optional[Callable[[float], str]] = None,
+) -> Optional[bytes]:
+    if not HAS_MPL:
+        return None
+
+    cleaned: List[Tuple[str, float]] = []
+    for label, value in points:
+        if value is None:
+            continue
+        try:
+            cleaned.append((label, float(value)))
+        except (TypeError, ValueError):
+            continue
+
+    if not cleaned:
+        return None
+
+    labels = [label for label, _ in cleaned]
+    values = [val for _, val in cleaned]
+    max_abs = max(abs(val) for val in values) if values else 0.0
+    if max_abs <= 0:
+        max_abs = 1.0
+
+    fig, ax = plt.subplots(figsize=(6, 4), dpi=160)
+    colors = []
+    for val in values:
+        if val > 0:
+            colors.append("#34a853")
+        elif val < 0:
+            colors.append("#ea4335")
+        else:
+            colors.append("#9aa0a6")
+
+    bars = ax.bar(range(len(values)), values, color=colors)
+
+    inner_offset = max_abs * 0.06
+    outer_offset = max_abs * 0.08
+    for bar, val in zip(bars, values):
+        text = formatter(val) if formatter else f"{val:+.1f}%"
+        text_x = bar.get_x() + bar.get_width() / 2
+        height = bar.get_height()
+
+        if val > 0:
+            if height > max_abs * 0.18:
+                y = height - inner_offset
+                va = "top"
+                color = "#ffffff"
+            else:
+                y = height + outer_offset
+                va = "bottom"
+                color = "#1a1a1a"
+        elif val < 0:
+            if abs(height) > max_abs * 0.18:
+                y = height + inner_offset
+                va = "bottom"
+                color = "#ffffff"
+            else:
+                y = height - outer_offset
+                va = "top"
+                color = "#1a1a1a"
+        else:
+            y = height + outer_offset
+            va = "bottom"
+            color = "#1a1a1a"
+
+        ax.text(
+            text_x,
+            y,
+            text,
+            ha="center",
+            va=va,
+            fontsize=8,
+            color=color,
+        )
+
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.axhline(0, color="#4a4a4a", linewidth=0.8)
+    ax.set_ylabel("Variación %")
+    ax.set_title(title + (f"\n{subtitle}" if subtitle else ""))
+    ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
+    ylim = max_abs * 1.25
+    ax.set_ylim(-ylim, ylim)
 
     fig.tight_layout()
     buf = io.BytesIO()
@@ -2772,8 +3017,9 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         daily_sum = sum(port_daily_vals)
         lines.append(f"Variación diaria estimada: {pct(daily_sum,2)}")
 
-    include_daily = any(entry.get('daily_change') is not None for entry in snapshot)
-    chart_rows: List[Tuple[str, List[Optional[float]]]] = []
+    has_daily_data = any(entry.get('daily_change') is not None for entry in snapshot)
+    return_points: List[Tuple[str, Optional[float]]] = []
+    daily_points: List[Tuple[str, Optional[float]]] = []
     for entry in snapshot:
         label = entry['label']
         valor_actual = entry['valor_actual']
@@ -2798,11 +3044,10 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         lines.append(detail)
 
         short_label = _label_short(entry['symbol']) if entry.get('symbol') else label
-        values: List[Optional[float]] = [ret_pct]
-        if include_daily:
-            values.append(daily if daily is not None else None)
-        if any(v is not None for v in values):
-            chart_rows.append((short_label, values))
+        if ret_pct is not None:
+            return_points.append((short_label, ret_pct))
+        if has_daily_data:
+            daily_points.append((short_label, daily if daily is not None else None))
 
     delta_t = total_actual - total_invertido
     lines.append("")
@@ -2824,22 +3069,32 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
 
     await _send_below_menu(context, chat_id, text="\n".join(lines))
 
-    total_values: List[Optional[float]] = []
-    total_values.append((delta_t / total_invertido * 100.0) if total_invertido > 0 else None)
-    if include_daily:
-        total_values.append(daily_sum if daily_sum is not None else None)
-    if any(v is not None for v in total_values):
-        chart_rows.append(("Portafolio", total_values))
+    total_pct = (delta_t / total_invertido * 100.0) if total_invertido > 0 else None
+    if total_pct is not None:
+        return_points.append(("Portafolio", total_pct))
+    if has_daily_data:
+        daily_points.append(("Portafolio", daily_sum if daily_sum is not None else None))
 
-    series_labels = ["Acumulado %"] + (["Diario %"] if include_daily else [])
-    img = _bar_image_from_rank(
-        chart_rows,
-        "Rendimiento por instrumento",
-        "Variación porcentual estimada",
-        series_labels,
-    )
-    if img:
-        await _send_below_menu(context, chat_id, photo_bytes=img)
+    if return_points:
+        img = _return_bar_image(
+            return_points,
+            "Rendimiento por instrumento",
+            "Variación acumulada vs. invertido",
+            formatter=lambda v: f"{v:+.1f}%",
+        )
+        if img:
+            await _send_below_menu(context, chat_id, photo_bytes=img)
+
+    cleaned_daily = [pt for pt in daily_points if pt[1] is not None]
+    if cleaned_daily:
+        daily_img = _return_bar_image(
+            cleaned_daily,
+            "Variación diaria",
+            "Cambios porcentuales del día",
+            formatter=lambda v: f"{v:+.2f}%",
+        )
+        if daily_img:
+            await _send_below_menu(context, chat_id, photo_bytes=daily_img)
 
 # --- Proyección (debajo del menú) ---
 
