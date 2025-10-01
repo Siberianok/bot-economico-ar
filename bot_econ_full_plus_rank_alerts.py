@@ -908,16 +908,28 @@ async def _rank_top3(update: Update, symbols: List[str], title: str):
         )
 
         if HAS_MPL and pairs:
-            chart_rows = []
-            for sym, value in pairs[:3]:
-                if value is None:
+            chart_rows: List[Tuple[str, List[Optional[float]]]] = []
+            for sym, _ in pairs[:3]:
+                metrics = mets.get(sym, {})
+                values: List[Optional[float]] = []
+                for key in ("1m", "3m", "6m"):
+                    raw_val = metrics.get(key)
+                    if raw_val is None:
+                        values.append(None)
+                        continue
+                    try:
+                        values.append(float(raw_val))
+                    except Exception:
+                        values.append(None)
+                if not any(v is not None for v in values):
                     continue
-                chart_rows.append((_label_short(sym), [float(value)]))
+                chart_rows.append((_label_short(sym), values))
             subtitle = f"Datos al {fecha}" if fecha else None
             img = _bar_image_from_rank(
                 chart_rows,
-                title=f"{title} — Rendimiento 6M",
+                title=f"{title} — Rendimientos 1/3/6M",
                 subtitle=subtitle,
+                series_labels=["Rend. 1M", "Rend. 3M", "Rend. 6M"],
             )
             if img:
                 await update.effective_message.reply_photo(photo=img)
