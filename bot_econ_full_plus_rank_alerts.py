@@ -762,8 +762,10 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
         row = d.get(k)
         if not row: continue
         compra_val = row.get("compra"); venta_val = row.get("venta")
-        compra = fmt_money_ars(compra_val) if compra_val is not None else "—"
-        venta = fmt_money_ars(venta_val) if venta_val is not None else "—"
+        # La tabla se muestra desde la perspectiva del usuario que compraría dólares
+        # al precio "venta" de la casa y vendería al precio "compra".
+        compra = fmt_money_ars(venta_val) if venta_val is not None else "—"
+        venta = fmt_money_ars(compra_val) if compra_val is not None else "—"
         l = f"{label:<12}{compra:>12} {venta:>12}"
         rows.append(f"<pre>{l}</pre>")
     rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
@@ -1117,8 +1119,8 @@ def _parse_float_user_strict(s: str) -> Optional[float]:
     except Exception: return None
 
 def _fx_display_value(row: Dict[str, Any], side: str) -> Optional[float]:
-    if side == "compra": return row.get("compra")
-    if side == "venta":  return row.get("venta")
+    if side == "compra": return row.get("venta")
+    if side == "venta":  return row.get("compra")
     return None
 
 async def cmd_alertas_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
