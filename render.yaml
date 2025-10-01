@@ -8,5 +8,11 @@ services:
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false          # cargalo en Render → Environment
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false          # cargalo en Render → Environment
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false          # cargalo en Render → Environment
+      - key: UPSTASH_STATE_KEY     # opcional: solo si queres customizarlo
+        sync: false
       - key: PYTHON_VERSION
         value: 3.11.9
