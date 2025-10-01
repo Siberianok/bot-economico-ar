@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os, asyncio, logging, re, html as _html, json, math, io, signal, csv, unicodedata
+import copy
 import urllib.request
 import urllib.error
 from time import time
@@ -2029,9 +2030,126 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "PF:CLEAR":
-        PF[chat_id] = {"base": {"moneda":"ARS","tc":"mep"}, "monto": 0.0, "items": []}; save_state()
-        await _send_below_menu(context, chat_id, text="Portafolio eliminado.")
-        await pf_refresh_menu(context, chat_id)
+        pf = pf_get(chat_id)
+        items = pf.get("items", [])
+
+        def _pf_clear_keyboard() -> InlineKeyboardMarkup:
+            rows = []
+            for i, it in enumerate(items, 1):
+                sym = it.get("simbolo")
+                label = _label_long(sym) if sym else it.get("tipo", "Instrumento").upper()
+                rows.append([InlineKeyboardButton(f"{i}. {label}", callback_data=f"PF:CLEAR:{i-1}")])
+            rows.append([
+                InlineKeyboardButton("Eliminar todo", callback_data="PF:CLEAR:ALL"),
+                InlineKeyboardButton("Deshacer", callback_data="PF:CLEAR:UNDO"),
+            ])
+            rows.append([InlineKeyboardButton("Cancelar", callback_data="PF:CLEAR:CANCEL")])
+            return InlineKeyboardMarkup(rows)
+
+        if not items:
+            await _send_below_menu(
+                context,
+                chat_id,
+                text="Tu portafolio está vacío. Podés usar <b>Deshacer</b> si eliminaste algo recientemente.",
+                reply_markup=_pf_clear_keyboard(),
+            )
+        else:
+            await _send_below_menu(
+                context,
+                chat_id,
+                text="Elegí qué instrumento eliminar:",
+                reply_markup=_pf_clear_keyboard(),
+            )
+        return
+
+    if data.startswith("PF:CLEAR:"):
+        pf = pf_get(chat_id)
+        stack: List[Dict[str, Any]] = context.user_data.setdefault("pf_deleted_stack", [])
+        action = data.split(":", 2)[2]
+
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        if action == "ALL":
+            items = pf.get("items", [])
+            if not items:
+                await _send_below_menu(context, chat_id, text="No hay instrumentos para eliminar.")
+                return
+            kb_confirm = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("Sí, eliminar todo", callback_data="PF:CLEAR:ALLCONFIRM"),
+                    InlineKeyboardButton("Cancelar", callback_data="PF:CLEAR:CANCEL"),
+                ]
+            ])
+            await _send_below_menu(
+                context,
+                chat_id,
+                text="¿Seguro que querés eliminar todos los instrumentos? Podés deshacer luego.",
+                reply_markup=kb_confirm,
+            )
+            return
+
+        if action == "ALLCONFIRM":
+            items = pf.get("items", [])
+            if not items:
+                await _send_below_menu(context, chat_id, text="No había instrumentos para eliminar.")
+                return
+            for idx, entry in reversed(list(enumerate(items))):
+                stack.append({"index": idx, "item": copy.deepcopy(entry)})
+            cnt = len(items)
+            pf["items"].clear()
+            save_state()
+            await pf_refresh_menu(context, chat_id)
+            await _send_below_menu(
+                context,
+                chat_id,
+                text=f"Se eliminaron {cnt} instrumentos. Podés usar <b>Deshacer</b> para recuperarlos.",
+            )
+            return
+
+        if action == "UNDO":
+            if not stack:
+                await _send_below_menu(context, chat_id, text="No hay eliminaciones para deshacer.")
+                return
+            last = stack.pop()
+            idx = max(0, min(int(last.get("index", 0)), len(pf.get("items", []))))
+            item = copy.deepcopy(last.get("item"))
+            pf.setdefault("items", [])
+            pf["items"].insert(idx, item)
+            save_state()
+            await pf_refresh_menu(context, chat_id)
+            sym = item.get("simbolo") if isinstance(item, dict) else None
+            label = _label_long(sym) if sym else (item.get("tipo", "Instrumento").upper() if isinstance(item, dict) else "Instrumento")
+            await _send_below_menu(context, chat_id, text=f"Se restauró: {label}.")
+            return
+
+        if action == "CANCEL":
+            await _send_below_menu(context, chat_id, text="Operación cancelada.")
+            return
+
+        try:
+            idx = int(action)
+        except Exception:
+            await _send_below_menu(context, chat_id, text="Acción inválida.")
+            return
+
+        items = pf.get("items", [])
+        if 0 <= idx < len(items):
+            removed = items.pop(idx)
+            stack.append({"index": idx, "item": copy.deepcopy(removed)})
+            save_state()
+            await pf_refresh_menu(context, chat_id)
+            sym = removed.get("simbolo") if isinstance(removed, dict) else None
+            label = _label_long(sym) if sym else (removed.get("tipo", "Instrumento").upper() if isinstance(removed, dict) else "Instrumento")
+            await _send_below_menu(
+                context,
+                chat_id,
+                text=f"Instrumento eliminado: {label}. Podés usar <b>Deshacer</b> para revertir.",
+            )
+        else:
+            await _send_below_menu(context, chat_id, text="Índice inválido.")
         return
 
     if data == "PF:BACK":
