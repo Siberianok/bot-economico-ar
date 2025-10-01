@@ -4,3 +4,4 @@ APScheduler==3.10.*
 httpx==0.26.*
 certifi
 tzdata
+matplotlib==3.8.*
