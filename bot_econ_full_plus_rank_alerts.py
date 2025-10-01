@@ -1642,7 +1642,18 @@ async def subs_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================ PORTAFOLIO (salida debajo del menú + torta) ============================
 
 def pf_get(chat_id: int) -> Dict[str, Any]:
-    return PF.setdefault(chat_id, {"base": {"moneda":"ARS", "tc":"mep"}, "monto": 0.0, "items": []})
+    pf = PF.setdefault(chat_id, {"base": {}, "monto": 0.0, "items": []})
+    base_conf = pf.get("base")
+    if not isinstance(base_conf, dict):
+        base_conf = {}
+        pf["base"] = base_conf
+    base_conf.setdefault("moneda", "ARS")
+    base_conf.setdefault("tc", "mep")
+    base_conf.setdefault("tc_valor", None)
+    base_conf.setdefault("tc_timestamp", None)
+    if not isinstance(pf.get("items"), list):
+        pf["items"] = []
+    return pf
 
 def kb_pf_main() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -1669,7 +1680,7 @@ async def pf_main_menu_text(chat_id: int) -> str:
     tc = (base_conf.get("tc") or "oficial").upper()
     monto = float(pf.get("monto") or 0.0)
     f_money = fmt_money_ars if base == "ARS" else fmt_money_usd
-    _, _, total_invertido, total_actual, tc_val = await pf_market_snapshot(pf)
+    _, _, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
     restante = max(0.0, monto - total_invertido)
     lines = ["<b>📦 Menú Portafolio</b>"]
     lines.append(f"Base: {base} / {tc}")
@@ -1679,8 +1690,12 @@ async def pf_main_menu_text(chat_id: int) -> str:
     if pf.get("items"):
         lines.append(f"Valor actual estimado: {f_money(total_actual)}")
     lines.append(f"Instrumentos cargados: {len(pf.get('items', []))}")
-    if tc_val:
-        lines.append(f"Tipo de cambio ref. ({tc}): {fmt_money_ars(tc_val)} por USD")
+    if tc_val is not None:
+        tc_line = f"Tipo de cambio ref. ({tc}): {fmt_money_ars(tc_val)} por USD"
+        if tc_ts:
+            dt = datetime.fromtimestamp(tc_ts, TZ)
+            tc_line += f" (al {dt.strftime('%d/%m/%Y %H:%M')})"
+        lines.append(tc_line)
     return "\n".join(lines)
 
 async def pf_refresh_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
@@ -1778,7 +1793,20 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("PF:BASE:"):
         _,_,mon,tc = data.split(":")
         pf = pf_get(chat_id)
-        pf["base"] = {"moneda": mon, "tc": tc}
+        base_conf = pf.get("base", {})
+        tc_val = None
+        tc_ts: Optional[int] = None
+        if tc:
+            async with ClientSession() as session:
+                tc_val = await get_tc_value(session, tc)
+            tc_ts = int(time()) if tc_val is not None else None
+        base_conf.update({
+            "moneda": mon,
+            "tc": tc,
+            "tc_valor": tc_val,
+            "tc_timestamp": tc_ts,
+        })
+        pf["base"] = base_conf
         save_state()
         msg = f"Base fijada: {mon.upper()} / {tc.upper()}"
         await pf_refresh_menu(context, chat_id)
@@ -1913,7 +1941,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pf.get("items"):
             await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. No hay datos para exportar.")
             return
-        snapshot, last_ts, total_invertido, total_actual, tc_val = await pf_market_snapshot(pf)
+        snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
         base_conf = pf.get("base", {})
         base = (base_conf.get("moneda") or "ARS").upper()
         tc_name = (base_conf.get("tc") or "oficial").upper()
@@ -1930,12 +1958,19 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "moneda_base",
             "tc_nombre",
             "tc_valor",
+            "tc_timestamp",
             "fecha_valuacion",
+            "item_fx_rate",
+            "item_fx_timestamp",
         ])
         fecha_val = datetime.fromtimestamp(last_ts, TZ).strftime("%Y-%m-%d") if last_ts else ""
+        tc_fecha = datetime.fromtimestamp(tc_ts, TZ).strftime("%Y-%m-%d %H:%M") if tc_ts else ""
         for entry in snapshot:
             sym = entry.get("symbol") or ""
             qty = entry.get("cantidad")
+            item_fx_rate = entry.get("fx_rate")
+            item_fx_ts = entry.get("fx_ts")
+            item_fx_fecha = datetime.fromtimestamp(item_fx_ts, TZ).strftime("%Y-%m-%d %H:%M") if item_fx_ts else ""
             writer.writerow([
                 sym,
                 entry.get("label") or sym or entry.get("tipo") or "",
@@ -1947,7 +1982,10 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 base,
                 tc_name,
                 tc_val if tc_val is not None else "",
+                tc_fecha,
                 fecha_val,
+                item_fx_rate if item_fx_rate is not None else "",
+                item_fx_fecha,
             ])
         csv_bytes = buf.getvalue().encode("utf-8")
         filename = f"portafolio_{datetime.now(TZ).strftime('%Y%m%d_%H%M')}.csv"
@@ -1956,8 +1994,11 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption_lines.append(f"Valor invertido: {f_money(total_invertido)}")
         caption_lines.append(f"Valor actual estimado: {f_money(total_actual)}")
         caption_lines.append(f"Instrumentos: {len(snapshot)}")
-        if tc_val:
-            caption_lines.append(f"TC ref.: {fmt_money_ars(tc_val)} por USD")
+        if tc_val is not None:
+            tc_caption = f"TC ref.: {fmt_money_ars(tc_val)} por USD"
+            if tc_ts:
+                tc_caption += f" (al {datetime.fromtimestamp(tc_ts, TZ).strftime('%d/%m/%Y %H:%M')})"
+            caption_lines.append(tc_caption)
         if fecha_val:
             caption_lines.append(f"Datos al {fecha_val}")
         await context.bot.send_document(
@@ -2046,28 +2087,41 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sym = context.user_data.get("pf_add_simbolo","")
         yfsym = sym
 
+        base_conf = pf.get("base", {})
+        pf_base = (base_conf.get("moneda") or "ARS").upper()  # ARS o USD
+        inst_moneda = instrument_currency(yfsym, tipo) if yfsym else pf_base
+        needs_fx = pf_base != inst_moneda
+        tc_key = (base_conf.get("tc") or "oficial").lower()
+        tc_val = base_conf.get("tc_valor")
+        tc_ts = base_conf.get("tc_timestamp")
+
         price_native = None  # precio en MONEDA NATIVA
         async with ClientSession() as session:
             if yfsym.endswith(".BA") or yfsym.endswith("-USD"):
                 mets, _ = await metrics_for_symbols(session, [yfsym])
                 price_native = mets.get(yfsym,{}).get("last_px")
-            tc_key = (pf_get(chat_id)["base"].get("tc") or "oficial").lower()
-            tc_val = await get_tc_value(session, tc_key)
-
-        pf_base = pf_get(chat_id)["base"]["moneda"].upper()  # ARS o USD
-        inst_moneda = "USD" if yfsym.endswith("-USD") else "ARS"
+            if needs_fx and (not tc_val or tc_val <= 0):
+                tc_val = await get_tc_value(session, tc_key)
+                tc_ts = int(time()) if tc_val is not None else None
+                base_conf["tc_valor"] = tc_val
+                base_conf["tc_timestamp"] = tc_ts
 
         # Precio expresado en MONEDA BASE
         price_base = None
+        fx_rate_used: Optional[float] = None
+        fx_ts_used: Optional[int] = tc_ts if isinstance(tc_ts, int) else None
         if price_native is not None:
             if pf_base == inst_moneda:
                 price_base = float(price_native)
             else:
                 if tc_val and tc_val > 0:
+                    fx_rate_used = float(tc_val)
                     if pf_base == "ARS" and inst_moneda == "USD":
                         price_base = float(price_native) * float(tc_val)
                     elif pf_base == "USD" and inst_moneda == "ARS":
                         price_base = float(price_native) / float(tc_val)
+                else:
+                    fx_rate_used = None
 
         cantidad, importe_base = None, None
 
@@ -2107,6 +2161,9 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         item = {"tipo":tipo, "simbolo": yfsym if yfsym else sym}
         if cantidad is not None: item["cantidad"] = float(cantidad)
         if importe_base is not None: item["importe"] = float(importe_base)  # en MONEDA BASE
+        if needs_fx:
+            item["fx_rate"] = float(fx_rate_used) if fx_rate_used is not None else tc_val if tc_val is not None else None
+            item["fx_ts"] = fx_ts_used
         pf["items"].append(item); save_state()
 
         pf_base = pf["base"]["moneda"].upper()
@@ -2138,27 +2195,41 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         it = pf["items"][idx]
 
         yfsym = it.get("simbolo")
+        base_conf = pf.get("base", {})
+        pf_base = (base_conf.get("moneda") or "ARS").upper()
+        inst_moneda = instrument_currency(yfsym or "", it.get("tipo")) if yfsym else pf_base
+        needs_fx = pf_base != inst_moneda
+        tc_key = (base_conf.get("tc") or "oficial").lower()
+        tc_val = base_conf.get("tc_valor")
+        tc_ts = base_conf.get("tc_timestamp")
+        item_fx_rate = it.get("fx_rate")
+        item_fx_ts = it.get("fx_ts")
+        effective_tc = item_fx_rate if item_fx_rate else tc_val
+
         async with ClientSession() as session:
             if yfsym and (yfsym.endswith(".BA") or yfsym.endswith("-USD")):
                 mets, _ = await metrics_for_symbols(session, [yfsym])
                 px = mets.get(yfsym,{}).get("last_px")
             else:
                 px = None
-            tc_key = (pf_get(chat_id)["base"].get("tc") or "oficial").lower()
-            tc_val = await get_tc_value(session, tc_key)
+            if needs_fx and (not effective_tc or effective_tc <= 0):
+                fetched_tc = await get_tc_value(session, tc_key)
+                tc_ts = int(time()) if fetched_tc is not None else None
+                base_conf["tc_valor"] = fetched_tc
+                base_conf["tc_timestamp"] = tc_ts
+                effective_tc = fetched_tc
+                tc_val = fetched_tc
 
-        pf_base = pf_get(chat_id)["base"]["moneda"].upper()
-        inst_moneda = "USD" if yfsym and yfsym.endswith("-USD") else "ARS"
         price_base = None
         if px is not None:
             if pf_base == inst_moneda:
                 price_base = float(px)
             else:
-                if tc_val and tc_val > 0:
+                if effective_tc and effective_tc > 0:
                     if pf_base == "ARS" and inst_moneda == "USD":
-                        price_base = float(px) * float(tc_val)
+                        price_base = float(px) * float(effective_tc)
                     elif pf_base == "USD" and inst_moneda == "ARS":
-                        price_base = float(px) / float(tc_val)
+                        price_base = float(px) / float(effective_tc)
 
         if mode == "edit_amt":
             nuevo_importe = float(v)  # en MONEDA BASE
@@ -2191,6 +2262,10 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 it["importe"] = nuevo_importe
             it["cantidad"] = nueva_cant
 
+        if needs_fx and effective_tc and effective_tc > 0:
+            it["fx_rate"] = float(effective_tc)
+            it["fx_ts"] = item_fx_ts if item_fx_rate else tc_ts
+
         save_state()
         usado = await _pf_total_usado(chat_id)
         f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
@@ -2200,14 +2275,35 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Composición: texto + torta (debajo del menú) ---
 
-async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[int], float, float, Optional[float]]:
+async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[int], float, float, Optional[float], Optional[int]]:
     items = pf.get("items", [])
-    base_currency = (pf.get("base", {}).get("moneda") or "ARS").upper()
-    tc_name = (pf.get("base", {}).get("tc") or "").lower()
+    base_conf = pf.get("base", {})
+    base_currency = (base_conf.get("moneda") or "ARS").upper()
+    tc_name = (base_conf.get("tc") or "").lower()
+    tc_val_raw = base_conf.get("tc_valor")
+    try:
+        tc_val = float(tc_val_raw) if tc_val_raw is not None else None
+    except (TypeError, ValueError):
+        tc_val = None
+    tc_ts_raw = base_conf.get("tc_timestamp")
+    try:
+        tc_ts = int(tc_ts_raw) if tc_ts_raw is not None else None
+    except (TypeError, ValueError):
+        tc_ts = None
+    state_updated = False
     async with ClientSession() as session:
-        tc_val = await get_tc_value(session, tc_name) if tc_name else None
+        if tc_name and (tc_val is None or tc_val <= 0):
+            fetched_tc = await get_tc_value(session, tc_name)
+            if fetched_tc is not None:
+                tc_val = float(fetched_tc)
+                tc_ts = int(time())
+                base_conf["tc_valor"] = tc_val
+                base_conf["tc_timestamp"] = tc_ts
+                state_updated = True
         symbols = sorted({it.get("simbolo") for it in items if it.get("simbolo")})
         mets, last_ts = await metrics_for_symbols(session, symbols) if symbols else ({}, None)
+    if state_updated:
+        save_state()
 
     enriched: List[Dict[str, Any]] = []
     total_invertido = 0.0
@@ -2221,8 +2317,20 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         if met and met.get("last_px") is None:
             met = {}
         inst_cur = instrument_currency(sym, tipo) if sym else base_currency
+        fx_rate_raw = it.get("fx_rate")
+        try:
+            fx_rate_item = float(fx_rate_raw) if fx_rate_raw is not None else None
+        except (TypeError, ValueError):
+            fx_rate_item = None
+        fx_ts_raw = it.get("fx_ts")
+        try:
+            fx_ts_item = int(fx_ts_raw) if fx_ts_raw is not None else None
+        except (TypeError, ValueError):
+            fx_ts_item = None
+        effective_tc = fx_rate_item if fx_rate_item is not None else tc_val
+        effective_ts = fx_ts_item if fx_rate_item is not None else tc_ts
         price_native = met.get("last_px") if met else None
-        price_base = price_to_base(price_native, inst_cur, base_currency, tc_val) if price_native is not None else None
+        price_base = price_to_base(price_native, inst_cur, base_currency, effective_tc) if price_native is not None else None
         derived_qty = False
         if qty is None and price_base and price_base > 0 and invertido > 0:
             qty = invertido / price_base
@@ -2246,12 +2354,14 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             "metrics": met,
             "inst_currency": inst_cur,
             "daily_change": met.get("last_chg") if met else None,
+            "fx_rate": effective_tc,
+            "fx_ts": effective_ts,
         })
 
     for entry in enriched:
         entry["peso"] = (entry["valor_actual"] / total_actual) if total_actual > 0 else 0.0
 
-    return enriched, last_ts, total_invertido, total_actual, tc_val
+    return enriched, last_ts, total_invertido, total_actual, tc_val, tc_ts
 
 def _bar_image_from_rank(
     rows: List[Tuple[str, List[Optional[float]]]],
@@ -2401,7 +2511,7 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
     if not pf["items"]:
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Usá «Agregar instrumento»."); return
-    snapshot, last_ts, total_invertido, total_actual, tc_val = await pf_market_snapshot(pf)
+    snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     header = f"<b>Portafolio</b> — Base: {pf['base']['moneda'].upper()}/{pf['base']['tc'].upper()}"
     if fecha:
@@ -2414,8 +2524,11 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         lines.append(f"Variación estimada: {f_money(delta)} ({pct(delta/total_invertido*100.0,2)})")
     restante = max(0.0, pf['monto'] - total_invertido)
     lines.append(f"Restante del objetivo: {f_money(restante)}")
-    if tc_val:
-        lines.append(f"Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD")
+    if tc_val is not None:
+        tc_line = f"Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
+        if tc_ts:
+            tc_line += f" (al {datetime.fromtimestamp(tc_ts, TZ).strftime('%d/%m/%Y %H:%M')})"
+        lines.append(tc_line)
     lines.append("")
     for i, entry in enumerate(snapshot, 1):
         linea = f"{i}. {entry['label']}"
@@ -2443,14 +2556,17 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Agregá instrumentos primero."); return
     pf_base = pf["base"]["moneda"].upper()
     f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
-    snapshot, last_ts, total_invertido, total_actual, tc_val = await pf_market_snapshot(pf)
+    snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     header = "<b>📈 Rendimiento del portafolio</b>"
     if fecha:
         header += f" <i>Datos al {fecha}</i>"
     lines = [header]
-    if tc_val:
-        lines.append(f"Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD")
+    if tc_val is not None:
+        tc_line = f"Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
+        if tc_ts:
+            tc_line += f" (al {datetime.fromtimestamp(tc_ts, TZ).strftime('%d/%m/%Y %H:%M')})"
+        lines.append(tc_line)
 
     port_daily_vals = [entry['peso'] * entry['daily_change'] for entry in snapshot if entry.get('daily_change') is not None]
     if port_daily_vals:
@@ -2502,7 +2618,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     pf = pf_get(chat_id)
     if not pf["items"]:
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Agregá instrumentos primero."); return
-    snapshot, last_ts, _, total_actual, tc_val = await pf_market_snapshot(pf)
+    snapshot, last_ts, _, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
     if total_actual <= 0:
         await _send_below_menu(context, chat_id, text="Sin valores suficientes para proyectar."); return
 
@@ -2534,8 +2650,11 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     lines = [header, f"Valor actual estimado: {f_money(total_actual)}"]
     lines.append(f"Proyección 3M: {pct(w3,2)} → {f_money(forecast3)}")
     lines.append(f"Proyección 6M: {pct(w6,2)} → {f_money(forecast6)}")
-    if tc_val:
-        lines.append(f"Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD")
+    if tc_val is not None:
+        tc_line = f"Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
+        if tc_ts:
+            tc_line += f" (al {datetime.fromtimestamp(tc_ts, TZ).strftime('%d/%m/%Y %H:%M')})"
+        lines.append(tc_line)
 
     if detail:
         lines.append("")
