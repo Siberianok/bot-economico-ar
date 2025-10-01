@@ -18,14 +18,10 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib import colors as mcolors
-    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
     import numpy as np
     HAS_MPL = True
 except Exception:
     plt = None
-    mcolors = None
-    Poly3DCollection = None
     np = None
 
 from aiohttp import ClientSession, ClientTimeout, web
@@ -2610,156 +2606,149 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
     if not HAS_MPL:
         return None
 
-    pairs: List[Tuple[str, float]] = []
+    pair_details: List[Dict[str, Any]] = []
     if snapshot:
         for entry in snapshot:
             val = float(entry.get("valor_actual") or 0.0)
             if val > 0:
                 label = entry.get("label") or entry.get("symbol") or "Instrumento"
-                pairs.append((label, val))
+                pair_details.append(
+                    {
+                        "label": label,
+                        "valor_actual": val,
+                        "invertido": float(entry.get("invertido") or 0.0),
+                    }
+                )
     else:
         for it in pf.get("items", []):
             val = float(it.get("importe") or 0.0)
             if val > 0:
                 sym = it.get("simbolo", "")
                 label = _label_short(sym) if sym else (it.get("tipo", "").upper() or "Instrumento")
-                pairs.append((label, val))
+                pair_details.append(
+                    {
+                        "label": label,
+                        "valor_actual": val,
+                        "invertido": val,
+                    }
+                )
 
-    pairs = [(lbl, val) for lbl, val in pairs if val > 0]
-    if not pairs:
+    pair_details = [detail for detail in pair_details if detail["valor_actual"] > 0]
+    if not pair_details:
         return None
 
-    pairs.sort(key=lambda x: x[1], reverse=True)
-    total = sum(val for _, val in pairs)
+    pair_details.sort(key=lambda x: x["valor_actual"], reverse=True)
+    total = sum(detail["valor_actual"] for detail in pair_details)
     if total <= 0:
         return None
-
-    vals2: List[float] = []
-    labels2: List[str] = []
-    otros = 0.0
-    if len(pairs) > 6:
-        for lbl, val in pairs:
-            if val / total < 0.03:
-                otros += val
-            else:
-                labels2.append(lbl); vals2.append(val)
-    else:
-        for lbl, val in pairs:
-            labels2.append(lbl); vals2.append(val)
-    if otros > 0:
-        labels2.append("Otros"); vals2.append(otros)
-
-    fig = plt.figure(figsize=(8, 5.5), dpi=160)
-    ax = fig.add_subplot(121, projection="3d")
-    ax.view_init(elev=35, azim=140)
-    ax.set_axis_off()
-
-    def _shade(color: Any, factor: float) -> Any:
-        base = mcolors.to_rgba(color)
-        shaded = tuple(min(1.0, max(0.0, c * factor)) for c in base[:3])
-        return shaded
-
-    radius = 1.0
-    height = 0.3
-    start_angle = 0.0
-    cmap = plt.get_cmap("tab20c")
-    colors = cmap(np.linspace(0, 1, len(vals2))) if len(vals2) else []
-
-    for idx, (label, value) in enumerate(zip(labels2, vals2)):
-        fraction = value / total
-        theta1 = start_angle
-        theta2 = start_angle + fraction * 2 * math.pi
-        theta = np.linspace(theta1, theta2, 40)
-        x = radius * np.cos(theta)
-        y = radius * np.sin(theta)
-        top = [(0.0, 0.0, height)] + list(zip(x, y, np.full_like(x, height)))
-        bottom = [(0.0, 0.0, 0.0)] + list(zip(x, y, np.zeros_like(x)))
-
-        face_color = colors[idx]
-        top_color = _shade(face_color, 1.15)
-        side_color = _shade(face_color, 0.8)
-
-        ax.add_collection3d(
-            Poly3DCollection([top], facecolors=top_color, edgecolors="white", linewidths=0.4, alpha=0.95)
-        )
-        ax.add_collection3d(
-            Poly3DCollection([bottom], facecolors=_shade(face_color, 0.6), edgecolors="white", linewidths=0.4, alpha=0.95)
-        )
-
-        for i in range(len(theta) - 1):
-            side = [
-                (x[i], y[i], 0.0),
-                (x[i + 1], y[i + 1], 0.0),
-                (x[i + 1], y[i + 1], height),
-                (x[i], y[i], height),
-            ]
-            ax.add_collection3d(
-                Poly3DCollection([side], facecolors=side_color, edgecolors="white", linewidths=0.2, alpha=0.95)
-            )
-
-        radial_start = [
-            (0.0, 0.0, 0.0),
-            (x[0], y[0], 0.0),
-            (x[0], y[0], height),
-            (0.0, 0.0, height),
-        ]
-        radial_end = [
-            (0.0, 0.0, 0.0),
-            (x[-1], y[-1], 0.0),
-            (x[-1], y[-1], height),
-            (0.0, 0.0, height),
-        ]
-        ax.add_collection3d(
-            Poly3DCollection([radial_start], facecolors=side_color, edgecolors="white", linewidths=0.3, alpha=0.95)
-        )
-        ax.add_collection3d(
-            Poly3DCollection([radial_end], facecolors=side_color, edgecolors="white", linewidths=0.3, alpha=0.95)
-        )
-
-        mid = (theta1 + theta2) / 2.0
-        label_r = radius * 0.68
-        lx = label_r * math.cos(mid)
-        ly = label_r * math.sin(mid)
-        pct_txt = pct_plain(fraction * 100.0, 1)
-        ax.text(
-            lx,
-            ly,
-            height + 0.05,
-            f"{label}\n{pct_txt}",
-            ha="center",
-            va="bottom",
-            fontsize=8,
-            color="#1a1a1a",
-        )
-
-        start_angle = theta2
-
-    ax.set_xlim(-1.2, 1.2)
-    ax.set_ylim(-1.2, 1.2)
-    ax.set_zlim(0, height + 0.4)
 
     base_currency = pf.get("base", {}).get("moneda", "ARS").upper()
     f_money = fmt_money_ars if base_currency == "ARS" else fmt_money_usd
 
-    ax_info = fig.add_subplot(122)
+    selected_details: List[Dict[str, Any]] = []
+    otros_bucket: List[Dict[str, Any]] = []
+    if len(pair_details) > 6:
+        for detail in pair_details:
+            fraction = detail["valor_actual"] / total if total else 0.0
+            if fraction < 0.03:
+                otros_bucket.append(detail)
+            else:
+                selected_details.append(detail)
+    else:
+        selected_details = list(pair_details)
+
+    if otros_bucket:
+        selected_details.append(
+            {
+                "label": "Otros",
+                "valor_actual": sum(d["valor_actual"] for d in otros_bucket),
+                "invertido": sum(d.get("invertido", 0.0) for d in otros_bucket),
+            }
+        )
+
+    labels2 = [detail["label"] for detail in selected_details]
+    vals2 = [detail["valor_actual"] for detail in selected_details]
+
+    fig, (ax_pie, ax_info) = plt.subplots(
+        1,
+        2,
+        figsize=(10, 6),
+        dpi=200,
+        gridspec_kw={"width_ratios": [3, 2]},
+    )
+
+    cmap = plt.get_cmap("tab20c")
+    color_positions = np.linspace(0, 1, len(vals2)) if vals2 else []
+    colors = [cmap(pos) for pos in color_positions]
+
+    def autopct_fmt(pct: float) -> str:
+        value = total * pct / 100.0
+        return f"{pct_plain(pct, 1)}\n{f_money(value)}"
+
+    _, _, autotexts = ax_pie.pie(
+        vals2,
+        labels=labels2,
+        autopct=autopct_fmt,
+        pctdistance=0.75,
+        startangle=90,
+        colors=colors,
+        wedgeprops=dict(width=0.35, edgecolor="white"),
+    )
+
+    for text in autotexts:
+        text.set_color("#1a1a1a")
+        text.set_fontsize(9)
+
+    ax_pie.text(
+        0,
+        0,
+        f"{f_money(total)}\n{base_currency}",
+        ha="center",
+        va="center",
+        fontsize=12,
+        fontweight="bold",
+        color="#1a1a1a",
+    )
+    ax_pie.set_aspect("equal")
+    ax_pie.axis("off")
+
     ax_info.axis("off")
-    ax_info.set_xlim(0, 1)
+    ax_info.set_xlim(0, 1.05)
     ax_info.set_ylim(0, 1)
 
-    ax_info.text(0.0, 0.95, "Detalle por instrumento", fontsize=12, fontweight="bold")
-    line_spacing = 0.8 / max(1, len(labels2))
-    y = 0.9
-    for label, value in zip(labels2, vals2):
-        pct_value = value / total * 100.0
-        ax_info.text(
-            0.0,
-            y,
-            f"{label}: {pct_plain(pct_value,1)} · {f_money(value)}",
-            fontsize=10,
-        )
-        y -= line_spacing
+    ax_info.text(0.02, 0.95, "Detalle por instrumento", fontsize=12, fontweight="bold", va="center")
+    headers = ["Instrumento", "%", "Actual", "Invertido", "Variación"]
+    col_x = [0.08, 0.4, 0.66, 0.86, 1.02]
+    header_y = 0.85
+    for x, header in zip(col_x, headers):
+        ax_info.text(x, header_y, header, fontsize=10, fontweight="bold", va="center")
 
-    ax_info.text(0.0, max(0.05, y - line_spacing), f"Total: {f_money(total)}", fontsize=10, fontweight="bold")
+    n_rows = len(selected_details)
+    row_spacing = 0.65 / max(1, n_rows)
+    start_y = header_y - row_spacing
+
+    for color, detail in zip(colors, selected_details):
+        pct_value = detail["valor_actual"] / total * 100.0 if total else 0.0
+        invertido = detail.get("invertido", 0.0)
+        variacion = detail["valor_actual"] - invertido
+        ax_info.scatter(0.03, start_y, color=color, s=80, marker="s")
+        ax_info.text(0.08, start_y, detail["label"], fontsize=9, va="center")
+        ax_info.text(0.4, start_y, pct_plain(pct_value, 1), fontsize=9, va="center")
+        ax_info.text(0.66, start_y, f_money(detail["valor_actual"]), fontsize=9, va="center")
+        ax_info.text(0.86, start_y, f_money(invertido), fontsize=9, va="center")
+        ax_info.text(1.02, start_y, f_money(variacion), fontsize=9, va="center")
+        start_y -= row_spacing
+
+    ax_info.text(
+        0.02,
+        max(0.05, start_y),
+        f"Total: {f_money(total)} {base_currency}",
+        fontsize=10,
+        fontweight="bold",
+        va="center",
+    )
+
+    fig.subplots_adjust(wspace=0.15)
 
     fig.suptitle("Composición del Portafolio", fontsize=14, fontweight="bold")
     buf = io.BytesIO()
