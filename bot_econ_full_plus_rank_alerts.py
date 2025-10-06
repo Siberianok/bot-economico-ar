@@ -1155,21 +1155,41 @@ def _fx_display_value(row: Dict[str, Any], side: str) -> Optional[float]:
     if side == "venta":  return row.get("compra")
     return None
 
-async def cmd_alertas_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb_menu = kb([
+def kb_alertas_menu() -> InlineKeyboardMarkup:
+    return kb([
         [("Listar","AL:LIST"),("Agregar","AL:ADD")],
         [("Borrar","AL:CLEAR")],
         [("Pausar","AL:PAUSE"),("Reanudar","AL:RESUME")],
     ])
-    await update.effective_message.reply_text("🔔 Menú Alertas", reply_markup=kb_menu)
+
+
+async def cmd_alertas_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    prefix: Optional[str] = None,
+    *,
+    edit: bool = False,
+) -> None:
+    text = "🔔 Menú Alertas" if not prefix else f"{prefix}\n\n🔔 Menú Alertas"
+    markup = kb_alertas_menu()
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=markup)
+    else:
+        await update.effective_message.reply_text(text, reply_markup=markup)
 
 async def alertas_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
-    if data == "AL:LIST":   await cmd_alertas_list(update, context); await cmd_alertas_menu(update, context)
-    if data == "AL:CLEAR":  await cmd_alertas_clear(update, context)
-    if data == "AL:PAUSE":  await cmd_alertas_pause(update, context)
-    if data == "AL:RESUME": await cmd_alertas_resume(update, context); await cmd_alertas_menu(update, context)
+    if data == "AL:LIST":
+        await cmd_alertas_list(update, context)
+        await cmd_alertas_menu(update, context)
+    elif data == "AL:CLEAR":
+        await cmd_alertas_clear(update, context)
+    elif data == "AL:PAUSE":
+        await cmd_alertas_pause(update, context)
+    elif data == "AL:RESUME":
+        await cmd_alertas_resume(update, context)
+        await cmd_alertas_menu(update, context)
 
 async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -1203,7 +1223,9 @@ async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     rules = ALERTS.get(chat_id, [])
     if not rules:
-        await update.effective_message.reply_text("No tenés alertas guardadas."); return
+        await update.effective_message.reply_text("No tenés alertas guardadas.")
+        await cmd_alertas_menu(update, context)
+        return
     buttons: List[List[Tuple[str,str]]] = []
     for i, r in enumerate(rules, 1):
         if r.get("kind") == "fx":
@@ -1216,7 +1238,8 @@ async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             label = f"{i}. {_label_long(r['symbol'])} {html_op(r['op'])} {fmt_money_ars(r['value'])}"
         buttons.append([(label, f"CLR:{i-1}")])
-    buttons.append([("Borrar Todas","CLR:ALL"), ("Cancelar","CLR:CANCEL")])
+    buttons.append([("Borrar Todas","CLR:ALL")])
+    buttons.append([("Volver","CLR:BACK"), ("Cancelar","CLR:CANCEL")])
     await update.effective_message.reply_text("Elegí qué alerta borrar:", reply_markup=InlineKeyboardMarkup(
         [[InlineKeyboardButton(t, callback_data=d) for t,d in row] for row in buttons]
     ))
@@ -1227,7 +1250,9 @@ async def alertas_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rules = ALERTS.get(chat_id, [])
     data = q.data.split(":",1)[1]
     if data == "CANCEL":
-        await q.edit_message_text("Operación cancelada."); return
+        await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True); return
+    if data == "BACK":
+        await cmd_alertas_menu(update, context, edit=True); return
     if data == "ALL":
         cnt = len(rules); ALERTS[chat_id] = []; save_state()
         await q.edit_message_text(f"Se eliminaron {cnt} alertas."); return
@@ -1254,7 +1279,10 @@ async def cmd_alertas_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("Pausar 24h", callback_data="AP:PAUSE:24"),
             InlineKeyboardButton("Reanudar", callback_data="AP:RESUME"),
         ],
-        [InlineKeyboardButton("Cerrar", callback_data="AP:CLOSE")],
+        [
+            InlineKeyboardButton("Volver", callback_data="AP:BACK"),
+            InlineKeyboardButton("Cerrar", callback_data="AP:CLOSE"),
+        ],
     ])
     await update.effective_message.reply_text("Pausa de alertas:", reply_markup=kb_pause)
 
@@ -1264,6 +1292,8 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = q.data
     if data == "AP:CLOSE":
         await q.edit_message_text("Listo."); return
+    if data == "AP:BACK":
+        await cmd_alertas_menu(update, context, edit=True); return
     if data == "AP:RESUME":
         ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
         save_state()
@@ -1316,7 +1346,7 @@ async def alertas_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     k = kb([
         [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
         [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
-        [("Cancelar", "CANCEL")]
+        [("Volver", "AL:MENU"), ("Cancelar", "CANCEL")],
     ])
     if update.callback_query:
         q = update.callback_query; await q.answer()
@@ -1324,6 +1354,13 @@ async def alertas_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.effective_message.reply_text("¿Qué querés alertar?", reply_markup=k)
     return AL_KIND
+
+
+async def alertas_add_exit_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    context.user_data.pop("al", None)
+    await cmd_alertas_menu(update, context, edit=True)
+    return ConversationHandler.END
 
 async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -1333,7 +1370,7 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         k = kb([
             [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
             [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
-            [("Cancelar", "CANCEL")]
+            [("Volver", "AL:MENU"), ("Cancelar", "CANCEL")],
         ])
         await q.edit_message_text("¿Qué querés alertar?", reply_markup=k); return AL_KIND
     if target == "FXTYPE":
@@ -1361,12 +1398,15 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target == "MODE":
         kb_mode = kb([[("Ingresar Importe", "MODE:absolute"),("Ingresar % vs valor actual", "MODE:percent")], [("Volver","BACK:OP"),("Cancelar","CANCEL")]])
         await q.edit_message_text("¿Cómo querés definir el umbral?", reply_markup=kb_mode); return AL_MODE
-    await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
+    return ConversationHandler.END
 
 async def alertas_add_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
-    if data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    if data == "CANCEL":
+        await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
+        return ConversationHandler.END
     kind = data.split(":",1)[1]
     context.user_data["al"] = {}
     al = context.user_data["al"]
@@ -1380,11 +1420,14 @@ async def alertas_add_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "cedears":
         al["kind"] = "ticker"; al["segment"] = "cedears"
         await q.edit_message_text("Elegí el ticker (Cedears .BA):", reply_markup=kb_tickers(CEDEARS_BA, "KIND", "TICK")); return AL_TICKER
-    await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
+    return ConversationHandler.END
 
 async def alertas_add_fx_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    if q.data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    if q.data == "CANCEL":
+        await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
+        return ConversationHandler.END
     if q.data.startswith("BACK:"): return await alertas_back(update, context)
     t = q.data.split(":",1)[1]
     context.user_data["al"]["type"] = t
@@ -1393,7 +1436,9 @@ async def alertas_add_fx_type(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def alertas_add_fx_side(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    if q.data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    if q.data == "CANCEL":
+        await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
+        return ConversationHandler.END
     if q.data.startswith("BACK:"): return await alertas_back(update, context)
     side = q.data.split(":",1)[1]
     context.user_data["al"]["side"] = side
@@ -1403,7 +1448,9 @@ async def alertas_add_fx_side(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def alertas_add_metric_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    if q.data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    if q.data == "CANCEL":
+        await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
+        return ConversationHandler.END
     if q.data.startswith("BACK:"): return await alertas_back(update, context)
     m = q.data.split(":",1)[1]
     context.user_data["al"]["type"] = m
@@ -1413,7 +1460,9 @@ async def alertas_add_metric_type(update: Update, context: ContextTypes.DEFAULT_
 
 async def alertas_add_ticker_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    if q.data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    if q.data == "CANCEL":
+        await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
+        return ConversationHandler.END
     if q.data.startswith("BACK:"): return await alertas_back(update, context)
     sym = q.data.split(":",1)[1].upper()
     context.user_data["al"]["symbol"] = sym
@@ -1424,7 +1473,9 @@ async def alertas_add_ticker_cb(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def alertas_add_op(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    if q.data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    if q.data == "CANCEL":
+        await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
+        return ConversationHandler.END
     if q.data.startswith("BACK:"): return await alertas_back(update, context)
     op = q.data.split(":",1)[1]
     context.user_data["al"]["op"] = op
@@ -1448,7 +1499,9 @@ async def alertas_add_op(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    if q.data == "CANCEL": await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    if q.data == "CANCEL":
+        await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
+        return ConversationHandler.END
     if q.data.startswith("BACK:"): return await alertas_back(update, context)
     mode = q.data.split(":",1)[1]
     context.user_data["al"]["mode"] = mode
@@ -1477,7 +1530,8 @@ async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 msg = (f"Métrica: {al.get('type','?').upper()} | Condición: {op_text}\nAhora: {label}\n\nIngresá el <b>importe</b> (solo número, en {unidad}).")
             await q.edit_message_text(msg, parse_mode=ParseMode.HTML); return AL_VALUE
-    await q.edit_message_text("Operación cancelada."); return ConversationHandler.END
+    await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
+    return ConversationHandler.END
 
 async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     al = context.user_data.get("al", {})
@@ -3304,7 +3358,11 @@ def build_application() -> Application:
             AL_MODE: [CallbackQueryHandler(alertas_add_mode, pattern="^(MODE:|BACK:|CANCEL$)")],
             AL_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, alertas_add_value)],
         },
-        fallbacks=[CallbackQueryHandler(alertas_back, pattern="^BACK:"), CallbackQueryHandler(alertas_add_start, pattern="^AL:ADD$")],
+        fallbacks=[
+            CallbackQueryHandler(alertas_back, pattern="^BACK:"),
+            CallbackQueryHandler(alertas_add_start, pattern="^AL:ADD$"),
+            CallbackQueryHandler(alertas_add_exit_to_menu, pattern="^AL:MENU$"),
+        ],
         per_chat=True,
         per_user=True,
         per_message=False,
