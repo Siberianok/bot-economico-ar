@@ -44,6 +44,12 @@ BASE_URL = os.getenv("BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "http://localh
 ENV_STATE_PATH = os.getenv("STATE_PATH", "state.json")
 UPSTASH_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("UPSTASH_URL") or "").strip()
 UPSTASH_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("UPSTASH_TOKEN") or "").strip()
+UPSTASH_REDIS_URL = (
+    os.getenv("UPSTASH_REDIS_URL")
+    or os.getenv("REDIS_URL")
+    or os.getenv("redis-url")
+    or ""
+).strip()
 UPSTASH_STATE_KEY = os.getenv("UPSTASH_STATE_KEY", "bot-econ-state").strip()
 
 if not TELEGRAM_TOKEN:
@@ -247,10 +253,50 @@ def _writable_path(candidate: str) -> str:
             return fallback
 
 USE_UPSTASH = bool(UPSTASH_URL and UPSTASH_TOKEN)
-STATE_PATH = _writable_path(ENV_STATE_PATH) if not USE_UPSTASH else None
+USE_UPSTASH_REDIS = bool(UPSTASH_REDIS_URL)
+STATE_PATH = _writable_path(ENV_STATE_PATH) if not (USE_UPSTASH or USE_UPSTASH_REDIS) else None
 ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 SUBS: Dict[int, Dict[str, Any]] = {}
 PF: Dict[int, Dict[str, Any]] = {}
+
+_REDIS_CLIENT: Optional[Any] = None
+_REDIS_CLIENT_INITIALIZED = False
+
+
+def _ensure_state_path() -> Optional[str]:
+    global STATE_PATH
+    if STATE_PATH:
+        return STATE_PATH
+    STATE_PATH = _writable_path(ENV_STATE_PATH)
+    return STATE_PATH
+
+
+def _get_redis_client():
+    global _REDIS_CLIENT, _REDIS_CLIENT_INITIALIZED, USE_UPSTASH_REDIS
+    if not USE_UPSTASH_REDIS:
+        return None
+    if _REDIS_CLIENT_INITIALIZED:
+        return _REDIS_CLIENT
+    _REDIS_CLIENT_INITIALIZED = True
+    try:
+        import redis  # type: ignore
+    except Exception as e:
+        log.warning("Paquete redis no disponible: %s", e)
+        USE_UPSTASH_REDIS = False
+        _REDIS_CLIENT = None
+        return None
+    try:
+        _REDIS_CLIENT = redis.Redis.from_url(
+            UPSTASH_REDIS_URL,
+            decode_responses=True,
+            socket_timeout=5,
+        )
+        return _REDIS_CLIENT
+    except Exception as e:
+        log.warning("No pude inicializar cliente Redis de Upstash: %s", e)
+        USE_UPSTASH_REDIS = False
+        _REDIS_CLIENT = None
+        return None
 
 
 def _upstash_request(path: str, *, method: str = "GET", data: Optional[str] = None) -> Dict[str, Any]:
@@ -318,17 +364,51 @@ def _save_state_to_upstash(payload: Dict[str, Any]) -> None:
             log.warning("No pude guardar estado en Upstash: %s", e)
 
 
+def _load_state_from_redis() -> Optional[Dict[str, Any]]:
+    client = _get_redis_client()
+    if not client:
+        return None
+    try:
+        raw = client.get(UPSTASH_STATE_KEY)
+    except Exception as e:
+        log.warning("No pude leer estado desde Redis Upstash: %s", e)
+        return None
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception as e:
+        log.warning("Estado Redis Upstash inválido: %s", e)
+        return None
+
+
+def _save_state_to_redis(payload: Dict[str, Any]) -> bool:
+    client = _get_redis_client()
+    if not client:
+        return False
+    try:
+        client.set(UPSTASH_STATE_KEY, json.dumps(payload, ensure_ascii=False))
+        return True
+    except Exception as e:
+        log.warning("No pude guardar estado en Redis Upstash: %s", e)
+        return False
+
+
 def load_state():
     global ALERTS, SUBS, PF
     data: Optional[Dict[str, Any]] = None
     if USE_UPSTASH:
         data = _load_state_from_upstash()
-    if data is None and not USE_UPSTASH:
-        try:
-            with open(STATE_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = None
+    if data is None and USE_UPSTASH_REDIS:
+        data = _load_state_from_redis()
+    if data is None:
+        path = _ensure_state_path()
+        if path:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = None
     if data:
         ALERTS = {int(k): v for k, v in data.get("alerts", {}).items()}
         SUBS = {int(k): v for k, v in data.get("subs", {}).items()}
@@ -348,8 +428,14 @@ def save_state():
     if USE_UPSTASH:
         _save_state_to_upstash(payload)
         return
+    if USE_UPSTASH_REDIS and _save_state_to_redis(payload):
+        return
+    path = _ensure_state_path()
+    if not path:
+        log.warning("No tengo ruta de estado para guardar en disco.")
+        return
     try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
     except Exception as e:
         log.warning("save_state error: %s", e)

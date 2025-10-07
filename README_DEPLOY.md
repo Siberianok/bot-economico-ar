@@ -10,6 +10,7 @@
 - `BOT_TOKEN` — el token del bot de Telegram (NO hardcodear).
 - (opcional) `STATE_PATH` — ruta del archivo JSON donde se persiste el estado (`alerts`, `subs` y `pf`). Por defecto el bot usa `./state.json`, pero en Render conviene apuntarlo a `/var/tmp/state.json` (o a un volumen persistente) para minimizar pérdidas por redeploy.
 - (opcional) `UPSTASH_REDIS_REST_URL` y `UPSTASH_REDIS_REST_TOKEN` — si se definen, el bot persistirá todo en Upstash usando su API HTTP.
+- (opcional) `UPSTASH_REDIS_URL` (o las variantes `REDIS_URL` / `redis-url` que provee Render) — activa la persistencia vía cliente Redis nativo de Upstash. Se usa automáticamente si no hay credenciales REST configuradas.
 - (opcional) `UPSTASH_STATE_KEY` — clave del registro JSON dentro de Upstash (default `bot-econ-state`).
 
 ## 3) Deploy rápido (desde un repo)
