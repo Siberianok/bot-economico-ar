@@ -10,7 +10,7 @@ from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional, Set, Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 # ====== matplotlib opcional (no rompe si no está instalado) ======
 HAS_MPL = False
@@ -298,10 +298,24 @@ def _load_state_from_upstash() -> Optional[Dict[str, Any]]:
 
 def _save_state_to_upstash(payload: Dict[str, Any]) -> None:
     data = json.dumps(payload, ensure_ascii=False)
+    primary_error: Optional[Exception] = None
+    try:
+        encoded = quote(data, safe="")
+        _upstash_request(f"set/{UPSTASH_STATE_KEY}/{encoded}", method="POST")
+        return
+    except Exception as e:
+        primary_error = e
     try:
         _upstash_request(f"set/{UPSTASH_STATE_KEY}", method="POST", data=data)
     except Exception as e:
-        log.warning("No pude guardar estado en Upstash: %s", e)
+        if primary_error:
+            log.warning(
+                "No pude guardar estado en Upstash (fallback falló tras error primario %s): %s",
+                primary_error,
+                e,
+            )
+        else:
+            log.warning("No pude guardar estado en Upstash: %s", e)
 
 
 def load_state():
