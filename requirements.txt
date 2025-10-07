@@ -5,3 +5,4 @@ httpx==0.26.*
 certifi
 tzdata
 matplotlib==3.8.*
+redis>=5.0.0,<6
