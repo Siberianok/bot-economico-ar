@@ -1324,7 +1324,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Elegí una opción rápida o usá los comandos clásicos:\n"
         "• /economia — Panel macro: dólares, reservas, inflación, riesgo y noticias\n"
         "• /acciones — Rankings y proyecciones de acciones\n"
-        "• /cedears — Rankings y proyecciones de Cd-arts\n"
+        "• /cedears — Rankings y proyecciones de cedears\n"
         "• /alertas_menu — Gestioná alertas personalizadas\n"
         "• /portafolio — Armá y analizá tu cartera\n"
         "• /subs — Suscripción al resumen diario\n"
@@ -1340,8 +1340,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🏁 Acciones Proyección", callback_data="ACC:TOP5"),
         ],
         [
-            InlineKeyboardButton("🌎 Cd-arts Top 3", callback_data="CED:TOP3"),
-            InlineKeyboardButton("🌐 Cd-arts Proyección", callback_data="CED:TOP5"),
+            InlineKeyboardButton("🌎 Cedears Top 3", callback_data="CED:TOP3"),
+            InlineKeyboardButton("🌐 Cedears Proyección", callback_data="CED:TOP5"),
         ],
         [
             InlineKeyboardButton("🔔 Mis alertas", callback_data="AL:LIST"),
@@ -1374,10 +1374,10 @@ async def cmd_acciones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cedears_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_menu_counter(context, "cedears", 2)
     kb_menu = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Top 3 Cd-arts (Rendimiento)", callback_data="CED:TOP3")],
-        [InlineKeyboardButton("Top 5 Cd-arts (Proyección)", callback_data="CED:TOP5")],
+        [InlineKeyboardButton("Top 3 Cedears (Rendimiento)", callback_data="CED:TOP3")],
+        [InlineKeyboardButton("Top 5 Cedears (Proyección)", callback_data="CED:TOP5")],
     ])
-    await update.effective_message.reply_text("🌎 Menú Cd-arts", reply_markup=kb_menu)
+    await update.effective_message.reply_text("🌎 Menú cedears", reply_markup=kb_menu)
 
 async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -1389,10 +1389,10 @@ async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _rank_proj5(update, ACCIONES_BA, "🏁 Top 5 Acciones (Proyección)")
         await dec_and_maybe_show(update, context, "acciones", cmd_acciones_menu)
     elif data == "CED:TOP3":
-        await _rank_top3(update, CEDEARS_BA, "🌎 Top 3 Cd-arts (Rendimiento)")
+        await _rank_top3(update, CEDEARS_BA, "🌎 Top 3 Cedears (Rendimiento)")
         await dec_and_maybe_show(update, context, "cedears", cmd_cedears_menu)
     elif data == "CED:TOP5":
-        await _rank_proj5(update, CEDEARS_BA, "🏁 Top 5 Cd-arts (Proyección)")
+        await _rank_proj5(update, CEDEARS_BA, "🏁 Top 5 Cedears (Proyección)")
         await dec_and_maybe_show(update, context, "cedears", cmd_cedears_menu)
 
 # ---------- Macro ----------
@@ -1869,7 +1869,7 @@ async def alertas_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["al"] = {}
     k = kb([
         [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
-        [("Acciones", "KIND:acciones"), ("Cd-arts", "KIND:cedears")],
+        [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
         [("Criptomonedas", "KIND:crypto")],
         [("Volver", "AL:MENU"), ("Cancelar", "CANCEL")],
     ])
@@ -1894,7 +1894,7 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target == "KIND":
         k = kb([
             [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
-            [("Acciones", "KIND:acciones"), ("Cd-arts", "KIND:cedears")],
+            [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
             [("Criptomonedas", "KIND:crypto")],
             [("Volver", "AL:MENU"), ("Cancelar", "CANCEL")],
         ])
@@ -1908,7 +1908,7 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target == "TICKERS_ACC":
         await q.edit_message_text("Elegí el ticker (Acciones):", reply_markup=kb_tickers(ACCIONES_BA, "KIND", "TICK")); return AL_TICKER
     if target == "TICKERS_CEDEARS":
-        await q.edit_message_text("Elegí el ticker (Cd-arts):", reply_markup=kb_tickers(CEDEARS_BA, "KIND", "TICK")); return AL_TICKER
+        await q.edit_message_text("Elegí el ticker (cedear):", reply_markup=kb_tickers(CEDEARS_BA, "KIND", "TICK")); return AL_TICKER
     if target in {"CRYPTO", "CRYPTO_LIST"}:
         return await alertas_show_crypto_list(update, context, query=q)
     if target == "CRYPTO_MANUAL":
@@ -1952,7 +1952,7 @@ async def alertas_add_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Elegí el ticker (Acciones):", reply_markup=kb_tickers(ACCIONES_BA, "KIND", "TICK")); return AL_TICKER
     if kind == "cedears":
         al["kind"] = "ticker"; al["segment"] = "cedears"
-        await q.edit_message_text("Elegí el ticker (Cd-arts):", reply_markup=kb_tickers(CEDEARS_BA, "KIND", "TICK")); return AL_TICKER
+        await q.edit_message_text("Elegí el ticker (cedear):", reply_markup=kb_tickers(CEDEARS_BA, "KIND", "TICK")); return AL_TICKER
     if kind == "crypto":
         al["kind"] = "crypto"
         return await alertas_show_crypto_list(update, context, query=q)
@@ -4056,8 +4056,8 @@ def setup_health_routes(application: Application) -> None:
 
 BOT_COMMANDS = [
     BotCommand("economia","Menú de economía"),
-    BotCommand("acciones","Menú acciones .BA"),
-    BotCommand("cedears","Menú CEDEARs .BA"),
+    BotCommand("acciones","Menú acciones"),
+    BotCommand("cedears","Menú cedears"),
     BotCommand("alertas_menu","Configurar alertas"),
     BotCommand("portafolio","Menú portafolio"),
     BotCommand("subs","Suscripción a resumen diario"),
