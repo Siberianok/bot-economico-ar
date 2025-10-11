@@ -106,6 +106,22 @@ CRIPTO_TOP_NAMES = [
 ]
 def _crypto_to_symbol(cname: str) -> str: return f"{cname}-USD"
 
+BINANCE_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
+BINANCE_TICKER_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_FIAT_QUOTES = {
+    "USDT", "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USD", "EUR", "GBP",
+    "ARS", "BRL", "TRY", "RUB", "AUD", "CAD", "JPY", "CHF", "MXN"
+}
+BINANCE_QUOTE_SYMBOL = {
+    "USDT": "US$", "USDC": "US$", "BUSD": "US$", "TUSD": "US$", "FDUSD": "US$",
+    "DAI": "US$", "USD": "US$", "EUR": "€", "GBP": "£", "ARS": "$",
+    "BRL": "R$", "TRY": "₺", "RUB": "₽", "AUD": "A$", "CAD": "C$",
+    "JPY": "¥", "CHF": "Fr.", "MXN": "$"
+}
+BINANCE_PREFERRED_QUOTES = ["USDT", "USDC", "FDUSD", "BUSD", "TUSD", "DAI", "BTC", "ETH", "BNB"]
+_binance_symbols_cache: Dict[str, Dict[str, str]] = {}
+_binance_symbols_ts: float = 0.0
+
 TICKER_NAME = {
     "GGAL.BA":"Grupo Financiero Galicia","YPFD.BA":"YPF","PAMP.BA":"Pampa Energía","CEPU.BA":"Central Puerto",
     "ALUA.BA":"Aluar","TXAR.BA":"Ternium Argentina","TGSU2.BA":"Transportadora de Gas del Sur",
@@ -464,6 +480,31 @@ def fmt_money_usd(n: Optional[float], nd: int = 2) -> str:
     except Exception:
         return f"US$ {n}"
 
+def _fmt_number_generic(n: float, nd: int) -> str:
+    s = f"{n:,.{nd}f}"
+    return s.replace(",", "X").replace(".", ",").replace("X", ".")
+
+def fmt_crypto_price(n: Optional[float], quote: Optional[str]) -> str:
+    if n is None:
+        return f"— {quote.upper()}" if quote else "—"
+    q = (quote or "").upper()
+    symbol = BINANCE_QUOTE_SYMBOL.get(q)
+    if symbol:
+        nd = 2 if abs(n) >= 1 else (4 if abs(n) >= 0.1 else 6)
+        return f"{symbol} {_fmt_number_generic(float(n), nd)}"
+    nd = 8 if abs(n) < 1 else 4
+    formatted = _fmt_number_generic(float(n), nd)
+    return f"{formatted} {q}".strip()
+
+def crypto_display_name(symbol: Optional[str], base: Optional[str], quote: Optional[str]) -> str:
+    base_u = (base or "").upper()
+    quote_u = (quote or "").upper()
+    if base_u and quote_u:
+        return f"{base_u}/{quote_u}"
+    if symbol:
+        return symbol.upper()
+    return "Cripto"
+
 def pct(n: Optional[float], nd: int = 2) -> str:
     try: return f"{n:+.{nd}f}%".replace(".", ",")
     except Exception: return "—"
@@ -520,6 +561,91 @@ async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str
     except Exception as e:
         log.warning("fetch_text error %s: %s", url, e)
     return None
+
+
+async def get_binance_symbols(session: ClientSession) -> Dict[str, Dict[str, str]]:
+    global _binance_symbols_cache, _binance_symbols_ts
+    now = time()
+    if _binance_symbols_cache and (now - _binance_symbols_ts) < 3600:
+        return _binance_symbols_cache
+    data = await fetch_json(session, BINANCE_EXCHANGE_INFO_URL)
+    if not data:
+        return _binance_symbols_cache
+    symbols: Dict[str, Dict[str, str]] = {}
+    for entry in data.get("symbols", []):
+        try:
+            if entry.get("status") != "TRADING":
+                continue
+            if not entry.get("isSpotTradingAllowed") and "SPOT" not in entry.get("permissions", []):
+                continue
+            symbol = entry.get("symbol")
+            base = entry.get("baseAsset")
+            quote = entry.get("quoteAsset")
+            if not (symbol and base and quote):
+                continue
+            symbols[symbol.upper()] = {
+                "symbol": symbol.upper(),
+                "base": base.upper(),
+                "quote": quote.upper(),
+            }
+        except Exception:
+            continue
+    if symbols:
+        _binance_symbols_cache = symbols
+        _binance_symbols_ts = now
+    return _binance_symbols_cache
+
+
+async def get_binance_prices(session: ClientSession, symbols: List[str]) -> Dict[str, Optional[float]]:
+    out: Dict[str, Optional[float]] = {}
+    if not symbols:
+        return out
+    norm = [s.upper() for s in symbols if s]
+    if not norm:
+        return out
+    chunk_size = 80
+    for i in range(0, len(norm), chunk_size):
+        chunk = norm[i:i+chunk_size]
+        if not chunk:
+            continue
+        url = None
+        if len(chunk) == 1:
+            url = f"{BINANCE_TICKER_PRICE_URL}?symbol={chunk[0]}"
+        else:
+            try:
+                payload = quote(json.dumps(chunk))
+                url = f"{BINANCE_TICKER_PRICE_URL}?symbols={payload}"
+            except Exception as e:
+                log.warning("binance symbols encode error: %s", e)
+                continue
+        data = await fetch_json(session, url) if url else None
+        if isinstance(data, dict):
+            sym = data.get("symbol")
+            price = data.get("price")
+            try:
+                if sym and price is not None:
+                    out[sym.upper()] = float(price)
+            except Exception:
+                out[sym.upper()] = None if sym else None
+        elif isinstance(data, list):
+            for row in data:
+                sym = None
+                price = None
+                if isinstance(row, dict):
+                    sym = row.get("symbol")
+                    price = row.get("price")
+                try:
+                    if sym and price is not None:
+                        out[sym.upper()] = float(price)
+                except Exception:
+                    if sym:
+                        out[sym.upper()] = None
+    return out
+
+
+async def get_binance_price(session: ClientSession, symbol: str) -> Optional[float]:
+    prices = await get_binance_prices(session, [symbol])
+    return prices.get(symbol.upper())
 
 # ============================ DATA SOURCES ============================
 
@@ -1226,7 +1352,7 @@ async def econ_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============================ ALERTAS ============================
 
-AL_KIND, AL_FX_TYPE, AL_FX_SIDE, AL_OP, AL_MODE, AL_VALUE, AL_METRIC_TYPE, AL_TICKER = range(8)
+AL_KIND, AL_FX_TYPE, AL_FX_SIDE, AL_OP, AL_MODE, AL_VALUE, AL_METRIC_TYPE, AL_TICKER, AL_CRYPTO = range(9)
 ALERTS_SILENT_UNTIL: Dict[int, float] = {}
 ALERTS_PAUSED: Set[int] = set()
 
@@ -1254,6 +1380,16 @@ def _fx_display_value(row: Dict[str, Any], side: str) -> Optional[float]:
     if side == "compra": return row.get("venta")
     if side == "venta":  return row.get("compra")
     return None
+
+def _sort_crypto_matches(matches: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    def key(info: Dict[str, str]):
+        quote = info.get("quote", "")
+        try:
+            idx = BINANCE_PREFERRED_QUOTES.index(quote)
+        except ValueError:
+            idx = len(BINANCE_PREFERRED_QUOTES)
+        return (idx, info.get("symbol", ""))
+    return sorted(matches, key=key)
 
 def kb_alertas_menu() -> InlineKeyboardMarkup:
     return kb([
@@ -1308,6 +1444,12 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 elif t=="reservas": val = f"{fmt_number(v,0)} MUS$"
                 else:               val = f"{str(round(v,1)).replace('.',',')}%"
                 lines.append(f"{i}. {t.upper()} {html_op(op)} {val}")
+            elif r.get("kind") == "crypto":
+                label = crypto_display_name(r.get("symbol"), r.get("base"), r.get("quote"))
+                op = r.get("op")
+                v = r.get("value")
+                quote = r.get("quote")
+                lines.append(f"{i}. {label} (Precio) {html_op(op)} {fmt_crypto_price(v, quote)}")
             else:
                 sym, op, v = r["symbol"], r["op"], r["value"]
                 lines.append(f"{i}. {_label_long(sym)} (Precio) {html_op(op)} {fmt_money_ars(v)}")
@@ -1335,6 +1477,8 @@ async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
             elif r["type"]=="reservas": val = f"{fmt_number(r['value'],0)} MUS$"
             else:                       val = f"{str(round(r['value'],1)).replace('.',',')}%"
             label = f"{i}. {r['type'].upper()} {html_op(r['op'])} {val}"
+        elif r.get("kind") == "crypto":
+            label = f"{i}. {crypto_display_name(r.get('symbol'), r.get('base'), r.get('quote'))} {html_op(r['op'])} {fmt_crypto_price(r['value'], r.get('quote'))}"
         else:
             label = f"{i}. {_label_long(r['symbol'])} {html_op(r['op'])} {fmt_money_ars(r['value'])}"
         buttons.append([(label, f"CLR:{i-1}")])
@@ -1446,6 +1590,7 @@ async def alertas_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     k = kb([
         [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
         [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
+        [("Criptos (Binance)", "KIND:crypto")],
         [("Volver", "AL:MENU"), ("Cancelar", "CANCEL")],
     ])
     if update.callback_query:
@@ -1470,6 +1615,7 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         k = kb([
             [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
             [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
+            [("Criptos (Binance)", "KIND:crypto")],
             [("Volver", "AL:MENU"), ("Cancelar", "CANCEL")],
         ])
         await q.edit_message_text("¿Qué querés alertar?", reply_markup=k); return AL_KIND
@@ -1483,6 +1629,9 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Elegí el ticker (Acciones .BA):", reply_markup=kb_tickers(ACCIONES_BA, "KIND", "TICK")); return AL_TICKER
     if target == "TICKERS_CEDEARS":
         await q.edit_message_text("Elegí el ticker (Cedears .BA):", reply_markup=kb_tickers(CEDEARS_BA, "KIND", "TICK")); return AL_TICKER
+    if target == "CRYPTO":
+        await q.edit_message_text("Ingresá la cripto (ej: BTCUSDT, BTC/USDT, BTC). Escribilo en el chat.")
+        return AL_CRYPTO
     if target == "OP":
         kind = al.get("kind")
         if kind == "ticker":
@@ -1490,6 +1639,9 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Elegí condición:", reply_markup=kb_op)
         elif kind == "fx":
             kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],[("Volver","BACK:FXSIDE"),("Cancelar","CANCEL")]])
+            await q.edit_message_text("Elegí condición:", reply_markup=kb_op)
+        elif kind == "crypto":
+            kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],[("Volver","BACK:CRYPTO"),("Cancelar","CANCEL")]])
             await q.edit_message_text("Elegí condición:", reply_markup=kb_op)
         else:
             kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],[("Volver","BACK:METRIC"),("Cancelar","CANCEL")]])
@@ -1520,6 +1672,14 @@ async def alertas_add_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "cedears":
         al["kind"] = "ticker"; al["segment"] = "cedears"
         await q.edit_message_text("Elegí el ticker (Cedears .BA):", reply_markup=kb_tickers(CEDEARS_BA, "KIND", "TICK")); return AL_TICKER
+    if kind == "crypto":
+        al["kind"] = "crypto"
+        msg = (
+            "Ingresá la cripto que querés alertar (ej: BTCUSDT, BTC/USDT, BTC).\n"
+            "Escribilo en el chat."
+        )
+        await q.edit_message_text(msg)
+        return AL_CRYPTO
     await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
     return ConversationHandler.END
 
@@ -1569,6 +1729,112 @@ async def alertas_add_ticker_cb(update: Update, context: ContextTypes.DEFAULT_TY
     k = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],
             [("Volver","BACK:" + ("TICKERS_ACC" if context.user_data["al"].get("segment")=="acciones" else "TICKERS_CEDEARS")),("Cancelar","CANCEL")]])
     await q.edit_message_text(f"Ticker: {_label_long(sym)}\nElegí condición:", reply_markup=k)
+    return AL_OP
+
+async def alertas_crypto_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("Ingresá el símbolo de la cripto. Ej: BTCUSDT o BTC/USDT.")
+        return AL_CRYPTO
+    normalized = unicodedata.normalize("NFKD", text)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    upper = normalized.upper()
+    alphanum = re.sub(r"[^A-Z0-9]", "", upper)
+    parts = [p for p in re.split(r"[^A-Z0-9]+", upper) if p]
+    async with ClientSession() as session:
+        symbols_map = await get_binance_symbols(session)
+    if not symbols_map:
+        await update.message.reply_text("No pude obtener el listado de Binance. Probá más tarde.")
+        return AL_CRYPTO
+    matches: List[Dict[str, str]] = []
+    seen: Set[str] = set()
+
+    def add_match(info: Dict[str, str]):
+        sym = info.get("symbol")
+        if sym and sym not in seen:
+            seen.add(sym)
+            matches.append(info)
+
+    if alphanum and alphanum in symbols_map:
+        add_match(symbols_map[alphanum])
+    if not matches and len(parts) >= 2:
+        combined = (parts[0] + parts[1]).upper()
+        if combined in symbols_map:
+            add_match(symbols_map[combined])
+    if not matches and alphanum:
+        for info in symbols_map.values():
+            if alphanum == info.get("base"):
+                add_match(info)
+    if not matches and alphanum:
+        for info in symbols_map.values():
+            if info.get("symbol", "").startswith(alphanum):
+                add_match(info)
+                if len(matches) >= 12:
+                    break
+    if not matches and alphanum:
+        for info in symbols_map.values():
+            if info.get("base", "").startswith(alphanum):
+                add_match(info)
+                if len(matches) >= 12:
+                    break
+    if not matches and alphanum:
+        for info in symbols_map.values():
+            if alphanum in info.get("symbol", ""):
+                add_match(info)
+                if len(matches) >= 12:
+                    break
+    matches = _sort_crypto_matches(matches)[:12]
+    al = context.user_data.setdefault("al", {})
+    if not matches:
+        await update.message.reply_text("No encontré esa cripto. Probá con el símbolo completo, por ejemplo BTCUSDT.")
+        return AL_CRYPTO
+    if len(matches) == 1:
+        info = matches[0]
+        al["symbol"] = info.get("symbol")
+        al["crypto_base"] = info.get("base")
+        al["crypto_quote"] = info.get("quote")
+        label = crypto_display_name(info.get("symbol"), info.get("base"), info.get("quote"))
+        k = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")], [("Volver", "BACK:CRYPTO"), ("Cancelar", "CANCEL")]])
+        await update.message.reply_text(f"Cripto: {label}\nElegí condición:", reply_markup=k)
+        return AL_OP
+    buttons: List[List[Tuple[str, str]]] = []
+    row: List[Tuple[str, str]] = []
+    for info in matches:
+        sym = info.get("symbol")
+        label = crypto_display_name(sym, info.get("base"), info.get("quote"))
+        row.append((label, f"CRYPTOSEL:{sym}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([("Nueva búsqueda", "BACK:CRYPTO"), ("Cancelar", "CANCEL")])
+    await update.message.reply_text("Elegí la cripto:", reply_markup=kb(buttons))
+    return AL_CRYPTO
+
+async def alertas_crypto_pick_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    if data == "CANCEL":
+        await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
+        return ConversationHandler.END
+    if data.startswith("BACK:"):
+        return await alertas_back(update, context)
+    sym = data.split(":", 1)[1].upper()
+    async with ClientSession() as session:
+        symbols_map = await get_binance_symbols(session)
+    info = symbols_map.get(sym)
+    if not info:
+        await q.edit_message_text("No encontré esa cripto. Probá buscar de nuevo.")
+        return AL_CRYPTO
+    al = context.user_data.setdefault("al", {})
+    al["symbol"] = info.get("symbol")
+    al["crypto_base"] = info.get("base")
+    al["crypto_quote"] = info.get("quote")
+    label = crypto_display_name(info.get("symbol"), info.get("base"), info.get("quote"))
+    k = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")], [("Volver", "BACK:CRYPTO"), ("Cancelar", "CANCEL")]])
+    await q.edit_message_text(f"Cripto: {label}\nElegí condición:", reply_markup=k)
     return AL_OP
 
 async def alertas_add_op(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1630,6 +1896,22 @@ async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 msg = (f"Métrica: {al.get('type','?').upper()} | Condición: {op_text}\nAhora: {label}\n\nIngresá el <b>importe</b> (solo número, en {unidad}).")
             await q.edit_message_text(msg, parse_mode=ParseMode.HTML); return AL_VALUE
+        if al.get("kind") == "crypto":
+            sym = al.get("symbol")
+            quote = al.get("crypto_quote")
+            base = al.get("crypto_base")
+            price = await get_binance_price(session, sym) if sym else None
+            if price is None:
+                await q.edit_message_text("No pude leer el precio actual. Probá más tarde.")
+                return ConversationHandler.END
+            label = crypto_display_name(sym, base, quote)
+            price_s = fmt_crypto_price(price, quote)
+            if mode == "percent":
+                msg = (f"Cripto: {label} | Condición: {op_text}\nAhora: {price_s}\n\nIngresá el <b>%</b> (solo número). Ej: 10 | 7.5")
+            else:
+                unidad = (quote or "").upper() or "USDT"
+                msg = (f"Cripto: {label} | Condición: {op_text}\nAhora: {price_s}\n\nIngresá el <b>precio objetivo</b> en {unidad} (solo número).")
+            await q.edit_message_text(msg, parse_mode=ParseMode.HTML); return AL_VALUE
     await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
     return ConversationHandler.END
 
@@ -1668,6 +1950,35 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if (al["op"] == ">" and thr <= cur) or (al["op"] == "<" and thr >= cur):
                     await update.message.reply_text("El objetivo debe ser válido respecto al valor actual."); return AL_VALUE
             ALERTS.setdefault(chat_id, []).append({"kind":"metric","type":al["type"],"op":al["op"],"value":float(thr)})
+            save_state()
+            await update.message.reply_text("Listo. Alerta agregada ✅")
+            await cmd_alertas_menu(update, context)
+            return ConversationHandler.END
+
+        if al.get("kind") == "crypto":
+            sym = al.get("symbol")
+            op = al.get("op")
+            quote = al.get("crypto_quote")
+            base = al.get("crypto_base")
+            price = await get_binance_price(session, sym) if sym else None
+            if price is None:
+                await update.message.reply_text("No pude leer el precio actual."); return ConversationHandler.END
+            thr = price*(1 + (val/100.0)) if al.get("mode") == "percent" and op == ">" else \
+                  price*(1 - (val/100.0)) if al.get("mode") == "percent" else val
+            if al.get("mode") == "absolute":
+                if (op == ">" and thr <= price) or (op == "<" and thr >= price):
+                    await update.message.reply_text(
+                        f"El precio objetivo debe ser {'mayor' if op=='>' else 'menor'} que {fmt_crypto_price(price, quote)}."
+                    ); return AL_VALUE
+            ALERTS.setdefault(chat_id, []).append({
+                "kind": "crypto",
+                "symbol": (sym or "").upper(),
+                "op": op,
+                "value": float(thr),
+                "mode": al.get("mode"),
+                "base": (base or "").upper(),
+                "quote": (quote or "").upper(),
+            })
             save_state()
             await update.message.reply_text("Listo. Alerta agregada ✅")
             await cmd_alertas_menu(update, context)
@@ -1713,7 +2024,9 @@ async def alerts_loop(app: Application):
                                 "inflacion": float(infl[0]) if infl else None,
                                 "reservas": rv[0] if rv else None}
                         sym_list = {r["symbol"] for cid in active_chats for r in ALERTS.get(cid, []) if r.get("kind")=="ticker" and r.get("symbol")}
+                        crypto_list = {r["symbol"] for cid in active_chats for r in ALERTS.get(cid, []) if r.get("kind")=="crypto" and r.get("symbol")}
                         metmap, _ = (await metrics_for_symbols(session, sorted(sym_list))) if sym_list else ({}, None)
+                        crypto_prices = await get_binance_prices(session, sorted(crypto_list)) if crypto_list else {}
                         for chat_id in active_chats:
                             rules = ALERTS.get(chat_id, [])
                             if not rules: continue
@@ -1735,6 +2048,13 @@ async def alerts_loop(app: Application):
                                     if cur is None: continue
                                     ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
                                     if ok: trig.append(("ticker_px", sym, r["op"], r["value"], cur))
+                                elif r.get("kind") == "crypto":
+                                    sym = (r.get("symbol") or "").upper()
+                                    cur = crypto_prices.get(sym)
+                                    if cur is None: continue
+                                    ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
+                                    if ok:
+                                        trig.append(("crypto_px", sym, r.get("op"), r.get("value"), cur, r.get("base"), r.get("quote")))
                             if trig:
                                 lines = [f"<b>🔔 Alertas</b>"]
                                 for t, *rest in trig:
@@ -1749,6 +2069,10 @@ async def alerts_loop(app: Application):
                                             lines.append(f"Inflación Mensual: {str(round(cur,1)).replace('.',',')}% ({html_op(op)} {str(round(v,1)).replace('.',',')}%)")
                                         elif tipo=="reservas":
                                             lines.append(f"Reservas: {fmt_number(cur,0)} MUS$ ({html_op(op)} {fmt_number(v,0)} MUS$)")
+                                    elif t == "crypto_px":
+                                        sym, op, v, cur, base, quote = rest
+                                        label = crypto_display_name(sym, base, quote)
+                                        lines.append(f"{label}: {fmt_crypto_price(cur, quote)} ({html_op(op)} {fmt_crypto_price(v, quote)})")
                                     else:
                                         sym, op, v, cur = rest
                                         lines.append(f"{_label_long(sym)} (Precio): {fmt_money_ars(cur)} ({html_op(op)} {fmt_money_ars(v)})")
@@ -3454,6 +3778,10 @@ def build_application() -> Application:
             AL_FX_SIDE: [CallbackQueryHandler(alertas_add_fx_side, pattern="^(SIDE:|BACK:|CANCEL$)")],
             AL_METRIC_TYPE: [CallbackQueryHandler(alertas_add_metric_type, pattern="^(METRIC:|BACK:|CANCEL$)")],
             AL_TICKER: [CallbackQueryHandler(alertas_add_ticker_cb, pattern="^(TICK:|BACK:|CANCEL$)")],
+            AL_CRYPTO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, alertas_crypto_query),
+                CallbackQueryHandler(alertas_crypto_pick_cb, pattern="^(CRYPTOSEL:|BACK:|CANCEL$)"),
+            ],
             AL_OP: [CallbackQueryHandler(alertas_add_op, pattern="^(OP:|BACK:|CANCEL$)")],
             AL_MODE: [CallbackQueryHandler(alertas_add_mode, pattern="^(MODE:|BACK:|CANCEL$)")],
             AL_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, alertas_add_value)],
