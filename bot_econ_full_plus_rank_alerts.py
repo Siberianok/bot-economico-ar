@@ -119,6 +119,16 @@ BINANCE_QUOTE_SYMBOL = {
     "JPY": "¥", "CHF": "Fr.", "MXN": "$"
 }
 BINANCE_PREFERRED_QUOTES = ["USDT", "USDC", "FDUSD", "BUSD", "TUSD", "DAI", "BTC", "ETH", "BNB"]
+MAX_BINANCE_TOP_CRYPTO = 50
+BINANCE_TOP_USDT_BASES = [
+    "BTC", "ETH", "BNB", "SOL", "XRP", "ADA", "DOGE", "TON", "TRX", "AVAX",
+    "SHIB", "DOT", "LINK", "MATIC", "LTC", "BCH", "ICP", "NEAR", "APT", "ARB",
+    "FIL", "ATOM", "HBAR", "VET", "GRT", "FTM", "SAND", "AXS", "APE", "OP",
+    "RNDR", "INJ", "RUNE", "FLOW", "ALGO", "QNT", "IMX", "MANA", "GALA", "CHZ",
+    "LDO", "DYDX", "SUI", "TIA", "SEI", "ETC", "XLM", "EGLD", "STX", "COMP",
+    "MKR", "AAVE", "XMR", "UNI", "KAVA", "CRV", "ZIL", "ROSE", "THETA", "IOTA",
+    "GMX", "AR", "PYTH", "ARKM", "WIF", "SSV", "JTO", "ENA", "JUP", "NOT",
+]
 _binance_symbols_cache: Dict[str, Dict[str, str]] = {}
 _binance_symbols_ts: float = 0.0
 
@@ -1369,6 +1379,77 @@ def kb_tickers(symbols: List[str], back_target: str, prefix: str) -> InlineKeybo
     rows.append([("Volver","BACK:"+back_target), ("Cancelar","CANCEL")])
     return kb(rows)
 
+
+def _build_crypto_top_rows(symbols_map: Dict[str, Dict[str, str]]) -> Optional[List[List[Tuple[str, str]]]]:
+    rows_data: List[Tuple[str, str]] = []
+    for base in BINANCE_TOP_USDT_BASES:
+        symbol = f"{base.upper()}USDT"
+        info = symbols_map.get(symbol)
+        if not info:
+            continue
+        label = crypto_display_name(info.get("symbol"), info.get("base"), info.get("quote"))
+        rows_data.append((label, f"CRYPTOSEL:{info.get('symbol')}"))
+        if len(rows_data) >= MAX_BINANCE_TOP_CRYPTO:
+            break
+    if not rows_data:
+        return None
+    rows: List[List[Tuple[str, str]]] = []
+    row: List[Tuple[str, str]] = []
+    for item in rows_data:
+        row.append(item)
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([("🔍 Buscar manualmente", "CRYPTO:SEARCH")])
+    rows.append([("⬅️ Volver", "BACK:KIND"), ("Cancelar", "CANCEL")])
+    return rows
+
+
+async def alertas_prompt_crypto_manual(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    query: Optional["CallbackQuery"] = None,
+    prefix: Optional[str] = None,
+) -> int:
+    msg = (
+        "Ingresá la criptomoneda que querés alertar (ej: BTCUSDT, BTC/USDT, BTC).\n"
+        "Escribila en el chat."
+    )
+    if prefix:
+        msg = f"{prefix}\n\n{msg}"
+    markup = kb([[("⬅️ Volver al listado", "BACK:CRYPTO_LIST"), ("Cancelar", "CANCEL")]])
+    if query:
+        await query.edit_message_text(msg, reply_markup=markup)
+    else:
+        await update.effective_message.reply_text(msg, reply_markup=markup)
+    return AL_CRYPTO
+
+
+async def alertas_show_crypto_list(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    query: Optional["CallbackQuery"] = None,
+    prefix: Optional[str] = None,
+) -> int:
+    text = "Elegí la criptomoneda:"
+    if prefix:
+        text = f"{prefix}\n\n{text}"
+    async with ClientSession() as session:
+        symbols_map = await get_binance_symbols(session)
+    rows = _build_crypto_top_rows(symbols_map)
+    if rows:
+        if query:
+            await query.edit_message_text(text, reply_markup=kb(rows))
+        else:
+            await update.effective_message.reply_text(text, reply_markup=kb(rows))
+        return AL_CRYPTO
+    fallback_prefix = prefix or "No pude obtener el listado de criptomonedas."
+    return await alertas_prompt_crypto_manual(update, context, query=query, prefix=fallback_prefix)
+
 def _parse_float_user_strict(s: str) -> Optional[float]:
     s = (s or "").strip()
     if re.search(r"[^\d\.,\-+]", s): return None
@@ -1590,7 +1671,7 @@ async def alertas_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     k = kb([
         [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
         [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
-        [("Criptos (Binance)", "KIND:crypto")],
+        [("Criptomonedas", "KIND:crypto")],
         [("Volver", "AL:MENU"), ("Cancelar", "CANCEL")],
     ])
     if update.callback_query:
@@ -1615,7 +1696,7 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         k = kb([
             [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
             [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
-            [("Criptos (Binance)", "KIND:crypto")],
+            [("Criptomonedas", "KIND:crypto")],
             [("Volver", "AL:MENU"), ("Cancelar", "CANCEL")],
         ])
         await q.edit_message_text("¿Qué querés alertar?", reply_markup=k); return AL_KIND
@@ -1629,9 +1710,10 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Elegí el ticker (Acciones .BA):", reply_markup=kb_tickers(ACCIONES_BA, "KIND", "TICK")); return AL_TICKER
     if target == "TICKERS_CEDEARS":
         await q.edit_message_text("Elegí el ticker (Cedears .BA):", reply_markup=kb_tickers(CEDEARS_BA, "KIND", "TICK")); return AL_TICKER
-    if target == "CRYPTO":
-        await q.edit_message_text("Ingresá la cripto (ej: BTCUSDT, BTC/USDT, BTC). Escribilo en el chat.")
-        return AL_CRYPTO
+    if target in {"CRYPTO", "CRYPTO_LIST"}:
+        return await alertas_show_crypto_list(update, context, query=q)
+    if target == "CRYPTO_MANUAL":
+        return await alertas_prompt_crypto_manual(update, context, query=q)
     if target == "OP":
         kind = al.get("kind")
         if kind == "ticker":
@@ -1641,7 +1723,7 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
             kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],[("Volver","BACK:FXSIDE"),("Cancelar","CANCEL")]])
             await q.edit_message_text("Elegí condición:", reply_markup=kb_op)
         elif kind == "crypto":
-            kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],[("Volver","BACK:CRYPTO"),("Cancelar","CANCEL")]])
+            kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],[("Volver","BACK:CRYPTO_LIST"),("Cancelar","CANCEL")]])
             await q.edit_message_text("Elegí condición:", reply_markup=kb_op)
         else:
             kb_op = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],[("Volver","BACK:METRIC"),("Cancelar","CANCEL")]])
@@ -1674,12 +1756,7 @@ async def alertas_add_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Elegí el ticker (Cedears .BA):", reply_markup=kb_tickers(CEDEARS_BA, "KIND", "TICK")); return AL_TICKER
     if kind == "crypto":
         al["kind"] = "crypto"
-        msg = (
-            "Ingresá la cripto que querés alertar (ej: BTCUSDT, BTC/USDT, BTC).\n"
-            "Escribilo en el chat."
-        )
-        await q.edit_message_text(msg)
-        return AL_CRYPTO
+        return await alertas_show_crypto_list(update, context, query=q)
     await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
     return ConversationHandler.END
 
@@ -1794,7 +1871,7 @@ async def alertas_crypto_query(update: Update, context: ContextTypes.DEFAULT_TYP
         al["crypto_base"] = info.get("base")
         al["crypto_quote"] = info.get("quote")
         label = crypto_display_name(info.get("symbol"), info.get("base"), info.get("quote"))
-        k = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")], [("Volver", "BACK:CRYPTO"), ("Cancelar", "CANCEL")]])
+        k = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")], [("Volver", "BACK:CRYPTO_MANUAL"), ("Cancelar", "CANCEL")]])
         await update.message.reply_text(f"Cripto: {label}\nElegí condición:", reply_markup=k)
         return AL_OP
     buttons: List[List[Tuple[str, str]]] = []
@@ -1808,7 +1885,7 @@ async def alertas_crypto_query(update: Update, context: ContextTypes.DEFAULT_TYP
             row = []
     if row:
         buttons.append(row)
-    buttons.append([("Nueva búsqueda", "BACK:CRYPTO"), ("Cancelar", "CANCEL")])
+    buttons.append([("Nueva búsqueda", "BACK:CRYPTO_MANUAL"), ("Cancelar", "CANCEL")])
     await update.message.reply_text("Elegí la cripto:", reply_markup=kb(buttons))
     return AL_CRYPTO
 
@@ -1819,6 +1896,8 @@ async def alertas_crypto_pick_cb(update: Update, context: ContextTypes.DEFAULT_T
     if data == "CANCEL":
         await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
         return ConversationHandler.END
+    if data == "CRYPTO:SEARCH":
+        return await alertas_prompt_crypto_manual(update, context, query=q)
     if data.startswith("BACK:"):
         return await alertas_back(update, context)
     sym = data.split(":", 1)[1].upper()
@@ -1833,7 +1912,7 @@ async def alertas_crypto_pick_cb(update: Update, context: ContextTypes.DEFAULT_T
     al["crypto_base"] = info.get("base")
     al["crypto_quote"] = info.get("quote")
     label = crypto_display_name(info.get("symbol"), info.get("base"), info.get("quote"))
-    k = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")], [("Volver", "BACK:CRYPTO"), ("Cancelar", "CANCEL")]])
+    k = kb([[("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")], [("Volver", "BACK:CRYPTO_LIST"), ("Cancelar", "CANCEL")]])
     await q.edit_message_text(f"Cripto: {label}\nElegí condición:", reply_markup=k)
     return AL_OP
 
@@ -3780,7 +3859,7 @@ def build_application() -> Application:
             AL_TICKER: [CallbackQueryHandler(alertas_add_ticker_cb, pattern="^(TICK:|BACK:|CANCEL$)")],
             AL_CRYPTO: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, alertas_crypto_query),
-                CallbackQueryHandler(alertas_crypto_pick_cb, pattern="^(CRYPTOSEL:|BACK:|CANCEL$)"),
+                CallbackQueryHandler(alertas_crypto_pick_cb, pattern="^(CRYPTOSEL:|CRYPTO:SEARCH|BACK:|CANCEL$)"),
             ],
             AL_OP: [CallbackQueryHandler(alertas_add_op, pattern="^(OP:|BACK:|CANCEL$)")],
             AL_MODE: [CallbackQueryHandler(alertas_add_mode, pattern="^(MODE:|BACK:|CANCEL$)")],
