@@ -2213,7 +2213,11 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "quote": (quote or "").upper(),
             })
             save_state()
-            await update.message.reply_text("Listo. Alerta agregada ✅")
+            target_s = fmt_crypto_price(thr, quote)
+            direction = "sube a" if op == ">" else "baja a"
+            await update.message.reply_text(
+                f"Listo. Alerta agregada ✅\nSe disparará si el precio {direction} {target_s}."
+            )
             await cmd_alertas_menu(update, context)
             return ConversationHandler.END
 
