@@ -3762,6 +3762,8 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         lines.append(tc_line)
     lines.append("")
     for i, entry in enumerate(snapshot, 1):
+        if i > 1:
+            lines.append("")
         linea = f"{i}. {entry['label']}"
         linea += f" · Valor: {f_money(entry['valor_actual'])}"
         if entry['invertido'] > 0:
@@ -3811,12 +3813,14 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
     has_daily_data = any(entry.get('daily_change') is not None for entry in snapshot)
     return_points: List[Tuple[str, Optional[float]]] = []
     daily_points: List[Tuple[str, Optional[float]]] = []
-    for entry in snapshot:
+    for idx, entry in enumerate(snapshot):
         label = entry['label']
         valor_actual = entry['valor_actual']
         invertido = entry['invertido']
         delta = valor_actual - invertido
         ret_pct = (delta / invertido * 100.0) if invertido > 0 else None
+        if idx > 0:
+            lines.append("")
         detail = f"• {label}: {f_money(valor_actual)}"
         if ret_pct is not None:
             detail += f" ({pct(ret_pct,2)} | Δ {f_money(delta)})"
@@ -3914,6 +3918,8 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         w3 += weight * p3
         w6 += weight * p6
         short_label = _label_short(entry['symbol']) if entry.get('symbol') else entry['label']
+        if detail:
+            detail.append("")
         detail.append(f"• {short_label} → 3M {pct(p3,2)} | 6M {pct(p6,2)} (peso {pct_plain(weight*100.0,1)})")
 
     forecast3 = total_actual * (1.0 + w3/100.0)
