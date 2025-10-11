@@ -129,8 +129,21 @@ BINANCE_TOP_USDT_BASES = [
     "MKR", "AAVE", "XMR", "UNI", "KAVA", "CRV", "ZIL", "ROSE", "THETA", "IOTA",
     "GMX", "AR", "PYTH", "ARKM", "WIF", "SSV", "JTO", "ENA", "JUP", "NOT",
 ]
+COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 _binance_symbols_cache: Dict[str, Dict[str, str]] = {}
 _binance_symbols_ts: float = 0.0
+
+
+def _binance_build_fallback() -> Dict[str, Dict[str, str]]:
+    fallback: Dict[str, Dict[str, str]] = {}
+    for base in BINANCE_TOP_USDT_BASES[:MAX_BINANCE_TOP_CRYPTO]:
+        sym = f"{base.upper()}USDT"
+        fallback[sym] = {
+            "symbol": sym,
+            "base": base.upper(),
+            "quote": "USDT",
+        }
+    return fallback
 
 TICKER_NAME = {
     "GGAL.BA":"Grupo Financiero Galicia","YPFD.BA":"YPF","PAMP.BA":"Pampa Energía","CEPU.BA":"Central Puerto",
@@ -190,7 +203,8 @@ CEDEARS_SET = {sym.upper() for sym in CEDEARS_BA}
 
 def label_with_currency(sym: str) -> str:
     if sym.endswith(".BA"):
-        base = f"{TICKER_NAME.get(sym, sym)} ({sym})"
+        base_sym = sym[:-3]
+        base = f"{TICKER_NAME.get(sym, sym)} ({base_sym})"
         return f"{base} (ARS)"
     if sym in BONOS_AR: return f"{sym} ({bono_moneda(sym)})"
     if sym.startswith("FCI-"):
@@ -580,6 +594,9 @@ async def get_binance_symbols(session: ClientSession) -> Dict[str, Dict[str, str
         return _binance_symbols_cache
     data = await fetch_json(session, BINANCE_EXCHANGE_INFO_URL)
     if not data:
+        if not _binance_symbols_cache:
+            _binance_symbols_cache = _binance_build_fallback()
+            _binance_symbols_ts = now
         return _binance_symbols_cache
     symbols: Dict[str, Dict[str, str]] = {}
     for entry in data.get("symbols", []):
@@ -604,15 +621,7 @@ async def get_binance_symbols(session: ClientSession) -> Dict[str, Dict[str, str
         _binance_symbols_cache = symbols
         _binance_symbols_ts = now
     if not _binance_symbols_cache:
-        fallback: Dict[str, Dict[str, str]] = {}
-        for base in BINANCE_TOP_USDT_BASES[:MAX_BINANCE_TOP_CRYPTO]:
-            sym = f"{base.upper()}USDT"
-            fallback[sym] = {
-                "symbol": sym,
-                "base": base.upper(),
-                "quote": "USDT",
-            }
-        _binance_symbols_cache = fallback
+        _binance_symbols_cache = _binance_build_fallback()
         _binance_symbols_ts = now
     return _binance_symbols_cache
 
@@ -1006,7 +1015,7 @@ def format_news_block(news: List[Tuple[str, str]]) -> Tuple[str, Optional[Inline
 
 def _label_long(sym: str) -> str: return label_with_currency(sym)
 def _label_short(sym: str) -> str:
-    if sym.endswith(".BA"): return f"{NAME_ABBR.get(sym, sym)} ({sym})"
+    if sym.endswith(".BA"): return f"{NAME_ABBR.get(sym, sym)} ({sym[:-3]})"
     return label_with_currency(sym)
 
 def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
@@ -1227,8 +1236,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<i>Seguimiento de dólar, bonos, acciones, portafolio y alertas en un mismo lugar.</i>\n\n"
         "Elegí una opción rápida o usá los comandos clásicos:\n"
         "• /economia — Panel macro: dólares, reservas, inflación, riesgo y noticias\n"
-        "• /acciones — Rankings y proyecciones de acciones .BA\n"
-        "• /cedears — Rankings y proyecciones de CEDEARs\n"
+        "• /acciones — Rankings y proyecciones de acciones\n"
+        "• /cedears — Rankings y proyecciones de Cd-arts\n"
         "• /alertas_menu — Gestioná alertas personalizadas\n"
         "• /portafolio — Armá y analizá tu cartera\n"
         "• /subs — Suscripción al resumen diario\n"
@@ -1244,8 +1253,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🏁 Acciones Proyección", callback_data="ACC:TOP5"),
         ],
         [
-            InlineKeyboardButton("🌎 Cedears Top 3", callback_data="CED:TOP3"),
-            InlineKeyboardButton("🌐 Cedears Proyección", callback_data="CED:TOP5"),
+            InlineKeyboardButton("🌎 Cd-arts Top 3", callback_data="CED:TOP3"),
+            InlineKeyboardButton("🌐 Cd-arts Proyección", callback_data="CED:TOP5"),
         ],
         [
             InlineKeyboardButton("🔔 Mis alertas", callback_data="AL:LIST"),
@@ -1278,10 +1287,10 @@ async def cmd_acciones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cedears_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_menu_counter(context, "cedears", 2)
     kb_menu = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Top 3 Cedears (Rendimiento)", callback_data="CED:TOP3")],
-        [InlineKeyboardButton("Top 5 Cedears (Proyección)", callback_data="CED:TOP5")],
+        [InlineKeyboardButton("Top 3 Cd-arts (Rendimiento)", callback_data="CED:TOP3")],
+        [InlineKeyboardButton("Top 5 Cd-arts (Proyección)", callback_data="CED:TOP5")],
     ])
-    await update.effective_message.reply_text("🌎 Menú Cedears", reply_markup=kb_menu)
+    await update.effective_message.reply_text("🌎 Menú Cd-arts", reply_markup=kb_menu)
 
 async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -1293,10 +1302,10 @@ async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _rank_proj5(update, ACCIONES_BA, "🏁 Top 5 Acciones (Proyección)")
         await dec_and_maybe_show(update, context, "acciones", cmd_acciones_menu)
     elif data == "CED:TOP3":
-        await _rank_top3(update, CEDEARS_BA, "🌎 Top 3 Cedears (Rendimiento)")
+        await _rank_top3(update, CEDEARS_BA, "🌎 Top 3 Cd-arts (Rendimiento)")
         await dec_and_maybe_show(update, context, "cedears", cmd_cedears_menu)
     elif data == "CED:TOP5":
-        await _rank_proj5(update, CEDEARS_BA, "🏁 Top 5 Cedears (Proyección)")
+        await _rank_proj5(update, CEDEARS_BA, "🏁 Top 5 Cd-arts (Proyección)")
         await dec_and_maybe_show(update, context, "cedears", cmd_cedears_menu)
 
 # ---------- Macro ----------
@@ -1391,17 +1400,16 @@ def kb_tickers(symbols: List[str], back_target: str, prefix: str) -> InlineKeybo
     return kb(rows)
 
 
-def _build_crypto_top_rows(symbols_map: Dict[str, Dict[str, str]]) -> Optional[List[List[Tuple[str, str]]]]:
+def _build_crypto_top_rows(
+    symbols_map: Dict[str, Dict[str, str]],
+    bases: List[str],
+) -> Optional[List[List[Tuple[str, str]]]]:
     rows_data: List[Tuple[str, str]] = []
-    for base in BINANCE_TOP_USDT_BASES:
+    for base in bases:
         symbol = f"{base.upper()}USDT"
         info = symbols_map.get(symbol)
         if not info:
-            info = {
-                "symbol": symbol,
-                "base": base.upper(),
-                "quote": "USDT",
-            }
+            continue
         label = info.get("base") or base.upper()
         rows_data.append((label, f"CRYPTOSEL:{info.get('symbol')}"))
         if len(rows_data) >= MAX_BINANCE_TOP_CRYPTO:
@@ -1455,7 +1463,8 @@ async def alertas_show_crypto_list(
         text = f"{prefix}\n\n{text}"
     async with ClientSession() as session:
         symbols_map = await get_binance_symbols(session)
-    rows = _build_crypto_top_rows(symbols_map)
+        top_bases = await get_top_crypto_bases(session, symbols_map)
+    rows = _build_crypto_top_rows(symbols_map, top_bases)
     if rows:
         if query:
             await query.edit_message_text(text, reply_markup=kb(rows))
@@ -1486,6 +1495,49 @@ def _sort_crypto_matches(matches: List[Dict[str, str]]) -> List[Dict[str, str]]:
             idx = len(BINANCE_PREFERRED_QUOTES)
         return (idx, info.get("symbol", ""))
     return sorted(matches, key=key)
+
+
+async def get_top_crypto_bases(
+    session: ClientSession,
+    symbols_map: Dict[str, Dict[str, str]],
+    limit: int = MAX_BINANCE_TOP_CRYPTO,
+) -> List[str]:
+    available_usdt: Set[str] = {
+        (info.get("base") or "").upper()
+        for info in symbols_map.values()
+        if (info.get("quote") or "").upper() == "USDT"
+    }
+    bases: List[str] = []
+    seen: Set[str] = set()
+    if available_usdt and limit > 0:
+        params = {
+            "vs_currency": "usd",
+            "order": "market_cap_desc",
+            "per_page": str(min(limit, 250)),
+            "page": "1",
+            "sparkline": "false",
+        }
+        data = await fetch_json(session, COINGECKO_MARKETS_URL, params=params)
+        if isinstance(data, list):
+            for entry in data:
+                base = (entry.get("symbol") or "").upper()
+                if not base or base in seen or base not in available_usdt:
+                    continue
+                bases.append(base)
+                seen.add(base)
+                if len(bases) >= limit:
+                    break
+    if len(bases) < limit:
+        for base in BINANCE_TOP_USDT_BASES:
+            up = base.upper()
+            if up in seen or up not in available_usdt:
+                continue
+            bases.append(up)
+            seen.add(up)
+            if len(bases) >= limit:
+                break
+    return bases
+
 
 def kb_alertas_menu() -> InlineKeyboardMarkup:
     return kb([
@@ -1685,7 +1737,7 @@ async def alertas_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["al"] = {}
     k = kb([
         [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
-        [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
+        [("Acciones", "KIND:acciones"), ("Cd-arts", "KIND:cedears")],
         [("Criptomonedas", "KIND:crypto")],
         [("Volver", "AL:MENU"), ("Cancelar", "CANCEL")],
     ])
@@ -1710,7 +1762,7 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target == "KIND":
         k = kb([
             [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
-            [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
+            [("Acciones", "KIND:acciones"), ("Cd-arts", "KIND:cedears")],
             [("Criptomonedas", "KIND:crypto")],
             [("Volver", "AL:MENU"), ("Cancelar", "CANCEL")],
         ])
@@ -1722,9 +1774,9 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target == "METRIC":
         await q.edit_message_text("Elegí la métrica:", reply_markup=kb_submenu_metric()); return AL_METRIC_TYPE
     if target == "TICKERS_ACC":
-        await q.edit_message_text("Elegí el ticker (Acciones .BA):", reply_markup=kb_tickers(ACCIONES_BA, "KIND", "TICK")); return AL_TICKER
+        await q.edit_message_text("Elegí el ticker (Acciones):", reply_markup=kb_tickers(ACCIONES_BA, "KIND", "TICK")); return AL_TICKER
     if target == "TICKERS_CEDEARS":
-        await q.edit_message_text("Elegí el ticker (Cedears .BA):", reply_markup=kb_tickers(CEDEARS_BA, "KIND", "TICK")); return AL_TICKER
+        await q.edit_message_text("Elegí el ticker (Cd-arts):", reply_markup=kb_tickers(CEDEARS_BA, "KIND", "TICK")); return AL_TICKER
     if target in {"CRYPTO", "CRYPTO_LIST"}:
         return await alertas_show_crypto_list(update, context, query=q)
     if target == "CRYPTO_MANUAL":
@@ -1765,10 +1817,10 @@ async def alertas_add_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         al["kind"] = "metric"; await q.edit_message_text("Elegí la métrica:", reply_markup=kb_submenu_metric()); return AL_METRIC_TYPE
     if kind == "acciones":
         al["kind"] = "ticker"; al["segment"] = "acciones"
-        await q.edit_message_text("Elegí el ticker (Acciones .BA):", reply_markup=kb_tickers(ACCIONES_BA, "KIND", "TICK")); return AL_TICKER
+        await q.edit_message_text("Elegí el ticker (Acciones):", reply_markup=kb_tickers(ACCIONES_BA, "KIND", "TICK")); return AL_TICKER
     if kind == "cedears":
         al["kind"] = "ticker"; al["segment"] = "cedears"
-        await q.edit_message_text("Elegí el ticker (Cedears .BA):", reply_markup=kb_tickers(CEDEARS_BA, "KIND", "TICK")); return AL_TICKER
+        await q.edit_message_text("Elegí el ticker (Cd-arts):", reply_markup=kb_tickers(CEDEARS_BA, "KIND", "TICK")); return AL_TICKER
     if kind == "crypto":
         al["kind"] = "crypto"
         return await alertas_show_crypto_list(update, context, query=q)
