@@ -603,6 +603,17 @@ async def get_binance_symbols(session: ClientSession) -> Dict[str, Dict[str, str
     if symbols:
         _binance_symbols_cache = symbols
         _binance_symbols_ts = now
+    if not _binance_symbols_cache:
+        fallback: Dict[str, Dict[str, str]] = {}
+        for base in BINANCE_TOP_USDT_BASES[:MAX_BINANCE_TOP_CRYPTO]:
+            sym = f"{base.upper()}USDT"
+            fallback[sym] = {
+                "symbol": sym,
+                "base": base.upper(),
+                "quote": "USDT",
+            }
+        _binance_symbols_cache = fallback
+        _binance_symbols_ts = now
     return _binance_symbols_cache
 
 
@@ -1386,8 +1397,12 @@ def _build_crypto_top_rows(symbols_map: Dict[str, Dict[str, str]]) -> Optional[L
         symbol = f"{base.upper()}USDT"
         info = symbols_map.get(symbol)
         if not info:
-            continue
-        label = crypto_display_name(info.get("symbol"), info.get("base"), info.get("quote"))
+            info = {
+                "symbol": symbol,
+                "base": base.upper(),
+                "quote": "USDT",
+            }
+        label = info.get("base") or base.upper()
         rows_data.append((label, f"CRYPTOSEL:{info.get('symbol')}"))
         if len(rows_data) >= MAX_BINANCE_TOP_CRYPTO:
             break
