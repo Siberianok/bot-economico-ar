@@ -107,7 +107,12 @@ CRIPTO_TOP_NAMES = [
 def _crypto_to_symbol(cname: str) -> str: return f"{cname}-USD"
 
 BINANCE_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
-BINANCE_TICKER_PRICE_URL = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_TICKER_PRICE_URLS = [
+    "https://api.binance.com/api/v3/ticker/price",
+    "https://data.binance.com/api/v3/ticker/price",
+    "https://www.binance.com/api/v3/ticker/price",
+    "https://api.binance.us/api/v3/ticker/price",
+]
 BINANCE_FIAT_QUOTES = {
     "USDT", "USDC", "BUSD", "TUSD", "FDUSD", "DAI", "USD", "EUR", "GBP",
     "ARS", "BRL", "TRY", "RUB", "AUD", "CAD", "JPY", "CHF", "MXN"
@@ -130,6 +135,7 @@ BINANCE_TOP_USDT_BASES = [
     "GMX", "AR", "PYTH", "ARKM", "WIF", "SSV", "JTO", "ENA", "JUP", "NOT",
 ]
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
+CRYPTOCOMPARE_PRICE_URL = "https://min-api.cryptocompare.com/data/price"
 _binance_symbols_cache: Dict[str, Dict[str, str]] = {}
 _binance_symbols_ts: float = 0.0
 
@@ -638,17 +644,23 @@ async def get_binance_prices(session: ClientSession, symbols: List[str]) -> Dict
         chunk = norm[i:i+chunk_size]
         if not chunk:
             continue
-        url = None
-        if len(chunk) == 1:
-            url = f"{BINANCE_TICKER_PRICE_URL}?symbol={chunk[0]}"
-        else:
-            try:
-                payload = quote(json.dumps(chunk))
-                url = f"{BINANCE_TICKER_PRICE_URL}?symbols={payload}"
-            except Exception as e:
-                log.warning("binance symbols encode error: %s", e)
+        data = None
+        for base_url in BINANCE_TICKER_PRICE_URLS:
+            url = None
+            if len(chunk) == 1:
+                url = f"{base_url}?symbol={chunk[0]}"
+            else:
+                try:
+                    payload = quote(json.dumps(chunk))
+                    url = f"{base_url}?symbols={payload}"
+                except Exception as e:
+                    log.warning("binance symbols encode error: %s", e)
+                    url = None
+            if not url:
                 continue
-        data = await fetch_json(session, url) if url else None
+            data = await fetch_json(session, url)
+            if data:
+                break
         if isinstance(data, dict):
             sym = data.get("symbol")
             price = data.get("price")
@@ -656,7 +668,8 @@ async def get_binance_prices(session: ClientSession, symbols: List[str]) -> Dict
                 if sym and price is not None:
                     out[sym.upper()] = float(price)
             except Exception:
-                out[sym.upper()] = None if sym else None
+                if sym:
+                    out[sym.upper()] = None
         elif isinstance(data, list):
             for row in data:
                 sym = None
@@ -675,6 +688,80 @@ async def get_binance_prices(session: ClientSession, symbols: List[str]) -> Dict
 
 async def get_binance_price(session: ClientSession, symbol: str) -> Optional[float]:
     prices = await get_binance_prices(session, [symbol])
+    return prices.get(symbol.upper())
+
+
+async def _crypto_price_fallback(
+    session: ClientSession,
+    *,
+    symbol: str,
+    base: Optional[str],
+    quote: Optional[str],
+) -> Optional[float]:
+    base_u = (base or "").upper()
+    quote_u = (quote or "").upper()
+    if not base_u or not quote_u:
+        return None
+    tsym = quote_u
+    if quote_u in {"USDT", "USDC", "BUSD", "FDUSD", "TUSD", "DAI"}:
+        tsym = "USD"
+    params = {"fsym": base_u, "tsyms": tsym}
+    data = await fetch_json(session, CRYPTOCOMPARE_PRICE_URL, params=params)
+    if not isinstance(data, dict):
+        return None
+    if data.get("Response") == "Error":
+        return None
+    price = data.get(tsym)
+    try:
+        if price is not None:
+            return float(price)
+    except Exception:
+        return None
+    return None
+
+
+async def get_crypto_prices(
+    session: ClientSession,
+    symbols: List[str],
+    symbols_info: Optional[Dict[str, Dict[str, Optional[str]]]] = None,
+) -> Dict[str, Optional[float]]:
+    prices: Dict[str, Optional[float]] = {s.upper(): None for s in symbols if s}
+    if not prices:
+        return {}
+    binance_prices = await get_binance_prices(session, list(prices.keys()))
+    prices.update(binance_prices)
+    missing = [sym for sym, val in prices.items() if val is None]
+    if not missing:
+        return prices
+    info_map = symbols_info or {}
+    if not info_map:
+        info_map = await get_binance_symbols(session)
+    for sym in missing:
+        info = info_map.get(sym.upper()) or info_map.get(sym)
+        base = info.get("base") if isinstance(info, dict) else None
+        quote = info.get("quote") if isinstance(info, dict) else None
+        fallback = await _crypto_price_fallback(
+            session,
+            symbol=sym,
+            base=base,
+            quote=quote,
+        )
+        if fallback is not None:
+            prices[sym] = fallback
+    return prices
+
+
+async def get_crypto_price(
+    session: ClientSession,
+    symbol: str,
+    *,
+    base: Optional[str] = None,
+    quote: Optional[str] = None,
+) -> Optional[float]:
+    info_map: Dict[str, Dict[str, Optional[str]]] = {}
+    if base or quote:
+        info_map[symbol.upper()] = {"symbol": symbol.upper(), "base": base, "quote": quote}
+    prices = await get_crypto_prices(session, [symbol], info_map if info_map else None)
     return prices.get(symbol.upper())
 
 # ============================ DATA SOURCES ============================
@@ -2046,7 +2133,7 @@ async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sym = al.get("symbol")
             quote = al.get("crypto_quote")
             base = al.get("crypto_base")
-            price = await get_binance_price(session, sym) if sym else None
+            price = await get_crypto_price(session, sym, base=base, quote=quote) if sym else None
             if price is None:
                 await q.edit_message_text("No pude leer el precio actual. Probá más tarde.")
                 return ConversationHandler.END
@@ -2106,7 +2193,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             op = al.get("op")
             quote = al.get("crypto_quote")
             base = al.get("crypto_base")
-            price = await get_binance_price(session, sym) if sym else None
+            price = await get_crypto_price(session, sym, base=base, quote=quote) if sym else None
             if price is None:
                 await update.message.reply_text("No pude leer el precio actual."); return ConversationHandler.END
             thr = price*(1 + (val/100.0)) if al.get("mode") == "percent" and op == ">" else \
@@ -2170,9 +2257,22 @@ async def alerts_loop(app: Application):
                                 "inflacion": float(infl[0]) if infl else None,
                                 "reservas": rv[0] if rv else None}
                         sym_list = {r["symbol"] for cid in active_chats for r in ALERTS.get(cid, []) if r.get("kind")=="ticker" and r.get("symbol")}
-                        crypto_list = {r["symbol"] for cid in active_chats for r in ALERTS.get(cid, []) if r.get("kind")=="crypto" and r.get("symbol")}
+                        crypto_list = {(r.get("symbol") or "").upper() for cid in active_chats for r in ALERTS.get(cid, []) if r.get("kind")=="crypto" and r.get("symbol")}
+                        crypto_info_map: Dict[str, Dict[str, Optional[str]]] = {}
+                        for cid in active_chats:
+                            for rule in ALERTS.get(cid, []) or []:
+                                if rule.get("kind") != "crypto":
+                                    continue
+                                sym = (rule.get("symbol") or "").upper()
+                                if not sym or sym in crypto_info_map:
+                                    continue
+                                crypto_info_map[sym] = {
+                                    "symbol": sym,
+                                    "base": rule.get("base"),
+                                    "quote": rule.get("quote"),
+                                }
                         metmap, _ = (await metrics_for_symbols(session, sorted(sym_list))) if sym_list else ({}, None)
-                        crypto_prices = await get_binance_prices(session, sorted(crypto_list)) if crypto_list else {}
+                        crypto_prices = await get_crypto_prices(session, sorted(crypto_list), crypto_info_map) if crypto_list else {}
                         for chat_id in active_chats:
                             rules = ALERTS.get(chat_id, [])
                             if not rules: continue
