@@ -1473,6 +1473,51 @@ AL_KIND, AL_FX_TYPE, AL_FX_SIDE, AL_OP, AL_MODE, AL_VALUE, AL_METRIC_TYPE, AL_TI
 ALERTS_SILENT_UNTIL: Dict[int, float] = {}
 ALERTS_PAUSED: Set[int] = set()
 
+
+def _float_equals(a: Any, b: Any, abs_tol: float = 1e-6) -> bool:
+    try:
+        return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=abs_tol)
+    except Exception:
+        return False
+
+
+def _alerts_match(existing: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
+    if existing.get("kind") != candidate.get("kind"):
+        return False
+    kind = candidate.get("kind")
+    if kind == "fx":
+        return (
+            existing.get("type") == candidate.get("type")
+            and existing.get("side") == candidate.get("side")
+            and existing.get("op") == candidate.get("op")
+            and _float_equals(existing.get("value"), candidate.get("value"))
+        )
+    if kind == "metric":
+        return (
+            existing.get("type") == candidate.get("type")
+            and existing.get("op") == candidate.get("op")
+            and _float_equals(existing.get("value"), candidate.get("value"))
+        )
+    if kind == "crypto":
+        return (
+            (existing.get("symbol") or "").upper() == (candidate.get("symbol") or "").upper()
+            and (existing.get("base") or "").upper() == (candidate.get("base") or "").upper()
+            and (existing.get("quote") or "").upper() == (candidate.get("quote") or "").upper()
+            and existing.get("op") == candidate.get("op")
+            and _float_equals(existing.get("value"), candidate.get("value"))
+        )
+    if kind == "ticker":
+        return (
+            existing.get("symbol") == candidate.get("symbol")
+            and existing.get("op") == candidate.get("op")
+            and _float_equals(existing.get("value"), candidate.get("value"))
+        )
+    return False
+
+
+def _has_duplicate_alert(rules: List[Dict[str, Any]], candidate: Dict[str, Any]) -> bool:
+    return any(_alerts_match(r, candidate) for r in rules)
+
 def kb(rows: List[List[Tuple[str,str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=data) for text, data in r] for r in rows])
 
@@ -2154,6 +2199,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if val is None:
         await update.message.reply_text("Ingresá solo número (sin $ ni % ni separadores)."); return AL_VALUE
     chat_id = update.effective_chat.id
+    rules = ALERTS.setdefault(chat_id, [])
     async with ClientSession() as session:
         if al.get("kind") == "fx":
             fx = await get_dolares(session); row = fx.get(al["type"], {}) or {}
@@ -2165,7 +2211,11 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if al.get("mode") == "absolute":
                 if (al["op"] == ">" and thr <= cur) or (al["op"] == "<" and thr >= cur):
                     await update.message.reply_text(f"El objetivo debe ser {'mayor' if al['op']=='>' else 'menor'} que {fmt_money_ars(cur)}."); return AL_VALUE
-            ALERTS.setdefault(chat_id, []).append({"kind":"fx","type":al["type"],"side":al["side"],"op":al["op"],"value":float(thr)})
+            candidate = {"kind":"fx","type":al["type"],"side":al["side"],"op":al["op"],"value":float(thr)}
+            if _has_duplicate_alert(rules, candidate):
+                await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
+                return AL_VALUE
+            rules.append(candidate)
             save_state()
             await update.message.reply_text("Listo. Alerta agregada ✅")
             await cmd_alertas_menu(update, context)
@@ -2182,7 +2232,11 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if al.get("mode") == "absolute":
                 if (al["op"] == ">" and thr <= cur) or (al["op"] == "<" and thr >= cur):
                     await update.message.reply_text("El objetivo debe ser válido respecto al valor actual."); return AL_VALUE
-            ALERTS.setdefault(chat_id, []).append({"kind":"metric","type":al["type"],"op":al["op"],"value":float(thr)})
+            candidate = {"kind":"metric","type":al["type"],"op":al["op"],"value":float(thr)}
+            if _has_duplicate_alert(rules, candidate):
+                await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
+                return AL_VALUE
+            rules.append(candidate)
             save_state()
             await update.message.reply_text("Listo. Alerta agregada ✅")
             await cmd_alertas_menu(update, context)
@@ -2203,7 +2257,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(
                         f"El precio objetivo debe ser {'mayor' if op=='>' else 'menor'} que {fmt_crypto_price(price, quote)}."
                     ); return AL_VALUE
-            ALERTS.setdefault(chat_id, []).append({
+            candidate = {
                 "kind": "crypto",
                 "symbol": (sym or "").upper(),
                 "op": op,
@@ -2211,7 +2265,11 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "mode": al.get("mode"),
                 "base": (base or "").upper(),
                 "quote": (quote or "").upper(),
-            })
+            }
+            if _has_duplicate_alert(rules, candidate):
+                await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
+                return AL_VALUE
+            rules.append(candidate)
             save_state()
             target_s = fmt_crypto_price(thr, quote)
             direction = "sube a" if op == ">" else "baja a"
@@ -2230,7 +2288,11 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         thr = val
         if (op == ">" and thr <= last_px) or (op == "<" and thr >= last_px):
             await update.message.reply_text(f"El precio objetivo debe ser {'mayor' if op=='>' else 'menor'} que {fmt_money_ars(last_px)}."); return AL_VALUE
-        ALERTS.setdefault(chat_id, []).append({"kind":"ticker","symbol":sym,"op":op,"value":float(thr),"mode":"absolute"})
+        candidate = {"kind":"ticker","symbol":sym,"op":op,"value":float(thr),"mode":"absolute"}
+        if _has_duplicate_alert(rules, candidate):
+            await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
+            return AL_VALUE
+        rules.append(candidate)
         save_state()
         await update.message.reply_text("Listo. Alerta agregada ✅")
         await cmd_alertas_menu(update, context)
