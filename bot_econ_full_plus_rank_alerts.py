@@ -133,11 +133,58 @@ BINANCE_TOP_USDT_BASES = [
     "LDO", "DYDX", "SUI", "TIA", "SEI", "ETC", "XLM", "EGLD", "STX", "COMP",
     "MKR", "AAVE", "XMR", "UNI", "KAVA", "CRV", "ZIL", "ROSE", "THETA", "IOTA",
     "GMX", "AR", "PYTH", "ARKM", "WIF", "SSV", "JTO", "ENA", "JUP", "NOT",
+    "VRA",
 ]
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 CRYPTOCOMPARE_PRICE_URL = "https://min-api.cryptocompare.com/data/price"
 _binance_symbols_cache: Dict[str, Dict[str, str]] = {}
 _binance_symbols_ts: float = 0.0
+
+
+CUSTOM_CRYPTO_ENTRIES: Dict[str, Dict[str, Any]] = {
+    "VERACITYUSDT": {
+        "symbol": "VERACITYUSDT",
+        "base": "VRA",
+        "quote": "USDT",
+        "display": "Veracity",
+        "aliases": ["VRAUSDT"],
+    },
+}
+
+
+def _build_custom_crypto_map(entries: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
+    mapping: Dict[str, Dict[str, str]] = {}
+    for key, info in entries.items():
+        primary = (info.get("symbol") or key or "").upper()
+        if not primary:
+            continue
+        base = (info.get("base") or "").upper()
+        quote = (info.get("quote") or "").upper()
+        entry: Dict[str, str] = {
+            "symbol": primary,
+            "base": base,
+            "quote": quote,
+        }
+        display = info.get("display")
+        if isinstance(display, str) and display:
+            entry["display"] = display
+        mapping[primary] = entry
+        for alias in info.get("aliases", []):
+            alias_up = str(alias).upper()
+            if not alias_up:
+                continue
+            mapping[alias_up] = {**entry}
+    return mapping
+
+
+CUSTOM_CRYPTO_SYMBOLS = _build_custom_crypto_map(CUSTOM_CRYPTO_ENTRIES)
+
+
+def _merge_custom_crypto_symbols(symbols: Dict[str, Dict[str, str]]) -> Dict[str, Dict[str, str]]:
+    merged = dict(symbols)
+    for key, info in CUSTOM_CRYPTO_SYMBOLS.items():
+        merged[key.upper()] = {**info}
+    return merged
 
 
 def _binance_build_fallback() -> Dict[str, Dict[str, str]]:
@@ -149,7 +196,7 @@ def _binance_build_fallback() -> Dict[str, Dict[str, str]]:
             "base": base.upper(),
             "quote": "USDT",
         }
-    return fallback
+    return _merge_custom_crypto_symbols(fallback)
 
 TICKER_NAME = {
     "GGAL.BA":"Grupo Financiero Galicia","YPFD.BA":"YPF","PAMP.BA":"Pampa Energía","CEPU.BA":"Central Puerto",
@@ -529,10 +576,18 @@ def fmt_crypto_price(n: Optional[float], quote: Optional[str]) -> str:
 def crypto_display_name(symbol: Optional[str], base: Optional[str], quote: Optional[str]) -> str:
     base_u = (base or "").upper()
     quote_u = (quote or "").upper()
+    sym_u = (symbol or "").upper()
+    custom = CUSTOM_CRYPTO_SYMBOLS.get(sym_u)
+    if custom:
+        display = custom.get("display")
+        if display and quote_u:
+            return f"{display}/{quote_u}"
+        if display:
+            return display
     if base_u and quote_u:
         return f"{base_u}/{quote_u}"
     if symbol:
-        return symbol.upper()
+        return sym_u
     return "Cripto"
 
 def pct(n: Optional[float], nd: int = 2) -> str:
@@ -624,6 +679,7 @@ async def get_binance_symbols(session: ClientSession) -> Dict[str, Dict[str, str
         except Exception:
             continue
     if symbols:
+        symbols = _merge_custom_crypto_symbols(symbols)
         _binance_symbols_cache = symbols
         _binance_symbols_ts = now
     if not _binance_symbols_cache:
@@ -1542,7 +1598,7 @@ def _build_crypto_top_rows(
         info = symbols_map.get(symbol)
         if not info:
             continue
-        label = info.get("base") or base.upper()
+        label = info.get("display") or info.get("base") or base.upper()
         rows_data.append((label, f"CRYPTOSEL:{info.get('symbol')}"))
         if len(rows_data) >= MAX_BINANCE_TOP_CRYPTO:
             break
