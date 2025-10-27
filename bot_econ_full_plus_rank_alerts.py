@@ -142,12 +142,12 @@ _binance_symbols_ts: float = 0.0
 
 
 CUSTOM_CRYPTO_ENTRIES: Dict[str, Dict[str, Any]] = {
-    "VERACITYUSDT": {
-        "symbol": "VERACITYUSDT",
+    "VRAUSDT": {
+        "symbol": "VRAUSDT",
         "base": "VRA",
         "quote": "USDT",
-        "display": "Veracity",
-        "aliases": ["VRAUSDT"],
+        "display": "Verasity",
+        "aliases": ["VERACITYUSDT"],
     },
 }
 
@@ -694,7 +694,19 @@ async def get_binance_prices(session: ClientSession, symbols: List[str]) -> Dict
     out: Dict[str, Optional[float]] = {}
     if not symbols:
         return out
-    norm = [s.upper() for s in symbols if s]
+    symbol_map: Dict[str, Set[str]] = {}
+    norm: List[str] = []
+    seen: Set[str] = set()
+    for sym in symbols:
+        if not sym:
+            continue
+        sym_u = sym.upper()
+        info = CUSTOM_CRYPTO_SYMBOLS.get(sym_u)
+        api_symbol = str(info.get("symbol") or sym_u).upper() if info else sym_u
+        symbol_map.setdefault(api_symbol, set()).add(sym_u)
+        if api_symbol not in seen:
+            norm.append(api_symbol)
+            seen.add(api_symbol)
     if not norm:
         return out
     chunk_size = 80
@@ -722,12 +734,15 @@ async def get_binance_prices(session: ClientSession, symbols: List[str]) -> Dict
         if isinstance(data, dict):
             sym = data.get("symbol")
             price = data.get("price")
+            targets = symbol_map.get((sym or "").upper(), {(sym or "").upper()})
             try:
                 if sym and price is not None:
-                    out[sym.upper()] = float(price)
+                    for target in targets:
+                        out[target] = float(price)
             except Exception:
                 if sym:
-                    out[sym.upper()] = None
+                    for target in targets:
+                        out[target] = None
         elif isinstance(data, list):
             for row in data:
                 sym = None
@@ -735,12 +750,15 @@ async def get_binance_prices(session: ClientSession, symbols: List[str]) -> Dict
                 if isinstance(row, dict):
                     sym = row.get("symbol")
                     price = row.get("price")
+                targets = symbol_map.get((sym or "").upper(), {(sym or "").upper()})
                 try:
                     if sym and price is not None:
-                        out[sym.upper()] = float(price)
+                        for target in targets:
+                            out[target] = float(price)
                 except Exception:
                     if sym:
-                        out[sym.upper()] = None
+                        for target in targets:
+                            out[target] = None
     return out
 
 
