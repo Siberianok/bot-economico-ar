@@ -2283,7 +2283,7 @@ def _get_alert_usage_suggestions(chat_id: int) -> List[Dict[str, Any]]:
     suggestions: List[Dict[str, Any]] = []
     for key, entry in (ALERT_USAGE.get(chat_id) or {}).items():
         count = int(entry.get("count", 0))
-        if count < 3:
+        if count < 1:
             continue
         kind = entry.get("kind")
         meta = entry.get("meta") or {}
