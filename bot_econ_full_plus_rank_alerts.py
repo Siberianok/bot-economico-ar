@@ -1786,29 +1786,18 @@ async def alertas_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     rules = ALERTS.get(chat_id, [])
+    now = datetime.now(TZ)
     if not rules:
         txt = "No tenés alertas configuradas.\nUsá /alertas_menu → Agregar."
     else:
         lines = ["<b>🔔 Alertas Configuradas</b>"]
         for i, r in enumerate(rules, 1):
-            if r.get("kind") == "fx":
-                t, side, op, v = r["type"], r["side"], r["op"], r["value"]
-                lines.append(f"{i}. {t.upper()} ({side}) {html_op(op)} {fmt_money_ars(v)}")
-            elif r.get("kind") == "metric":
-                t, op, v = r["type"], r["op"], r["value"]
-                if t=="riesgo":     val = f"{v:.0f} pb"
-                elif t=="reservas": val = f"{fmt_number(v,0)} MUS$"
-                else:               val = f"{str(round(v,1)).replace('.',',')}%"
-                lines.append(f"{i}. {t.upper()} {html_op(op)} {val}")
-            elif r.get("kind") == "crypto":
-                label = crypto_display_name(r.get("symbol"), r.get("base"), r.get("quote"))
-                op = r.get("op")
-                v = r.get("value")
-                quote = r.get("quote")
-                lines.append(f"{i}. {label} (Precio) {html_op(op)} {fmt_crypto_price(v, quote)}")
+            label = _alert_rule_label(r)
+            status = _alert_pause_status(r, now=now)
+            if status:
+                lines.append(f"{i}. {label} <i>({status})</i>")
             else:
-                sym, op, v = r["symbol"], r["op"], r["value"]
-                lines.append(f"{i}. {_label_long(sym)} (Precio) {html_op(op)} {fmt_money_ars(v)}")
+                lines.append(f"{i}. {label}")
         if chat_id in ALERTS_PAUSED:
             lines.append("\n<i>Alertas en pausa (indefinida)</i>")
         elif chat_id in ALERTS_SILENT_UNTIL and ALERTS_SILENT_UNTIL[chat_id] > datetime.now(TZ).timestamp():
@@ -1864,58 +1853,213 @@ async def alertas_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await q.edit_message_text("Número fuera de rango.")
 
-async def cmd_alertas_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb_pause = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Pausar (Indefinida)", callback_data="AP:PAUSE:INF")],
-        [
-            InlineKeyboardButton("Pausar 1h", callback_data="AP:PAUSE:1"),
-            InlineKeyboardButton("Pausar 3h", callback_data="AP:PAUSE:3"),
-        ],
-        [
-            InlineKeyboardButton("Pausar 6h", callback_data="AP:PAUSE:6"),
-            InlineKeyboardButton("Pausar 12h", callback_data="AP:PAUSE:12"),
-        ],
-        [
-            InlineKeyboardButton("Pausar 24h", callback_data="AP:PAUSE:24"),
-            InlineKeyboardButton("Reanudar", callback_data="AP:RESUME"),
-        ],
-        [
-            InlineKeyboardButton("Volver", callback_data="AP:BACK"),
-            InlineKeyboardButton("Cerrar", callback_data="AP:CLOSE"),
-        ],
+def _pause_list_markup(chat_id: int) -> InlineKeyboardMarkup:
+    rules = ALERTS.get(chat_id, []) or []
+    now = datetime.now(TZ)
+    rows: List[List[InlineKeyboardButton]] = []
+    for i, rule in enumerate(rules, 1):
+        status = _alert_pause_status_short(rule, now=now)
+        label = f"{i}. {_alert_rule_label(rule)}{status}"[:64]
+        rows.append([InlineKeyboardButton(label, callback_data=f"AP:SEL:{i-1}")])
+    if rows:
+        rows.append([
+            InlineKeyboardButton("Pausar todas", callback_data="AP:SEL:ALL"),
+            InlineKeyboardButton("Reanudar todas", callback_data="AP:DO:ALL:RESUME"),
+        ])
+    rows.append([
+        InlineKeyboardButton("Volver", callback_data="AP:BACK"),
+        InlineKeyboardButton("Cerrar", callback_data="AP:CLOSE"),
     ])
-    await update.effective_message.reply_text("Pausa de alertas:", reply_markup=kb_pause)
+    return InlineKeyboardMarkup(rows)
+
+
+def _pause_options_markup(target: str, *, is_all: bool = False) -> InlineKeyboardMarkup:
+    resume_text = "Reanudar todas" if is_all else "Reanudar"
+    rows = [
+        [InlineKeyboardButton("Pausar (Indefinida)", callback_data=f"AP:DO:{target}:INF")],
+        [
+            InlineKeyboardButton("Pausar 1h", callback_data=f"AP:DO:{target}:1"),
+            InlineKeyboardButton("Pausar 3h", callback_data=f"AP:DO:{target}:3"),
+        ],
+        [
+            InlineKeyboardButton("Pausar 6h", callback_data=f"AP:DO:{target}:6"),
+            InlineKeyboardButton("Pausar 12h", callback_data=f"AP:DO:{target}:12"),
+        ],
+        [
+            InlineKeyboardButton("Pausar 24h", callback_data=f"AP:DO:{target}:24"),
+            InlineKeyboardButton(resume_text, callback_data=f"AP:DO:{target}:RESUME"),
+        ],
+        [
+            InlineKeyboardButton("Volver", callback_data="AP:LIST"),
+            InlineKeyboardButton("Cancelar", callback_data="AP:CLOSE"),
+        ],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_alertas_pause(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    prefix: Optional[str] = None,
+    *,
+    edit: bool = False,
+) -> None:
+    chat_id = update.effective_chat.id
+    rules = ALERTS.get(chat_id, []) or []
+    if not rules:
+        msg = "No tenés alertas guardadas."
+        if prefix:
+            msg = f"{prefix}\n\n{msg}"
+        if edit and update.callback_query:
+            await update.callback_query.edit_message_text(msg)
+        else:
+            await update.effective_message.reply_text(msg)
+        await cmd_alertas_menu(update, context)
+        return
+    text = "Elegí qué alertas pausar:"
+    if prefix:
+        text = f"{prefix}\n\n{text}"
+    markup = _pause_list_markup(chat_id)
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(text, reply_markup=markup)
+    else:
+        await update.effective_message.reply_text(text, reply_markup=markup)
 
 async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     chat_id = q.message.chat_id
-    data = q.data
-    if data == "AP:CLOSE":
+    parts = q.data.split(":")
+    if len(parts) < 2:
+        await q.answer("Acción inválida.", show_alert=True); return
+    action = parts[1]
+    if action == "CLOSE":
         await q.edit_message_text("Listo."); return
-    if data == "AP:BACK":
+    if action == "BACK":
         await cmd_alertas_menu(update, context, edit=True); return
-    if data == "AP:RESUME":
-        ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
-        save_state()
-        await q.edit_message_text("🔔 Alertas reanudadas."); return
-    if data.startswith("AP:PAUSE:"):
-        arg = data.split(":")[-1]
-        if arg == "INF":
-            ALERTS_PAUSED.add(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
-            save_state()
-            await q.edit_message_text("🔕 Alertas en pausa (indefinida)."); return
+    if action == "LIST":
+        await cmd_alertas_pause(update, context, edit=True); return
+    if action == "SEL":
+        target = parts[2] if len(parts) > 2 else None
+        rules = ALERTS.get(chat_id, []) or []
+        if not rules:
+            await cmd_alertas_pause(update, context, prefix="No tenés alertas para pausar.", edit=True)
+            return
+        if target == "ALL":
+            text = "Elegí duración para todas las alertas."
+            if chat_id in ALERTS_PAUSED:
+                text += "\nActualmente están en pausa indefinida."
+            elif chat_id in ALERTS_SILENT_UNTIL and ALERTS_SILENT_UNTIL[chat_id] > datetime.now(TZ).timestamp():
+                until = datetime.fromtimestamp(ALERTS_SILENT_UNTIL[chat_id], TZ)
+                text += f"\nEn pausa hasta {until.strftime('%d/%m %H:%M')}."
+            await q.edit_message_text(text, reply_markup=_pause_options_markup("ALL", is_all=True))
+            return
         try:
-            hrs = int(arg); until = datetime.now(TZ) + timedelta(hours=hrs)
+            idx = int(target) if target is not None else -1
+        except Exception:
+            await q.answer("Alerta inválida.", show_alert=True); return
+        if idx < 0 or idx >= len(rules):
+            await q.answer("Alerta inexistente.", show_alert=True); return
+        rule = rules[idx]
+        label = _alert_rule_label(rule)
+        status = _alert_pause_status(rule)
+        text = f"Elegí duración para la alerta {idx+1}:\n{label[:120]}"
+        if status:
+            text += f"\n{status}"
+        await q.edit_message_text(text, reply_markup=_pause_options_markup(str(idx)))
+        return
+    if action == "DO":
+        if len(parts) < 4:
+            await q.answer("Acción inválida.", show_alert=True); return
+        target = parts[2]
+        op = parts[3]
+        rules = ALERTS.get(chat_id, []) or []
+        if target == "ALL":
+            if op == "RESUME":
+                ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
+                changed = False
+                for rule in rules:
+                    if rule.pop("pause_indef", None) is not None:
+                        changed = True
+                    if rule.pop("pause_until", None) is not None:
+                        changed = True
+                if changed:
+                    save_state()
+                await cmd_alertas_pause(update, context, prefix="🔔 Alertas reanudadas.", edit=True)
+                return
+            if op == "INF":
+                ALERTS_PAUSED.add(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
+                save_state()
+                await cmd_alertas_pause(update, context, prefix="🔕 Alertas en pausa (indefinida).", edit=True)
+                return
+            try:
+                hrs = int(op)
+            except Exception:
+                await q.answer("Acción inválida.", show_alert=True); return
+            until = datetime.now(TZ) + timedelta(hours=hrs)
             ALERTS_SILENT_UNTIL[chat_id] = until.timestamp(); ALERTS_PAUSED.discard(chat_id)
             save_state()
-            await q.edit_message_text(f"🔕 Alertas en pausa por {hrs}h (hasta {until.strftime('%d/%m %H:%M')})."); return
+            await cmd_alertas_pause(
+                update,
+                context,
+                prefix=f"🔕 Alertas en pausa por {hrs}h (hasta {until.strftime('%d/%m %H:%M')}).",
+                edit=True,
+            )
+            return
+        try:
+            idx = int(target)
         except Exception:
-            await q.edit_message_text("Acción inválida."); return
+            await q.answer("Acción inválida.", show_alert=True); return
+        if idx < 0 or idx >= len(rules):
+            await q.answer("Alerta inexistente.", show_alert=True); return
+        rule = rules[idx]
+        if op == "RESUME":
+            changed = False
+            if rule.pop("pause_indef", None) is not None:
+                changed = True
+            if rule.pop("pause_until", None) is not None:
+                changed = True
+            ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
+            if changed:
+                save_state()
+            await cmd_alertas_pause(update, context, prefix=f"🔔 Alerta {idx+1} reanudada.", edit=True)
+            return
+        if op == "INF":
+            rule["pause_indef"] = True
+            rule.pop("pause_until", None)
+            ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
+            save_state()
+            await cmd_alertas_pause(update, context, prefix=f"🔕 Alerta {idx+1} en pausa indefinida.", edit=True)
+            return
+        try:
+            hrs = int(op)
+        except Exception:
+            await q.answer("Acción inválida.", show_alert=True); return
+        until = datetime.now(TZ) + timedelta(hours=hrs)
+        rule["pause_until"] = until.timestamp()
+        rule.pop("pause_indef", None)
+        ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
+        save_state()
+        await cmd_alertas_pause(
+            update,
+            context,
+            prefix=f"🔕 Alerta {idx+1} en pausa por {hrs}h (hasta {until.strftime('%d/%m %H:%M')}).",
+            edit=True,
+        )
+        return
+    await q.answer("Acción inválida.", show_alert=True)
 
 async def cmd_alertas_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
-    save_state()
+    rules = ALERTS.get(chat_id, []) or []
+    changed = False
+    for rule in rules:
+        if rule.pop("pause_indef", None) is not None:
+            changed = True
+        if rule.pop("pause_until", None) is not None:
+            changed = True
+    if changed:
+        save_state()
     await update.effective_message.reply_text("🔔 Alertas reanudadas.")
 
 # ---- Conversación Agregar Alerta ----
@@ -1938,6 +2082,95 @@ METRIC_TYPE_LABELS = {
 
 SIDE_LABELS = {"compra": "Compra", "venta": "Venta"}
 
+
+def _get_rule_pause_until(rule: Dict[str, Any]) -> Optional[float]:
+    raw = rule.get("pause_until")
+    if raw is None:
+        return None
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(val) or math.isinf(val):
+        return None
+    return val
+
+
+def _alert_pause_status(rule: Dict[str, Any], now: Optional[datetime] = None) -> Optional[str]:
+    if rule.get("pause_indef"):
+        return "⏸️ Pausada indefinidamente"
+    until = _get_rule_pause_until(rule)
+    if until is None:
+        return None
+    ref = now or datetime.now(TZ)
+    if until <= ref.timestamp():
+        return None
+    until_dt = datetime.fromtimestamp(until, TZ)
+    return f"⏸️ Pausada hasta {until_dt.strftime('%d/%m %H:%M')}"
+
+
+def _alert_pause_status_short(rule: Dict[str, Any], now: Optional[datetime] = None) -> str:
+    if rule.get("pause_indef"):
+        return " ⏸️"
+    until = _get_rule_pause_until(rule)
+    if until is None:
+        return ""
+    ref = now or datetime.now(TZ)
+    if until <= ref.timestamp():
+        return ""
+    until_dt = datetime.fromtimestamp(until, TZ)
+    fmt = "%H:%M" if until_dt.date() == ref.date() else "%d/%m %H:%M"
+    return f" ⏸️ hasta {until_dt.strftime(fmt)}"
+
+
+def _alert_rule_label(rule: Dict[str, Any]) -> str:
+    kind = rule.get("kind")
+    if kind == "fx":
+        t = rule.get("type") or ""
+        side = rule.get("side") or ""
+        label = FX_TYPE_LABELS.get(t, t.upper())
+        side_label = SIDE_LABELS.get(side, side)
+        return f"{label} ({side_label}) {html_op(rule.get('op', ''))} {fmt_money_ars(rule.get('value'))}"
+    if kind == "metric":
+        t = rule.get("type") or ""
+        op = rule.get("op", "")
+        v = rule.get("value")
+        if t == "riesgo":
+            val = f"{(v or 0):.0f} pb"
+        elif t == "reservas":
+            val = f"{fmt_number(v, 0)} MUS$"
+        else:
+            try:
+                val = f"{str(round(float(v or 0), 1)).replace('.', ',')}%"
+            except Exception:
+                val = f"{v}%"
+        label = METRIC_TYPE_LABELS.get(t, t.upper())
+        return f"{label} {html_op(op)} {val}"
+    if kind == "crypto":
+        label = crypto_display_name(rule.get("symbol"), rule.get("base"), rule.get("quote"))
+        op = rule.get("op", "")
+        v = rule.get("value")
+        return f"{label} (Precio) {html_op(op)} {fmt_crypto_price(v, rule.get('quote'))}"
+    sym = rule.get("symbol")
+    op = rule.get("op", "")
+    v = rule.get("value")
+    return f"{_label_long(sym)} (Precio) {html_op(op)} {fmt_money_ars(v)}"
+
+
+def _is_rule_paused(rule: Dict[str, Any], now_ts: Optional[float] = None) -> Tuple[bool, bool]:
+    if rule.get("pause_indef"):
+        return True, False
+    until = _get_rule_pause_until(rule)
+    if until is None:
+        if "pause_until" in rule:
+            rule.pop("pause_until", None)
+            return False, True
+        return False, False
+    ref_ts = now_ts if now_ts is not None else datetime.now(TZ).timestamp()
+    if until > ref_ts:
+        return True, False
+    rule.pop("pause_until", None)
+    return False, True
 
 def _alert_usage_key(kind: str, meta: Dict[str, Any]) -> Optional[str]:
     if kind == "fx":
@@ -2663,6 +2896,7 @@ async def alerts_loop(app: Application):
         while True:
             try:
                 now_ts = datetime.now(TZ).timestamp()
+                state_dirty = False
                 active_chats = []
                 for cid, rules in ALERTS.items():
                     if not rules: continue
@@ -2700,6 +2934,11 @@ async def alerts_loop(app: Application):
                             if not rules: continue
                             trig = []
                             for r in rules:
+                                paused, changed = _is_rule_paused(r, now_ts)
+                                if changed:
+                                    state_dirty = True
+                                if paused:
+                                    continue
                                 if r.get("kind") == "fx":
                                     row = fx.get(r["type"], {}) or {}
                                     cur = _fx_display_value(row, r["side"])
@@ -2748,6 +2987,8 @@ async def alerts_loop(app: Application):
                                     await app.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.HTML)
                                 except Exception as e:
                                     log.warning("send alert failed %s: %s", chat_id, e)
+                    if state_dirty:
+                        save_state()
                 await asyncio.sleep(600)
             except asyncio.CancelledError:
                 raise
