@@ -351,6 +351,7 @@ STATE_PATH = _writable_path(ENV_STATE_PATH) if not (USE_UPSTASH or USE_UPSTASH_R
 ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 SUBS: Dict[int, Dict[str, Any]] = {}
 PF: Dict[int, Dict[str, Any]] = {}
+ALERT_USAGE: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
 _REDIS_CLIENT: Optional[Any] = None
 _REDIS_CLIENT_INITIALIZED = False
@@ -488,7 +489,7 @@ def _save_state_to_redis(payload: Dict[str, Any]) -> bool:
 
 
 def load_state():
-    global ALERTS, SUBS, PF
+    global ALERTS, SUBS, PF, ALERT_USAGE
     data: Optional[Dict[str, Any]] = None
     if USE_UPSTASH:
         data = _load_state_from_upstash()
@@ -506,6 +507,7 @@ def load_state():
         ALERTS = {int(k): v for k, v in data.get("alerts", {}).items()}
         SUBS = {int(k): v for k, v in data.get("subs", {}).items()}
         PF = {int(k): v for k, v in data.get("pf", {}).items()}
+        ALERT_USAGE = {int(k): v for k, v in data.get("alert_usage", {}).items()}
         log.info(
             "State loaded. alerts=%d subs=%d pf=%d",
             sum(len(v) for v in ALERTS.values()),
@@ -517,7 +519,7 @@ def load_state():
 
 
 def save_state():
-    payload = {"alerts": ALERTS, "subs": SUBS, "pf": PF}
+    payload = {"alerts": ALERTS, "subs": SUBS, "pf": PF, "alert_usage": ALERT_USAGE}
     if USE_UPSTASH:
         _save_state_to_upstash(payload)
         return
@@ -1900,6 +1902,178 @@ async def cmd_alertas_resume(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ---- Conversación Agregar Alerta ----
 
+FX_TYPE_LABELS = {
+    "oficial": "Dólar Oficial",
+    "mayorista": "Dólar Mayorista",
+    "blue": "Dólar Blue",
+    "mep": "Dólar MEP",
+    "ccl": "Dólar CCL",
+    "tarjeta": "Dólar Tarjeta",
+    "cripto": "Dólar Cripto",
+}
+
+METRIC_TYPE_LABELS = {
+    "riesgo": "Riesgo País",
+    "inflacion": "Inflación Mensual",
+    "reservas": "Reservas BCRA",
+}
+
+SIDE_LABELS = {"compra": "Compra", "venta": "Venta"}
+
+
+def _alert_usage_key(kind: str, meta: Dict[str, Any]) -> Optional[str]:
+    if kind == "fx":
+        t, side, op = meta.get("type"), meta.get("side"), meta.get("op")
+        if t and side and op:
+            return f"fx:{t}:{side}:{op}"
+        return None
+    if kind == "metric":
+        t, op = meta.get("type"), meta.get("op")
+        if t and op:
+            return f"metric:{t}:{op}"
+        return None
+    if kind == "crypto":
+        sym, op = (meta.get("symbol") or "").upper(), meta.get("op")
+        if sym and op:
+            mode = meta.get("mode") or ""
+            return f"crypto:{sym}:{op}:{mode}"
+        return None
+    if kind == "ticker":
+        sym, op = (meta.get("symbol") or "").upper(), meta.get("op")
+        if sym and op:
+            return f"ticker:{sym}:{op}"
+        return None
+    return None
+
+
+def _alert_usage_label(kind: str, meta: Dict[str, Any]) -> Optional[str]:
+    op = meta.get("op")
+    op_label = "↑ Sube" if op == ">" else "↓ Baja" if op == "<" else None
+    if kind == "fx":
+        t = meta.get("type")
+        side = meta.get("side")
+        label = FX_TYPE_LABELS.get(t or "", (t or "").upper())
+        side_label = SIDE_LABELS.get(side or "", side or "?")
+        if label and side_label and op_label:
+            return f"{label} {side_label} {op_label}"
+    elif kind == "metric":
+        t = meta.get("type")
+        label = METRIC_TYPE_LABELS.get(t or "", (t or "").capitalize())
+        if label and op_label:
+            return f"{label} {op_label}"
+    elif kind == "crypto":
+        sym = (meta.get("symbol") or "").upper()
+        base = (meta.get("base") or "").upper() or None
+        quote = (meta.get("quote") or "").upper() or None
+        if sym and op_label:
+            disp = crypto_display_name(sym, base, quote)
+            return f"{disp} {op_label}" if disp else f"{sym} {op_label}"
+    elif kind == "ticker":
+        sym = (meta.get("symbol") or "").upper()
+        if sym and op_label:
+            return f"{_label_long(sym)} {op_label}"
+    return None
+
+
+def _record_alert_usage(chat_id: int, al: Dict[str, Any]) -> None:
+    kind = al.get("kind")
+    if not kind:
+        return
+    meta: Dict[str, Any] = {}
+    if kind == "fx":
+        meta = {
+            "type": al.get("type"),
+            "side": al.get("side"),
+            "op": al.get("op"),
+            "mode": al.get("mode"),
+        }
+    elif kind == "metric":
+        meta = {
+            "type": al.get("type"),
+            "op": al.get("op"),
+            "mode": al.get("mode"),
+        }
+    elif kind == "crypto":
+        meta = {
+            "symbol": (al.get("symbol") or "").upper(),
+            "base": (al.get("crypto_base") or "").upper(),
+            "quote": (al.get("crypto_quote") or "").upper(),
+            "op": al.get("op"),
+            "mode": al.get("mode"),
+        }
+    elif kind == "ticker":
+        meta = {
+            "symbol": (al.get("symbol") or "").upper(),
+            "op": al.get("op"),
+            "segment": al.get("segment"),
+        }
+    key = _alert_usage_key(kind, meta)
+    if not key:
+        return
+    usage = ALERT_USAGE.setdefault(chat_id, {})
+    entry = usage.setdefault(key, {"count": 0, "kind": kind, "meta": meta})
+    entry["count"] = int(entry.get("count", 0)) + 1
+    entry["kind"] = kind
+    entry["meta"] = meta
+    entry["last"] = time()
+    if len(usage) > 30:
+        to_remove = sorted(
+            usage.items(),
+            key=lambda item: (
+                int(item[1].get("count", 0)),
+                float(item[1].get("last", 0.0)),
+            ),
+        )
+        for drop_key, _ in to_remove[: len(usage) - 30]:
+            usage.pop(drop_key, None)
+
+
+def _get_alert_usage_suggestions(chat_id: int) -> List[Dict[str, Any]]:
+    suggestions: List[Dict[str, Any]] = []
+    for key, entry in (ALERT_USAGE.get(chat_id) or {}).items():
+        count = int(entry.get("count", 0))
+        if count < 3:
+            continue
+        kind = entry.get("kind")
+        meta = entry.get("meta") or {}
+        label = _alert_usage_label(kind, meta)
+        if not label:
+            continue
+        suggestions.append(
+            {
+                "key": key,
+                "label": label,
+                "count": count,
+                "last": float(entry.get("last", 0.0)),
+                "kind": kind,
+                "meta": meta,
+            }
+        )
+    suggestions.sort(key=lambda x: (-x["count"], -x["last"], x["label"]))
+    return suggestions[:5]
+
+
+def _alertas_kind_prompt(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    base_rows: List[List[Tuple[str, str]]] = [
+        [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
+        [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
+        [("Criptomonedas", "KIND:crypto")],
+        [("Volver", "AL:MENU"), ("Cancelar", "CANCEL")],
+    ]
+    suggestions = _get_alert_usage_suggestions(chat_id)
+    rows: List[List[Tuple[str, str]]] = []
+    if suggestions:
+        for sug in suggestions:
+            rows.append([(f"⭐ {sug['label']}", f"SUG:{sug['key']}")])
+    rows.extend(base_rows)
+    text = "¿Qué querés alertar?"
+    if suggestions:
+        extra = ["", "Sugerencias frecuentes:"]
+        extra.extend([f"• {s['label']} ({s['count']}×)" for s in suggestions])
+        text = "\n".join([text] + extra)
+    return text, kb(rows)
+
+
 def kb_submenu_fx() -> InlineKeyboardMarkup:
     return kb([
         [("Oficial","FXTYPE:oficial"),("Mayorista","FXTYPE:mayorista")],
@@ -1923,17 +2097,13 @@ def kb_fx_side_for(t: str) -> InlineKeyboardMarkup:
 
 async def alertas_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["al"] = {}
-    k = kb([
-        [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
-        [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
-        [("Criptomonedas", "KIND:crypto")],
-        [("Volver", "AL:MENU"), ("Cancelar", "CANCEL")],
-    ])
+    chat_id = update.effective_chat.id
+    text, markup = _alertas_kind_prompt(chat_id)
     if update.callback_query:
         q = update.callback_query; await q.answer()
-        await q.edit_message_text("¿Qué querés alertar?", reply_markup=k)
+        await q.edit_message_text(text, reply_markup=markup)
     else:
-        await update.effective_message.reply_text("¿Qué querés alertar?", reply_markup=k)
+        await update.effective_message.reply_text(text, reply_markup=markup)
     return AL_KIND
 
 
@@ -1948,13 +2118,8 @@ async def alertas_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = q.data.split(":",1)[1]
     al = context.user_data.get("al", {})
     if target == "KIND":
-        k = kb([
-            [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
-            [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
-            [("Criptomonedas", "KIND:crypto")],
-            [("Volver", "AL:MENU"), ("Cancelar", "CANCEL")],
-        ])
-        await q.edit_message_text("¿Qué querés alertar?", reply_markup=k); return AL_KIND
+        text, markup = _alertas_kind_prompt(update.effective_chat.id)
+        await q.edit_message_text(text, reply_markup=markup); return AL_KIND
     if target == "FXTYPE":
         await q.edit_message_text("Elegí el tipo de dólar:", reply_markup=kb_submenu_fx()); return AL_FX_TYPE
     if target == "FXSIDE":
@@ -2014,6 +2179,119 @@ async def alertas_add_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await alertas_show_crypto_list(update, context, query=q)
     await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
     return ConversationHandler.END
+
+
+async def alertas_add_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data.split(":", 1)
+    if len(data) < 2:
+        text, markup = _alertas_kind_prompt(update.effective_chat.id)
+        await q.edit_message_text(text, reply_markup=markup)
+        return AL_KIND
+    key = data[1]
+    chat_id = update.effective_chat.id
+    entry = (ALERT_USAGE.get(chat_id) or {}).get(key)
+    if not entry:
+        text, markup = _alertas_kind_prompt(chat_id)
+        await q.edit_message_text("La sugerencia ya no está disponible.", reply_markup=markup)
+        return AL_KIND
+    kind = entry.get("kind")
+    meta = entry.get("meta") or {}
+    if not kind:
+        text, markup = _alertas_kind_prompt(chat_id)
+        await q.edit_message_text("No pude usar esa sugerencia.", reply_markup=markup)
+        return AL_KIND
+    al: Dict[str, Any] = {"kind": kind}
+    if kind == "fx":
+        al.update({
+            "type": meta.get("type"),
+            "side": meta.get("side"),
+            "op": meta.get("op"),
+            "mode": meta.get("mode"),
+        })
+        context.user_data["al"] = al
+        type_raw = al.get("type") or ""
+        label = FX_TYPE_LABELS.get(type_raw, type_raw.upper() or "?")
+        side_raw = al.get("side") or ""
+        side_label = SIDE_LABELS.get(side_raw, side_raw or "?")
+        op_val = al.get("op")
+        op_text = "↑ Sube" if op_val == ">" else "↓ Baja" if op_val == "<" else "?"
+        kb_mode = kb([
+            [("Ingresar Importe", "MODE:absolute"), ("Ingresar % vs valor actual", "MODE:percent")],
+            [("Volver", "BACK:OP"), ("Cancelar", "CANCEL")],
+        ])
+        await q.edit_message_text(
+            f"Tipo: {label} | Lado: {side_label} | Condición: {op_text}\n¿Cómo querés definir el umbral?",
+            reply_markup=kb_mode,
+        )
+        return AL_MODE
+    if kind == "metric":
+        al.update({
+            "type": meta.get("type"),
+            "op": meta.get("op"),
+            "mode": meta.get("mode"),
+        })
+        context.user_data["al"] = al
+        type_raw = al.get("type") or ""
+        label = METRIC_TYPE_LABELS.get(type_raw, type_raw.capitalize() or "?")
+        op_val = al.get("op")
+        op_text = "↑ Sube" if op_val == ">" else "↓ Baja" if op_val == "<" else "?"
+        kb_mode = kb([
+            [("Ingresar Importe", "MODE:absolute"), ("Ingresar % vs valor actual", "MODE:percent")],
+            [("Volver", "BACK:OP"), ("Cancelar", "CANCEL")],
+        ])
+        await q.edit_message_text(
+            f"Métrica: {label} | Condición: {op_text}\n¿Cómo querés definir el umbral?",
+            reply_markup=kb_mode,
+        )
+        return AL_MODE
+    if kind == "crypto":
+        al.update({
+            "symbol": (meta.get("symbol") or "").upper(),
+            "crypto_base": (meta.get("base") or "").upper(),
+            "crypto_quote": (meta.get("quote") or "").upper(),
+            "op": meta.get("op"),
+            "mode": meta.get("mode"),
+        })
+        context.user_data["al"] = al
+        label = crypto_display_name(al.get("symbol"), al.get("crypto_base"), al.get("crypto_quote"))
+        op_val = al.get("op")
+        op_text = "↑ Sube" if op_val == ">" else "↓ Baja" if op_val == "<" else "?"
+        kb_mode = kb([
+            [("Ingresar Importe", "MODE:absolute"), ("Ingresar % vs valor actual", "MODE:percent")],
+            [("Volver", "BACK:OP"), ("Cancelar", "CANCEL")],
+        ])
+        await q.edit_message_text(
+            f"Cripto: {label} | Condición: {op_text}\n¿Cómo querés definir el umbral?",
+            reply_markup=kb_mode,
+        )
+        return AL_MODE
+    if kind == "ticker":
+        al.update({
+            "symbol": (meta.get("symbol") or "").upper(),
+            "op": meta.get("op"),
+            "segment": meta.get("segment"),
+        })
+        context.user_data["al"] = al
+        async with ClientSession() as session:
+            metmap, _ = await metrics_for_symbols(session, [al.get("symbol")])
+        sym = al.get("symbol")
+        last_px = metmap.get(sym, {}).get("last_px") if metmap else None
+        price_s = fmt_money_ars(last_px) if last_px is not None else "—"
+        op_val = al.get("op")
+        op_text = "↑ Sube" if op_val == ">" else "↓ Baja" if op_val == "<" else "?"
+        msg = (
+            f"Ticker: {_label_long(sym)} | Condición: {op_text}\n"
+            f"Actual: Precio {price_s}\n\n"
+            "Ingresá el <b>precio objetivo</b> (solo número, sin símbolos ni separadores). Ej: 3500\n"
+            "<i>Válidos: 100 | 1000.5 · Inválidos: $100, 1.000,50, 100%</i>"
+        )
+        await q.edit_message_text(msg, parse_mode=ParseMode.HTML)
+        return AL_VALUE
+    text, markup = _alertas_kind_prompt(chat_id)
+    await q.edit_message_text("No pude usar esa sugerencia.", reply_markup=markup)
+    return AL_KIND
 
 async def alertas_add_fx_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -2272,6 +2550,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
                 return AL_VALUE
             rules.append(candidate)
+            _record_alert_usage(chat_id, al)
             save_state()
             await update.message.reply_text("Listo. Alerta agregada ✅")
             await cmd_alertas_menu(update, context)
@@ -2293,6 +2572,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
                 return AL_VALUE
             rules.append(candidate)
+            _record_alert_usage(chat_id, al)
             save_state()
             await update.message.reply_text("Listo. Alerta agregada ✅")
             await cmd_alertas_menu(update, context)
@@ -2326,6 +2606,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
                 return AL_VALUE
             rules.append(candidate)
+            _record_alert_usage(chat_id, al)
             save_state()
             target_s = fmt_crypto_price(thr, quote)
             direction = "sube a" if op == ">" else "baja a"
@@ -2349,6 +2630,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
             return AL_VALUE
         rules.append(candidate)
+        _record_alert_usage(chat_id, al)
         save_state()
         await update.message.reply_text("Listo. Alerta agregada ✅")
         await cmd_alertas_menu(update, context)
@@ -4147,7 +4429,10 @@ def build_application() -> Application:
     alert_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(alertas_add_start, pattern="^AL:ADD$")],
         states={
-            AL_KIND: [CallbackQueryHandler(alertas_add_kind, pattern="^(KIND:|CANCEL$)")],
+            AL_KIND: [
+                CallbackQueryHandler(alertas_add_suggestion, pattern="^SUG:"),
+                CallbackQueryHandler(alertas_add_kind, pattern="^(KIND:|CANCEL$)"),
+            ],
             AL_FX_TYPE: [CallbackQueryHandler(alertas_add_fx_type, pattern="^(FXTYPE:|BACK:|CANCEL$)")],
             AL_FX_SIDE: [CallbackQueryHandler(alertas_add_fx_side, pattern="^(SIDE:|BACK:|CANCEL$)")],
             AL_METRIC_TYPE: [CallbackQueryHandler(alertas_add_metric_type, pattern="^(METRIC:|BACK:|CANCEL$)")],
