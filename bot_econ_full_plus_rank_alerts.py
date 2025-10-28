@@ -1453,6 +1453,29 @@ KEYWORDS = ["inflación","ipc","índice de precios","devalu","dólar","ccl","mep
             "bcra","reservas","tasas","pases","fmi","deuda","riesgo país",
             "cepo","importaciones","exportaciones","merval","acciones","bonos","brecha",
             "subsidios","retenciones","tarifas","liquidez","recaudación","déficit"]
+NEWS_TOPICS = [
+    ("cambio", ["dolar", "blue", "mep", "ccl", "brecha", "cambio", "oficial", "mayorista", "contado con liqui"]),
+    ("inflacion", ["inflacion", "ipc", "precios", "indice de precios", "inflacionaria"]),
+    ("reservas", ["reserva", "bcra", "pases", "tasas", "leliq", "liquidez"]),
+    ("deuda", ["bono", "bonos", "riesgo", "deuda", "fmi", "default", "canje"]),
+    ("actividad", ["actividad", "pbi", "industria", "empleo", "salario", "consumo", "produccion", "pymes"]),
+    ("fiscal", ["deficit", "superavit", "recaudacion", "impuesto", "tribut", "presupuesto"]),
+    ("comercio", ["export", "import", "balanza", "aduana", "soja", "agro", "granos", "campo"]),
+    ("energia", ["energia", "combustible", "nafta", "gas", "petroleo", "ypf", "electricidad"]),
+]
+
+
+def _normalize_topic_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFD", text.lower())
+    return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+
+
+def _topic_for_title(title: str) -> str:
+    norm = _normalize_topic_text(title)
+    for topic, keywords in NEWS_TOPICS:
+        if any(kw in norm for kw in keywords):
+            return topic
+    return "otros"
 
 def domain_of(url: str) -> str:
     try: return urlparse(url).netloc.lower()
@@ -1525,14 +1548,31 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
                 ("Dólar: foco en brecha y CCL/MEP", "https://www.infobae.com/economia/")][:limit]
 
     scored = sorted([(t,l,_score_title(t), domain_of(l)) for l,t in uniq.items()], key=lambda x: x[2], reverse=True)
-    picked: List[Tuple[str,str]] = []; used_domains = set()
-    for t,l,_,dom in scored:
-        if dom in used_domains and len(used_domains) < 4: continue
-        used_domains.add(dom); picked.append((t,l))
-        if len(picked) >= limit: break
-    for t,l,_,dom in scored:
-        if len(picked) >= limit: break
-        if (t,l) not in picked: picked.append((t,l))
+    picked: List[Tuple[str,str]] = []
+    used_domains: Set[str] = set()
+    topic_counts: Dict[str, int] = {}
+
+    def attempt_pick(topic_cap: Optional[int], enforce_domain: bool) -> None:
+        nonlocal picked, used_domains, topic_counts
+        for title, link, _, dom in scored:
+            if len(picked) >= limit:
+                break
+            if (title, link) in picked:
+                continue
+            topic = _topic_for_title(title)
+            if topic_cap is not None and topic_counts.get(topic, 0) >= topic_cap:
+                continue
+            if enforce_domain and dom in used_domains and len(used_domains) < 4:
+                continue
+            picked.append((title, link))
+            topic_counts[topic] = topic_counts.get(topic, 0) + 1
+            used_domains.add(dom)
+
+    attempt_pick(topic_cap=1, enforce_domain=True)
+    if len(picked) < limit:
+        attempt_pick(topic_cap=2, enforce_domain=True)
+    if len(picked) < limit:
+        attempt_pick(topic_cap=None, enforce_domain=False)
     return picked[:limit]
 
 def _short_title(text: str, limit: int = 32) -> str:
