@@ -4504,7 +4504,7 @@ def _return_bar_image(
     if max_abs <= 0:
         max_abs = 1.0
 
-    fig, ax = plt.subplots(figsize=(6, 4), dpi=160)
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=160)
     colors = []
     for val in values:
         if val > 0:
@@ -4557,7 +4557,8 @@ def _return_bar_image(
         )
 
     ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
+    ax.margins(x=0.05)
     ax.axhline(0, color="#4a4a4a", linewidth=0.8)
     ax.set_ylabel("Variación %")
     ax.set_title(title + (f"\n{subtitle}" if subtitle else ""))
@@ -4709,22 +4710,6 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
 
     await _send_below_menu(context, chat_id, text="\n".join(lines))
 
-    total_pct = (delta_t / total_invertido * 100.0) if total_invertido > 0 else None
-    if total_pct is not None:
-        return_points.append(("Portafolio", total_pct))
-    if has_daily_data:
-        daily_points.append(("Portafolio", daily_sum if daily_sum is not None else None))
-
-    if return_points:
-        img = _return_bar_image(
-            return_points,
-            "Rendimiento por instrumento",
-            "Variación acumulada vs. invertido",
-            formatter=lambda v: f"{v:+.1f}%",
-        )
-        if img:
-            await _send_below_menu(context, chat_id, photo_bytes=img)
-
     cleaned_daily = [pt for pt in daily_points if pt[1] is not None]
     if cleaned_daily:
         daily_img = _return_bar_image(
@@ -4735,6 +4720,16 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         )
         if daily_img:
             await _send_below_menu(context, chat_id, photo_bytes=daily_img)
+
+    if return_points:
+        img = _return_bar_image(
+            return_points,
+            "Rendimiento por instrumento",
+            "Variación acumulada vs. invertido",
+            formatter=lambda v: f"{v:+.1f}%",
+        )
+        if img:
+            await _send_below_menu(context, chat_id, photo_bytes=img)
 
 # --- Proyección (debajo del menú) ---
 
