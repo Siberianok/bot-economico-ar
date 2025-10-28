@@ -3333,11 +3333,20 @@ async def pf_main_menu_text(chat_id: int) -> str:
         lines.append(tc_line)
     return "\n".join(lines)
 
-async def pf_refresh_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+async def pf_refresh_menu(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    force_new: bool = False,
+):
     text = await pf_main_menu_text(chat_id)
     kb_main = kb_pf_main()
-    msg_id = context.user_data.get("pf_menu_msg_id") if isinstance(context.user_data, dict) else None
-    if msg_id:
+    msg_id = (
+        context.user_data.get("pf_menu_msg_id")
+        if isinstance(context.user_data, dict)
+        else None
+    )
+    if msg_id and not force_new:
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
@@ -3347,7 +3356,7 @@ async def pf_refresh_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                 reply_markup=kb_main,
             )
         except Exception:
-            pass
+            msg_id = None
         else:
             context.user_data["pf_menu_msg_id"] = msg_id
             return
@@ -3560,7 +3569,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if 0 <= idx < len(pf["items"]):
             pf["items"].pop(idx); save_state()
             await _send_below_menu(context, chat_id, text="Instrumento eliminado.")
-            await pf_refresh_menu(context, chat_id)
+            await pf_refresh_menu(context, chat_id, force_new=True)
             return
         await _send_below_menu(context, chat_id, text="Índice inválido."); return
 
@@ -3726,7 +3735,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cnt = len(items)
             pf["items"].clear()
             save_state()
-            await pf_refresh_menu(context, chat_id)
+            await pf_refresh_menu(context, chat_id, force_new=True)
             await _send_below_menu(
                 context,
                 chat_id,
@@ -3744,7 +3753,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pf.setdefault("items", [])
             pf["items"].insert(idx, item)
             save_state()
-            await pf_refresh_menu(context, chat_id)
+            await pf_refresh_menu(context, chat_id, force_new=True)
             sym = item.get("simbolo") if isinstance(item, dict) else None
             label = _label_long(sym) if sym else (item.get("tipo", "Instrumento").upper() if isinstance(item, dict) else "Instrumento")
             await _send_below_menu(context, chat_id, text=f"Se restauró: {label}.")
@@ -3765,7 +3774,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             removed = items.pop(idx)
             stack.append({"index": idx, "item": copy.deepcopy(removed)})
             save_state()
-            await pf_refresh_menu(context, chat_id)
+            await pf_refresh_menu(context, chat_id, force_new=True)
             sym = removed.get("simbolo") if isinstance(removed, dict) else None
             label = _label_long(sym) if sym else (removed.get("tipo", "Instrumento").upper() if isinstance(removed, dict) else "Instrumento")
             await _send_below_menu(
@@ -3836,7 +3845,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pf_base = pf["base"]["moneda"].upper()
         f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
         await update.message.reply_text(f"Monto fijado: {f_money(v)} · Restante: {_restante_str(usado)}")
-        await pf_refresh_menu(context, chat_id)
+        await pf_refresh_menu(context, chat_id, force_new=True)
         context.user_data["pf_mode"]=None; return
 
     # Alta por cantidad/importe/% (símbolo ya elegido)
@@ -3944,7 +3953,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         base_label = _label_long(sym if not sym.endswith("-USD") else sym.replace("-USD"," (USD)"))
         det = f"Agregado {base_label} {qty_str}{unit_px_str}{total_str}.\nRestante: {restante_str}"
         await update.message.reply_text(det)
-        await pf_refresh_menu(context, chat_id)
+        await pf_refresh_menu(context, chat_id, force_new=True)
         context.user_data["pf_mode"]=None; return
 
     # Ediciones
@@ -4033,7 +4042,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         usado = await _pf_total_usado(chat_id)
         f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
         await update.message.reply_text("Actualizado ✅ · Restante: " + f_money(max(0.0, pf["monto"]-usado)))
-        await pf_refresh_menu(context, chat_id)
+        await pf_refresh_menu(context, chat_id, force_new=True)
         context.user_data["pf_mode"]=None; return
 
 # --- Composición: texto + torta (debajo del menú) ---
@@ -4775,7 +4784,7 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     img = _pie_image_from_items(pf, snapshot)
     if img:
         await _send_below_menu(context, chat_id, photo_bytes=img)
-    await pf_refresh_menu(context, chat_id)
+    await pf_refresh_menu(context, chat_id, force_new=True)
 
 # --- Rendimiento (debajo del menú) ---
 
@@ -4880,7 +4889,7 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         )
         if img:
             await _send_below_menu(context, chat_id, photo_bytes=img)
-    await pf_refresh_menu(context, chat_id)
+    await pf_refresh_menu(context, chat_id, force_new=True)
 
 # --- Proyección (debajo del menú) ---
 
@@ -4972,7 +4981,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     )
     if per_instrument_img:
         await _send_below_menu(context, chat_id, photo_bytes=per_instrument_img)
-    await pf_refresh_menu(context, chat_id)
+    await pf_refresh_menu(context, chat_id, force_new=True)
 
 # ============================ RESUMEN DIARIO ============================
 
