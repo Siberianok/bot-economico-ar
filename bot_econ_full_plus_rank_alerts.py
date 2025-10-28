@@ -4523,30 +4523,35 @@ def _projection_by_instrument_image(
         max_abs = 1.0
 
     x = np.arange(len(labels))
-    width = 0.38
+    width = 0.28
+    gap = 0.09
 
-    def _color(val: float, missing: bool) -> str:
+    def _color(val: float, missing: bool, is_longer: bool) -> str:
         if missing:
-            return "#9aa0a6"
+            return "#c3c7cf" if not is_longer else "#a1a6ad"
         if val > 0:
-            return "#34a853"
+            return "#8fd694" if not is_longer else "#2c7d3b"
         if val < 0:
-            return "#ea4335"
-        return "#9aa0a6"
+            return "#f28b82" if not is_longer else "#c5221f"
+        return "#c3c7cf" if not is_longer else "#a1a6ad"
 
-    fig, ax = plt.subplots(figsize=(7, 4), dpi=160)
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=160)
     bars_3m = ax.bar(
-        x - width / 2,
+        x - (width / 2 + gap / 2),
         values_3m,
         width,
-        color=[_color(v, miss) for v, miss in zip(values_3m, missing_3m)],
+        color=[_color(v, miss, False) for v, miss in zip(values_3m, missing_3m)],
+        edgecolor="#ffffff",
+        linewidth=0.6,
         label="3M",
     )
     bars_6m = ax.bar(
-        x + width / 2,
+        x + (width / 2 + gap / 2),
         values_6m,
         width,
-        color=[_color(v, miss) for v, miss in zip(values_6m, missing_6m)],
+        color=[_color(v, miss, True) for v, miss in zip(values_6m, missing_6m)],
+        edgecolor="#ffffff",
+        linewidth=0.6,
         label="6M",
     )
 
@@ -4603,12 +4608,15 @@ def _projection_by_instrument_image(
     ax.axhline(0, color="#4a4a4a", linewidth=0.8)
     ax.set_ylabel("Variación %")
     ax.set_title(title + (f"\n{subtitle}" if subtitle else ""))
-    ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+    ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.4)
+    ax.set_axisbelow(True)
     ax.legend()
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
 
     ax.set_ylim(-max_abs * 1.25, max_abs * 1.25)
+
+    ax.margins(x=0.08)
 
     fig.tight_layout()
     buf = io.BytesIO()
