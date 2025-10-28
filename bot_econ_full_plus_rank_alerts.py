@@ -140,6 +140,8 @@ CRYPTOCOMPARE_PRICE_URL = "https://min-api.cryptocompare.com/data/price"
 _binance_symbols_cache: Dict[str, Dict[str, str]] = {}
 _binance_symbols_ts: float = 0.0
 
+RAVA_PERFIL_URL = "https://www.rava.com/perfil/{symbol}"
+
 
 CUSTOM_CRYPTO_ENTRIES: Dict[str, Dict[str, Any]] = {
     "VRAUSDT": {
@@ -947,6 +949,197 @@ async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, 
     fecha = m_date.group(1) if m_date else None
     return (val, fecha)
 
+# ============================ RAVA ============================
+
+async def _fetch_rava_profile(session: ClientSession, symbol: str) -> Optional[Dict[str, Any]]:
+    url = RAVA_PERFIL_URL.format(symbol=quote(symbol))
+    try:
+        async with session.get(url, headers=REQ_HEADERS, timeout=ClientTimeout(total=12)) as resp:
+            if resp.status != 200:
+                return None
+            html = await resp.text()
+    except Exception:
+        return None
+
+    match = re.search(r':res="(\{.*?\})"', html, flags=re.S)
+    if not match:
+        return None
+    try:
+        data = json.loads(_html.unescape(match.group(1)))
+    except Exception:
+        return None
+    return data
+
+def _rava_history_points(entries: List[Dict[str, Any]]) -> List[Tuple[int, float]]:
+    points: List[Tuple[int, float]] = []
+    for entry in entries:
+        close_raw = entry.get("cierre") if isinstance(entry, dict) else None
+        if close_raw is None:
+            close_raw = entry.get("ultimo") if isinstance(entry, dict) else None
+        try:
+            close = float(close_raw)
+        except (TypeError, ValueError):
+            continue
+        ts_raw = entry.get("timestamp") if isinstance(entry, dict) else None
+        ts_val: Optional[int] = None
+        if ts_raw is not None:
+            try:
+                ts_val = int(ts_raw)
+            except (TypeError, ValueError):
+                ts_val = None
+        if ts_val is None and isinstance(entry, dict) and entry.get("fecha"):
+            try:
+                dt = datetime.strptime(entry["fecha"], "%Y-%m-%d").replace(tzinfo=TZ)
+                ts_val = int(dt.timestamp())
+            except Exception:
+                ts_val = None
+        if ts_val is None:
+            continue
+        points.append((ts_val, close))
+    points.sort(key=lambda x: x[0])
+    return points
+
+def _metrics_from_rava_history(history: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    points = _rava_history_points(history)
+    if not points:
+        return {"6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None, "dd6m": None,
+                "hi52": None, "slope50": None, "trend_flag": None}
+
+    ts = [p[0] for p in points]
+    closes = [p[1] for p in points]
+    last_ts = ts[-1]
+    last = closes[-1]
+    prev = closes[-2] if len(closes) >= 2 else None
+
+    def _first_on_or_after(target: int) -> float:
+        for t, value in points:
+            if t >= target:
+                return value
+        return points[0][1]
+
+    day = 24 * 3600
+    t6 = last_ts - 180 * day
+    t3 = last_ts - 90 * day
+    t1 = last_ts - 30 * day
+    base6 = _first_on_or_after(t6)
+    base3 = _first_on_or_after(t3)
+    base1 = _first_on_or_after(t1)
+    ret6 = ((last / base6) - 1.0) * 100.0 if base6 else None
+    ret3 = ((last / base3) - 1.0) * 100.0 if base3 else None
+    ret1 = ((last / base1) - 1.0) * 100.0 if base1 else None
+
+    # volatilidad anualizada
+    daily_returns: List[float] = []
+    for i in range(1, len(closes)):
+        if closes[i - 1] and closes[i]:
+            try:
+                daily_returns.append(closes[i] / closes[i - 1] - 1.0)
+            except Exception:
+                continue
+    window = 60 if len(daily_returns) >= 60 else max(10, len(daily_returns))
+    vol_ann = None
+    if len(daily_returns) >= 2:
+        tail = daily_returns[-window:]
+        mu = sum(tail) / len(tail)
+        var = sum((r - mu) ** 2 for r in tail) / (len(tail) - 1) if len(tail) > 1 else 0.0
+        vol_ann = math.sqrt(var) * math.sqrt(252) * 100.0
+
+    # drawdown últimos 6 meses
+    idx_cut = next((i for i, t in enumerate(ts) if t >= t6), 0)
+    peak = closes[idx_cut]
+    dd_min = 0.0
+    for value in closes[idx_cut:]:
+        if value > peak:
+            peak = value
+        draw = value / peak - 1.0
+        if draw < dd_min:
+            dd_min = draw
+    dd6 = abs(dd_min) * 100.0 if dd_min < 0 else 0.0
+
+    hi52 = (last / max(closes) - 1.0) * 100.0 if closes else None
+
+    def _sma(vals: List[float], window: int) -> List[Optional[float]]:
+        out: List[Optional[float]] = [None] * len(vals)
+        queue: List[float] = []
+        acc = 0.0
+        for idx, value in enumerate(vals):
+            queue.append(value)
+            acc += value
+            if len(queue) > window:
+                acc -= queue.pop(0)
+            if len(queue) == window:
+                out[idx] = acc / window
+        return out
+
+    sma50 = _sma(closes, 50)
+    sma200 = _sma(closes, 200)
+    slope50 = None
+    if sma50[-1] is not None and len(closes) > 20 and sma50[-21] is not None:
+        try:
+            slope50 = ((sma50[-1] / sma50[-21]) - 1.0) * 100.0
+        except Exception:
+            slope50 = None
+    trend_flag = None
+    if sma200[-1] is not None:
+        trend_flag = 1.0 if last > sma200[-1] else -1.0
+
+    return {
+        "6m": ret6,
+        "3m": ret3,
+        "1m": ret1,
+        "last_ts": int(last_ts),
+        "vol_ann": vol_ann,
+        "dd6m": dd6,
+        "hi52": hi52,
+        "slope50": slope50,
+        "trend_flag": trend_flag,
+        "prev_px": float(prev) if prev is not None else None,
+    }
+
+async def _rava_metrics(session: ClientSession, symbol: str) -> Dict[str, Optional[float]]:
+    base = {"6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None,
+            "dd6m": None, "hi52": None, "slope50": None, "trend_flag": None,
+            "last_px": None, "prev_px": None, "last_chg": None}
+    data = await _fetch_rava_profile(session, symbol)
+    if not data:
+        return base
+
+    quotes = data.get("cotizaciones") or []
+    history = data.get("coti_hist") or []
+    metrics = _metrics_from_rava_history(history)
+    base.update(metrics)
+
+    if quotes:
+        row = quotes[0]
+        last_raw = row.get("ultimo") if isinstance(row, dict) else None
+        try:
+            last = float(last_raw) if last_raw is not None else None
+        except (TypeError, ValueError):
+            last = None
+        if last is not None:
+            base["last_px"] = last
+        if row.get("variacion") is not None:
+            try:
+                base["last_chg"] = float(row.get("variacion"))
+            except (TypeError, ValueError):
+                base["last_chg"] = None
+        if row.get("anterior") is not None:
+            try:
+                base["prev_px"] = float(row.get("anterior"))
+            except (TypeError, ValueError):
+                pass
+        fecha = row.get("fecha")
+        hora = row.get("hora") or "00:00:00"
+        if fecha:
+            try:
+                dt = datetime.strptime(f"{fecha} {hora}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=TZ)
+                base["last_ts"] = int(dt.timestamp())
+            except Exception:
+                pass
+
+    base["currency"] = bono_moneda(symbol)
+    return base
+
 # ============================ YF MÉTRICAS ============================
 
 async def _yf_chart_1y(session: ClientSession, symbol: str, interval: str) -> Optional[Dict[str, Any]]:
@@ -1036,7 +1229,10 @@ async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
     sem = asyncio.Semaphore(4)
     async def work(sym: str):
         async with sem:
-            out[sym] = await _yf_metrics_1y(session, sym)
+            if sym in BONOS_AR:
+                out[sym] = await _rava_metrics(session, sym)
+            else:
+                out[sym] = await _yf_metrics_1y(session, sym)
     await asyncio.gather(*(work(s) for s in symbols))
     last_ts = None
     for d in out.values():
@@ -3874,7 +4070,10 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         met = mets.get(sym, {}) if sym in mets else {}
         if met and met.get("last_px") is None:
             met = {}
+        met_currency = met.get("currency") if met else None
         inst_cur = instrument_currency(sym, tipo) if sym else base_currency
+        if met_currency:
+            inst_cur = str(met_currency).upper()
         fx_rate_raw = it.get("fx_rate")
         try:
             fx_rate_item = float(fx_rate_raw) if fx_rate_raw is not None else None
