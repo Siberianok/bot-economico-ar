@@ -4293,9 +4293,9 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
     fig, (ax_pie, ax_info) = plt.subplots(
         1,
         2,
-        figsize=(10, 6),
+        figsize=(12, 6.5),
         dpi=200,
-        gridspec_kw={"width_ratios": [3, 2]},
+        gridspec_kw={"width_ratios": [3.4, 2.6]},
     )
 
     cmap = plt.get_cmap("tab20c")
@@ -4318,7 +4318,7 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
 
     for text in autotexts:
         text.set_color("#1a1a1a")
-        text.set_fontsize(9)
+        text.set_fontsize(8)
 
     ax_pie.text(
         0,
@@ -4334,7 +4334,7 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
     ax_pie.axis("off")
 
     ax_info.axis("off")
-    ax_info.set_xlim(0, 1.05)
+    ax_info.set_xlim(0, 1.25)
     ax_info.set_ylim(0, 1)
 
     ax_info.text(
@@ -4347,7 +4347,7 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
         ha="left",
     )
     headers = ["Instrumento", "%", "Actual", "Invertido", "Variación"]
-    col_x = [0.08, 0.48, 0.72, 0.9, 1.02]
+    col_x = [0.1, 0.5, 0.82, 1.05, 1.22]
     header_align = ["left", "center", "right", "right", "right"]
     header_y = 0.85
     for x, header, align in zip(col_x, headers, header_align):
@@ -4369,19 +4369,19 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
         pct_value = detail["valor_actual"] / total * 100.0 if total else 0.0
         invertido = detail.get("invertido", 0.0)
         variacion = detail["valor_actual"] - invertido
-        ax_info.scatter(0.03, start_y, color=color, s=80, marker="s")
-        ax_info.text(0.08, start_y, detail["label"], fontsize=9, va="center", ha="left")
-        ax_info.text(0.48, start_y, pct_plain(pct_value, 1), fontsize=9, va="center", ha="center")
-        ax_info.text(0.72, start_y, f_money(detail["valor_actual"]), fontsize=9, va="center", ha="right")
-        ax_info.text(0.9, start_y, f_money(invertido), fontsize=9, va="center", ha="right")
-        ax_info.text(1.02, start_y, f_money(variacion), fontsize=9, va="center", ha="right")
+        ax_info.scatter(0.05, start_y, color=color, s=70, marker="s")
+        ax_info.text(0.1, start_y, detail["label"], fontsize=8.5, va="center", ha="left")
+        ax_info.text(0.5, start_y, pct_plain(pct_value, 1), fontsize=8.5, va="center", ha="center")
+        ax_info.text(0.82, start_y, f_money(detail["valor_actual"]), fontsize=8.5, va="center", ha="right")
+        ax_info.text(1.05, start_y, f_money(invertido), fontsize=8.5, va="center", ha="right")
+        ax_info.text(1.22, start_y, f_money(variacion), fontsize=8.5, va="center", ha="right")
         start_y -= row_spacing
 
     ax_info.text(
         0.02,
         max(0.05, start_y),
         f"Total: {f_money(total)} {base_currency}",
-        fontsize=10,
+        fontsize=9.5,
         fontweight="bold",
         va="center",
     )
