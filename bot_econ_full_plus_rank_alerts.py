@@ -4328,12 +4328,29 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
     ax_info.set_xlim(0, 1.05)
     ax_info.set_ylim(0, 1)
 
-    ax_info.text(0.02, 0.95, "Detalle por instrumento", fontsize=12, fontweight="bold", va="center")
+    ax_info.text(
+        0.02,
+        0.95,
+        "Detalle por instrumento",
+        fontsize=12,
+        fontweight="bold",
+        va="center",
+        ha="left",
+    )
     headers = ["Instrumento", "%", "Actual", "Invertido", "Variación"]
-    col_x = [0.08, 0.4, 0.66, 0.86, 1.02]
+    col_x = [0.08, 0.48, 0.72, 0.9, 1.02]
+    header_align = ["left", "center", "right", "right", "right"]
     header_y = 0.85
-    for x, header in zip(col_x, headers):
-        ax_info.text(x, header_y, header, fontsize=10, fontweight="bold", va="center")
+    for x, header, align in zip(col_x, headers, header_align):
+        ax_info.text(
+            x,
+            header_y,
+            header,
+            fontsize=10,
+            fontweight="bold",
+            va="center",
+            ha=align,
+        )
 
     n_rows = len(selected_details)
     row_spacing = 0.65 / max(1, n_rows)
@@ -4344,11 +4361,11 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
         invertido = detail.get("invertido", 0.0)
         variacion = detail["valor_actual"] - invertido
         ax_info.scatter(0.03, start_y, color=color, s=80, marker="s")
-        ax_info.text(0.08, start_y, detail["label"], fontsize=9, va="center")
-        ax_info.text(0.4, start_y, pct_plain(pct_value, 1), fontsize=9, va="center")
-        ax_info.text(0.66, start_y, f_money(detail["valor_actual"]), fontsize=9, va="center")
-        ax_info.text(0.86, start_y, f_money(invertido), fontsize=9, va="center")
-        ax_info.text(1.02, start_y, f_money(variacion), fontsize=9, va="center")
+        ax_info.text(0.08, start_y, detail["label"], fontsize=9, va="center", ha="left")
+        ax_info.text(0.48, start_y, pct_plain(pct_value, 1), fontsize=9, va="center", ha="center")
+        ax_info.text(0.72, start_y, f_money(detail["valor_actual"]), fontsize=9, va="center", ha="right")
+        ax_info.text(0.9, start_y, f_money(invertido), fontsize=9, va="center", ha="right")
+        ax_info.text(1.02, start_y, f_money(variacion), fontsize=9, va="center", ha="right")
         start_y -= row_spacing
 
     ax_info.text(
