@@ -4914,6 +4914,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         weight = entry.get('peso') or 0.0
         if not metrics:
             continue
+        has_projection_data = True
         p3 = projection_3m(metrics)
         p6 = projection_6m(metrics)
         w3 += weight * p3
@@ -4928,6 +4929,30 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
             extras.append(f"desde {added_str}")
         detail.append(
             f"• {short_label} → 3M {pct(p3,2)} | 6M {pct(p6,2)} (" + " · ".join(extras) + ")"
+        )
+
+        invertido = float(entry.get('invertido') or 0.0)
+        valor_actual = float(entry.get('valor_actual') or 0.0)
+        actual_pct = ((valor_actual / invertido) - 1.0) * 100.0 if invertido > 0 else None
+        comparison_points.append(
+            {
+                "label": short_label,
+                "proj3": p3,
+                "proj6": p6,
+                "actual": actual_pct,
+            }
+        )
+
+        actual_profit = valor_actual - invertido
+        proj_profit3 = valor_actual * (p3 / 100.0)
+        proj_profit6 = valor_actual * (p6 / 100.0)
+        profit_points.append(
+            {
+                "label": short_label,
+                "proj3": proj_profit3,
+                "proj6": proj_profit6,
+                "actual": actual_profit,
+            }
         )
 
     forecast3 = total_actual * (1.0 + w3/100.0)
