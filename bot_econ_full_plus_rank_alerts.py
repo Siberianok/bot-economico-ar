@@ -109,6 +109,10 @@ def _crypto_to_symbol(cname: str) -> str: return f"{cname}-USD"
 BINANCE_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
 BINANCE_TICKER_PRICE_URLS = [
     "https://api.binance.com/api/v3/ticker/price",
+    "https://api1.binance.com/api/v3/ticker/price",
+    "https://api2.binance.com/api/v3/ticker/price",
+    "https://api3.binance.com/api/v3/ticker/price",
+    "https://api-gcp.binance.com/api/v3/ticker/price",
     "https://data.binance.com/api/v3/ticker/price",
     "https://www.binance.com/api/v3/ticker/price",
     "https://api.binance.us/api/v3/ticker/price",
@@ -640,8 +644,13 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
     try:
         timeout = kwargs.pop("timeout", ClientTimeout(total=15))
         headers = kwargs.pop("headers", {})
-        async with session.get(url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs) as resp:
-            if resp.status == 200:
+        async with session.get(
+            url,
+            timeout=timeout,
+            headers={**REQ_HEADERS, **headers},
+            **kwargs,
+        ) as resp:
+            if 200 <= resp.status < 300:
                 return await resp.json(content_type=None)
             log.warning("GET %s -> %s", url, resp.status)
     except Exception as e:
@@ -3324,11 +3333,20 @@ async def pf_main_menu_text(chat_id: int) -> str:
         lines.append(tc_line)
     return "\n".join(lines)
 
-async def pf_refresh_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+async def pf_refresh_menu(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    *,
+    force_new: bool = False,
+):
     text = await pf_main_menu_text(chat_id)
     kb_main = kb_pf_main()
-    msg_id = context.user_data.get("pf_menu_msg_id") if isinstance(context.user_data, dict) else None
-    if msg_id:
+    msg_id = (
+        context.user_data.get("pf_menu_msg_id")
+        if isinstance(context.user_data, dict)
+        else None
+    )
+    if msg_id and not force_new:
         try:
             await context.bot.edit_message_text(
                 chat_id=chat_id,
@@ -3338,7 +3356,7 @@ async def pf_refresh_menu(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
                 reply_markup=kb_main,
             )
         except Exception:
-            pass
+            msg_id = None
         else:
             context.user_data["pf_menu_msg_id"] = msg_id
             return
@@ -3551,7 +3569,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if 0 <= idx < len(pf["items"]):
             pf["items"].pop(idx); save_state()
             await _send_below_menu(context, chat_id, text="Instrumento eliminado.")
-            await pf_refresh_menu(context, chat_id)
+            await pf_refresh_menu(context, chat_id, force_new=True)
             return
         await _send_below_menu(context, chat_id, text="Índice inválido."); return
 
@@ -3717,7 +3735,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             cnt = len(items)
             pf["items"].clear()
             save_state()
-            await pf_refresh_menu(context, chat_id)
+            await pf_refresh_menu(context, chat_id, force_new=True)
             await _send_below_menu(
                 context,
                 chat_id,
@@ -3735,7 +3753,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pf.setdefault("items", [])
             pf["items"].insert(idx, item)
             save_state()
-            await pf_refresh_menu(context, chat_id)
+            await pf_refresh_menu(context, chat_id, force_new=True)
             sym = item.get("simbolo") if isinstance(item, dict) else None
             label = _label_long(sym) if sym else (item.get("tipo", "Instrumento").upper() if isinstance(item, dict) else "Instrumento")
             await _send_below_menu(context, chat_id, text=f"Se restauró: {label}.")
@@ -3756,7 +3774,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             removed = items.pop(idx)
             stack.append({"index": idx, "item": copy.deepcopy(removed)})
             save_state()
-            await pf_refresh_menu(context, chat_id)
+            await pf_refresh_menu(context, chat_id, force_new=True)
             sym = removed.get("simbolo") if isinstance(removed, dict) else None
             label = _label_long(sym) if sym else (removed.get("tipo", "Instrumento").upper() if isinstance(removed, dict) else "Instrumento")
             await _send_below_menu(
@@ -3827,7 +3845,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pf_base = pf["base"]["moneda"].upper()
         f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
         await update.message.reply_text(f"Monto fijado: {f_money(v)} · Restante: {_restante_str(usado)}")
-        await pf_refresh_menu(context, chat_id)
+        await pf_refresh_menu(context, chat_id, force_new=True)
         context.user_data["pf_mode"]=None; return
 
     # Alta por cantidad/importe/% (símbolo ya elegido)
@@ -3935,7 +3953,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         base_label = _label_long(sym if not sym.endswith("-USD") else sym.replace("-USD"," (USD)"))
         det = f"Agregado {base_label} {qty_str}{unit_px_str}{total_str}.\nRestante: {restante_str}"
         await update.message.reply_text(det)
-        await pf_refresh_menu(context, chat_id)
+        await pf_refresh_menu(context, chat_id, force_new=True)
         context.user_data["pf_mode"]=None; return
 
     # Ediciones
@@ -4024,7 +4042,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         usado = await _pf_total_usado(chat_id)
         f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
         await update.message.reply_text("Actualizado ✅ · Restante: " + f_money(max(0.0, pf["monto"]-usado)))
-        await pf_refresh_menu(context, chat_id)
+        await pf_refresh_menu(context, chat_id, force_new=True)
         context.user_data["pf_mode"]=None; return
 
 # --- Composición: texto + torta (debajo del menú) ---
@@ -4284,9 +4302,9 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
     fig, (ax_pie, ax_info) = plt.subplots(
         1,
         2,
-        figsize=(10, 6),
+        figsize=(13, 6.5),
         dpi=200,
-        gridspec_kw={"width_ratios": [3, 2]},
+        gridspec_kw={"width_ratios": [3.6, 2.4]},
     )
 
     cmap = plt.get_cmap("tab20c")
@@ -4309,7 +4327,7 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
 
     for text in autotexts:
         text.set_color("#1a1a1a")
-        text.set_fontsize(9)
+        text.set_fontsize(8)
 
     ax_pie.text(
         0,
@@ -4325,15 +4343,32 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
     ax_pie.axis("off")
 
     ax_info.axis("off")
-    ax_info.set_xlim(0, 1.05)
+    ax_info.set_xlim(0, 1.45)
     ax_info.set_ylim(0, 1)
 
-    ax_info.text(0.02, 0.95, "Detalle por instrumento", fontsize=12, fontweight="bold", va="center")
+    ax_info.text(
+        0.02,
+        0.95,
+        "Detalle por instrumento",
+        fontsize=12,
+        fontweight="bold",
+        va="center",
+        ha="left",
+    )
     headers = ["Instrumento", "%", "Actual", "Invertido", "Variación"]
-    col_x = [0.08, 0.4, 0.66, 0.86, 1.02]
+    col_x = [0.08, 0.38, 0.72, 1.04, 1.32]
+    header_align = ["left", "center", "right", "right", "right"]
     header_y = 0.85
-    for x, header in zip(col_x, headers):
-        ax_info.text(x, header_y, header, fontsize=10, fontweight="bold", va="center")
+    for x, header, align in zip(col_x, headers, header_align):
+        ax_info.text(
+            x,
+            header_y,
+            header,
+            fontsize=10,
+            fontweight="bold",
+            va="center",
+            ha=align,
+        )
 
     n_rows = len(selected_details)
     row_spacing = 0.65 / max(1, n_rows)
@@ -4343,24 +4378,24 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
         pct_value = detail["valor_actual"] / total * 100.0 if total else 0.0
         invertido = detail.get("invertido", 0.0)
         variacion = detail["valor_actual"] - invertido
-        ax_info.scatter(0.03, start_y, color=color, s=80, marker="s")
-        ax_info.text(0.08, start_y, detail["label"], fontsize=9, va="center")
-        ax_info.text(0.4, start_y, pct_plain(pct_value, 1), fontsize=9, va="center")
-        ax_info.text(0.66, start_y, f_money(detail["valor_actual"]), fontsize=9, va="center")
-        ax_info.text(0.86, start_y, f_money(invertido), fontsize=9, va="center")
-        ax_info.text(1.02, start_y, f_money(variacion), fontsize=9, va="center")
+        ax_info.scatter(0.03, start_y, color=color, s=70, marker="s")
+        ax_info.text(0.08, start_y, detail["label"], fontsize=8.5, va="center", ha="left")
+        ax_info.text(0.38, start_y, pct_plain(pct_value, 1), fontsize=8.5, va="center", ha="center")
+        ax_info.text(0.72, start_y, f_money(detail["valor_actual"]), fontsize=8.5, va="center", ha="right")
+        ax_info.text(1.04, start_y, f_money(invertido), fontsize=8.5, va="center", ha="right")
+        ax_info.text(1.32, start_y, f_money(variacion), fontsize=8.5, va="center", ha="right")
         start_y -= row_spacing
 
     ax_info.text(
         0.02,
         max(0.05, start_y),
         f"Total: {f_money(total)} {base_currency}",
-        fontsize=10,
+        fontsize=9.5,
         fontweight="bold",
         va="center",
     )
 
-    fig.subplots_adjust(wspace=0.15)
+    fig.subplots_adjust(wspace=0.25, left=0.04, right=0.98)
 
     fig.suptitle("Composición del Portafolio", fontsize=14, fontweight="bold")
     buf = io.BytesIO()
@@ -4460,171 +4495,137 @@ def _projection_bar_image(
     return buf.read()
 
 
-def _format_signed_money(value: float, money_formatter: Callable[[Optional[float]], str]) -> str:
-    formatted = money_formatter(abs(value))
-    if value > 0:
-        return f"+{formatted}"
-    if value < 0:
-        return f"-{formatted}"
-    return money_formatter(0.0)
-
-
-def _projection_vs_return_image(
-    entries: List[Dict[str, Optional[float]]],
+def _projection_by_instrument_image(
+    points: List[Tuple[str, Optional[float], Optional[float]]],
     title: str,
     subtitle: Optional[str] = None,
-    value_formatter: Optional[Callable[[float], str]] = None,
-    ylabel: str = "Variación %",
-    line_label: str = "Rendimiento actual",
+    formatter: Callable[[float], str] = lambda v: f"{v:+.1f}%",
 ) -> Optional[bytes]:
-    if not HAS_MPL:
+    if not HAS_MPL or np is None:
         return None
 
-    cleaned: List[Dict[str, float]] = []
-    for entry in entries:
-        label = entry.get("label")
-        if not label:
+    cleaned: List[Tuple[str, Optional[float], Optional[float]]] = []
+    for label, val_3m, val_6m in points:
+        if val_3m is None and val_6m is None:
             continue
-        try:
-            proj3 = float(entry["proj3"]) if entry.get("proj3") is not None else math.nan
-        except (TypeError, ValueError):
-            proj3 = math.nan
-        try:
-            proj6 = float(entry["proj6"]) if entry.get("proj6") is not None else math.nan
-        except (TypeError, ValueError):
-            proj6 = math.nan
-        try:
-            actual = float(entry["actual"]) if entry.get("actual") is not None else math.nan
-        except (TypeError, ValueError):
-            actual = math.nan
-
-        if math.isnan(actual) and math.isnan(proj3) and math.isnan(proj6):
-            continue
-        cleaned.append(
-            {
-                "label": str(label),
-                "proj3": proj3,
-                "proj6": proj6,
-                "actual": actual,
-            }
-        )
+        cleaned.append((label, val_3m, val_6m))
 
     if not cleaned:
         return None
 
-    labels = [entry["label"] for entry in cleaned]
-    proj3_vals = [entry["proj3"] for entry in cleaned]
-    proj6_vals = [entry["proj6"] for entry in cleaned]
-    actual_vals = [entry["actual"] for entry in cleaned]
+    labels: List[str] = []
+    values_3m: List[float] = []
+    values_6m: List[float] = []
+    missing_3m: List[bool] = []
+    missing_6m: List[bool] = []
+    for label, val_3m, val_6m in cleaned:
+        labels.append(label)
+        missing_3m.append(val_3m is None)
+        missing_6m.append(val_6m is None)
+        values_3m.append(val_3m if val_3m is not None else 0.0)
+        values_6m.append(val_6m if val_6m is not None else 0.0)
 
-    has_proj3 = any(not math.isnan(val) for val in proj3_vals)
-    has_proj6 = any(not math.isnan(val) for val in proj6_vals)
+    all_values = [abs(v) for v, miss in zip(values_3m, missing_3m) if not miss]
+    all_values += [abs(v) for v, miss in zip(values_6m, missing_6m) if not miss]
+    max_abs = max(all_values) if all_values else 0.0
+    if max_abs <= 0:
+        max_abs = 1.0
 
     x = np.arange(len(labels))
-    width = 0.34 if has_proj3 and has_proj6 else 0.44
+    width = 0.28
+    gap = 0.09
 
-    fig, ax = plt.subplots(figsize=(7.5, 4.5), dpi=180)
-    fig.patch.set_facecolor("#f8f9fb")
-    ax.set_facecolor("#f8f9fb")
+    def _color(val: float, missing: bool, is_longer: bool) -> str:
+        if missing:
+            return "#c3c7cf" if not is_longer else "#a1a6ad"
+        if val > 0:
+            return "#8fd694" if not is_longer else "#2c7d3b"
+        if val < 0:
+            return "#f28b82" if not is_longer else "#c5221f"
+        return "#c3c7cf" if not is_longer else "#a1a6ad"
 
-    bar_series: List[Tuple[Any, np.ndarray]] = []
-
-    formatter = value_formatter or (lambda v: f"{v:+.1f}%")
-
-    if has_proj3:
-        offset = -width / 2 if has_proj6 else 0.0
-        heights = np.array(proj3_vals, dtype=float)
-        bars = ax.bar(
-            x + offset,
-            heights,
-            width=width,
-            label="Proyección 3M",
-            color="#3b82f6",
-            alpha=0.85,
-        )
-        bar_series.append((bars, heights))
-
-    if has_proj6:
-        offset = width / 2 if has_proj3 else 0.0
-        heights = np.array(proj6_vals, dtype=float)
-        bars = ax.bar(
-            x + offset,
-            heights,
-            width=width,
-            label="Proyección 6M",
-            color="#60a5fa",
-            alpha=0.85,
-        )
-        bar_series.append((bars, heights))
-
-    actual_arr = np.array(actual_vals, dtype=float)
-    masked_actual = np.ma.masked_invalid(actual_arr)
-    ax.plot(
-        x,
-        masked_actual,
-        color="#1d4ed8",
-        marker="o",
-        markersize=6,
-        linewidth=2.2,
-        label=line_label,
-        markerfacecolor="#ffffff",
-        markeredgewidth=1.6,
-        zorder=3,
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=160)
+    bars_3m = ax.bar(
+        x - (width / 2 + gap / 2),
+        values_3m,
+        width,
+        color=[_color(v, miss, False) for v, miss in zip(values_3m, missing_3m)],
+        edgecolor="#ffffff",
+        linewidth=0.6,
+        label="3M",
+    )
+    bars_6m = ax.bar(
+        x + (width / 2 + gap / 2),
+        values_6m,
+        width,
+        color=[_color(v, miss, True) for v, miss in zip(values_6m, missing_6m)],
+        edgecolor="#ffffff",
+        linewidth=0.6,
+        label="6M",
     )
 
-    for bars, heights in bar_series:
-        for rect, val in zip(bars, heights):
-            if math.isnan(val):
-                continue
-            height = rect.get_height()
-            offset = max(1.0, abs(height) * 0.08)
-            if height >= 0:
-                y = height + offset
-                va = "bottom"
-            else:
-                y = height - offset
-                va = "top"
-            ax.text(
-                rect.get_x() + rect.get_width() / 2,
-                y,
-                formatter(val),
-                ha="center",
-                va=va,
-                fontsize=8,
-                color="#1a1a1a",
-            )
+    outer_offset = max_abs * 0.08
+    inner_offset = max_abs * 0.06
 
-    for xi, val in zip(x, actual_arr):
-        if math.isnan(val):
-            continue
-        offset = max(1.0, abs(val) * 0.08)
-        if val >= 0:
-            y = val + offset
+    def _annotate_bar(bar, val: float, missing: bool) -> None:
+        height = bar.get_height()
+        text = "N/D" if missing else formatter(val)
+        if missing:
+            y = height + outer_offset
             va = "bottom"
+            color = "#1a1a1a"
+        elif val > 0:
+            if height > max_abs * 0.18:
+                y = height - inner_offset
+                va = "top"
+                color = "#ffffff"
+            else:
+                y = height + outer_offset
+                va = "bottom"
+                color = "#1a1a1a"
+        elif val < 0:
+            if abs(height) > max_abs * 0.18:
+                y = height + inner_offset
+                va = "bottom"
+                color = "#ffffff"
+            else:
+                y = height - outer_offset
+                va = "top"
+                color = "#1a1a1a"
         else:
-            y = val - offset
-            va = "top"
+            y = height + outer_offset
+            va = "bottom"
+            color = "#1a1a1a"
+
         ax.text(
-            xi,
+            bar.get_x() + bar.get_width() / 2,
             y,
-            formatter(val),
+            text,
             ha="center",
             va=va,
             fontsize=8,
-            color="#1a1a1a",
+            color=color,
         )
+
+    for bar, val, miss in zip(bars_3m, values_3m, missing_3m):
+        _annotate_bar(bar, val, miss)
+    for bar, val, miss in zip(bars_6m, values_6m, missing_6m):
+        _annotate_bar(bar, val, miss)
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=15, ha="right")
-    ax.set_ylabel(ylabel)
+    ax.axhline(0, color="#4a4a4a", linewidth=0.8)
+    ax.set_ylabel("Variación %")
     ax.set_title(title + (f"\n{subtitle}" if subtitle else ""))
-
-    ax.legend()
-    ax.grid(axis="y", linestyle="--", linewidth=0.6, alpha=0.5)
-    ax.axhline(0, color="#d1d5db", linewidth=0.9)
+    ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.4)
     ax.set_axisbelow(True)
+    ax.legend()
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
+
+    ax.set_ylim(-max_abs * 1.25, max_abs * 1.25)
+
+    ax.margins(x=0.08)
 
     fig.tight_layout()
     buf = io.BytesIO()
@@ -4661,7 +4662,7 @@ def _return_bar_image(
     if max_abs <= 0:
         max_abs = 1.0
 
-    fig, ax = plt.subplots(figsize=(6, 4), dpi=160)
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=160)
     colors = []
     for val in values:
         if val > 0:
@@ -4714,7 +4715,8 @@ def _return_bar_image(
         )
 
     ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
+    ax.margins(x=0.05)
     ax.axhline(0, color="#4a4a4a", linewidth=0.8)
     ax.set_ylabel("Variación %")
     ax.set_title(title + (f"\n{subtitle}" if subtitle else ""))
@@ -4782,6 +4784,7 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     img = _pie_image_from_items(pf, snapshot)
     if img:
         await _send_below_menu(context, chat_id, photo_bytes=img)
+    await pf_refresh_menu(context, chat_id, force_new=True)
 
 # --- Rendimiento (debajo del menú) ---
 
@@ -4866,22 +4869,6 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
 
     await _send_below_menu(context, chat_id, text="\n".join(lines))
 
-    total_pct = (delta_t / total_invertido * 100.0) if total_invertido > 0 else None
-    if total_pct is not None:
-        return_points.append(("Portafolio", total_pct))
-    if has_daily_data:
-        daily_points.append(("Portafolio", daily_sum if daily_sum is not None else None))
-
-    if return_points:
-        img = _return_bar_image(
-            return_points,
-            "Rendimiento por instrumento",
-            "Variación acumulada vs. invertido",
-            formatter=lambda v: f"{v:+.1f}%",
-        )
-        if img:
-            await _send_below_menu(context, chat_id, photo_bytes=img)
-
     cleaned_daily = [pt for pt in daily_points if pt[1] is not None]
     if cleaned_daily:
         daily_img = _return_bar_image(
@@ -4892,6 +4879,17 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         )
         if daily_img:
             await _send_below_menu(context, chat_id, photo_bytes=daily_img)
+
+    if return_points:
+        img = _return_bar_image(
+            return_points,
+            "Rendimiento por instrumento",
+            "Variación acumulada vs. invertido",
+            formatter=lambda v: f"{v:+.1f}%",
+        )
+        if img:
+            await _send_below_menu(context, chat_id, photo_bytes=img)
+    await pf_refresh_menu(context, chat_id, force_new=True)
 
 # --- Proyección (debajo del menú) ---
 
@@ -4910,9 +4908,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     w3 = 0.0
     w6 = 0.0
     detail: List[str] = []
-    comparison_points: List[Dict[str, Optional[float]]] = []
-    profit_points: List[Dict[str, Optional[float]]] = []
-    has_projection_data = False
+    per_instrument_points: List[Tuple[str, Optional[float], Optional[float]]] = []
     for entry in snapshot:
         metrics = entry.get('metrics') or {}
         weight = entry.get('peso') or 0.0
@@ -4924,6 +4920,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         w3 += weight * p3
         w6 += weight * p6
         short_label = _label_short(entry['symbol']) if entry.get('symbol') else entry['label']
+        per_instrument_points.append((short_label, p3, p6))
         if detail:
             detail.append("")
         extras = [f"peso {pct_plain(weight*100.0,1)}"]
@@ -5002,80 +4999,14 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     if img:
         await _send_below_menu(context, chat_id, photo_bytes=img)
 
-    comparison_clean: List[Dict[str, Optional[float]]] = []
-    for pt in comparison_points:
-        raw_actual = pt.get("actual")
-        try:
-            actual_val = float(raw_actual) if raw_actual is not None else math.nan
-        except (TypeError, ValueError):
-            actual_val = math.nan
-        if math.isnan(actual_val):
-            continue
-        if pt.get("proj3") is None and pt.get("proj6") is None:
-            continue
-        cleaned_entry = dict(pt)
-        cleaned_entry["actual"] = actual_val
-        comparison_clean.append(cleaned_entry)
-    if comparison_clean:
-        comp_img = _projection_vs_return_image(
-            comparison_clean,
-            "Proyección vs. rendimiento por instrumento",
-            "Variaciones estimadas vs. reales",
-        )
-        if comp_img:
-            await _send_below_menu(context, chat_id, photo_bytes=comp_img)
-
-    money_formatter = lambda v: _format_signed_money(v, f_money)
-
-    profit_clean: List[Dict[str, float]] = []
-    for pt in profit_points:
-        try:
-            actual_val = float(pt.get("actual")) if pt.get("actual") is not None else math.nan
-        except (TypeError, ValueError):
-            actual_val = math.nan
-        if math.isnan(actual_val):
-            continue
-        entry = {"label": pt.get("label", ""), "actual": actual_val}
-        for key in ("proj3", "proj6"):
-            try:
-                entry[key] = float(pt.get(key)) if pt.get(key) is not None else math.nan
-            except (TypeError, ValueError):
-                entry[key] = math.nan
-        profit_clean.append(entry)
-
-    if profit_clean:
-        profit_img = _projection_vs_return_image(
-            profit_clean,
-            "Ganancia proyectada vs. actual por instrumento",
-            f"Montos estimados en {pf_base}",
-            value_formatter=money_formatter,
-            ylabel=f"Ganancias / pérdidas ({pf_base})",
-            line_label="Ganancia actual",
-        )
-        if profit_img:
-            await _send_below_menu(context, chat_id, photo_bytes=profit_img)
-
-    if has_projection_data and not math.isnan(total_pct):
-        total_profit = total_actual - total_invertido
-        total_proj3 = total_actual * (w3 / 100.0)
-        total_proj6 = total_actual * (w6 / 100.0)
-        overall_img = _projection_vs_return_image(
-            [
-                {
-                    "label": "Portafolio",
-                    "proj3": total_proj3,
-                    "proj6": total_proj6,
-                    "actual": total_profit,
-                }
-            ],
-            "Ganancia proyectada vs. actual del portafolio",
-            f"Montos estimados en {pf_base}",
-            value_formatter=money_formatter,
-            ylabel=f"Ganancias / pérdidas ({pf_base})",
-            line_label="Ganancia actual",
-        )
-        if overall_img:
-            await _send_below_menu(context, chat_id, photo_bytes=overall_img)
+    per_instrument_img = _projection_by_instrument_image(
+        per_instrument_points,
+        "Proyección por instrumento",
+        "Variación porcentual esperada",
+    )
+    if per_instrument_img:
+        await _send_below_menu(context, chat_id, photo_bytes=per_instrument_img)
+    await pf_refresh_menu(context, chat_id, force_new=True)
 
 # ============================ RESUMEN DIARIO ============================
 
