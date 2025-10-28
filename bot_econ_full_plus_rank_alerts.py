@@ -109,6 +109,10 @@ def _crypto_to_symbol(cname: str) -> str: return f"{cname}-USD"
 BINANCE_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
 BINANCE_TICKER_PRICE_URLS = [
     "https://api.binance.com/api/v3/ticker/price",
+    "https://api1.binance.com/api/v3/ticker/price",
+    "https://api2.binance.com/api/v3/ticker/price",
+    "https://api3.binance.com/api/v3/ticker/price",
+    "https://api-gcp.binance.com/api/v3/ticker/price",
     "https://data.binance.com/api/v3/ticker/price",
     "https://www.binance.com/api/v3/ticker/price",
     "https://api.binance.us/api/v3/ticker/price",
@@ -640,8 +644,13 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
     try:
         timeout = kwargs.pop("timeout", ClientTimeout(total=15))
         headers = kwargs.pop("headers", {})
-        async with session.get(url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs) as resp:
-            if resp.status == 200:
+        async with session.get(
+            url,
+            timeout=timeout,
+            headers={**REQ_HEADERS, **headers},
+            **kwargs,
+        ) as resp:
+            if 200 <= resp.status < 300:
                 return await resp.json(content_type=None)
             log.warning("GET %s -> %s", url, resp.status)
     except Exception as e:
