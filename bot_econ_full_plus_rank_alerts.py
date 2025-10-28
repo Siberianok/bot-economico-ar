@@ -4460,6 +4460,150 @@ def _projection_bar_image(
     return buf.read()
 
 
+def _projection_vs_return_image(
+    entries: List[Dict[str, Optional[float]]],
+    title: str,
+    subtitle: Optional[str] = None,
+) -> Optional[bytes]:
+    if not HAS_MPL:
+        return None
+
+    cleaned: List[Dict[str, float]] = []
+    for entry in entries:
+        label = entry.get("label")
+        if not label:
+            continue
+        try:
+            proj3 = float(entry["proj3"]) if entry.get("proj3") is not None else math.nan
+        except (TypeError, ValueError):
+            proj3 = math.nan
+        try:
+            proj6 = float(entry["proj6"]) if entry.get("proj6") is not None else math.nan
+        except (TypeError, ValueError):
+            proj6 = math.nan
+        try:
+            actual = float(entry["actual"]) if entry.get("actual") is not None else math.nan
+        except (TypeError, ValueError):
+            actual = math.nan
+
+        if math.isnan(actual) and math.isnan(proj3) and math.isnan(proj6):
+            continue
+        cleaned.append(
+            {
+                "label": str(label),
+                "proj3": proj3,
+                "proj6": proj6,
+                "actual": actual,
+            }
+        )
+
+    if not cleaned:
+        return None
+
+    labels = [entry["label"] for entry in cleaned]
+    proj3_vals = [entry["proj3"] for entry in cleaned]
+    proj6_vals = [entry["proj6"] for entry in cleaned]
+    actual_vals = [entry["actual"] for entry in cleaned]
+
+    has_proj3 = any(not math.isnan(val) for val in proj3_vals)
+    has_proj6 = any(not math.isnan(val) for val in proj6_vals)
+
+    x = np.arange(len(labels))
+    width = 0.34 if has_proj3 and has_proj6 else 0.44
+
+    fig, ax = plt.subplots(figsize=(7.5, 4.5), dpi=180)
+
+    bar_series: List[Tuple[Any, np.ndarray]] = []
+
+    if has_proj3:
+        offset = -width / 2 if has_proj6 else 0.0
+        heights = np.array(proj3_vals, dtype=float)
+        bars = ax.bar(
+            x + offset,
+            heights,
+            width=width,
+            label="Proyección 3M",
+            color="#3478bc",
+            alpha=0.85,
+        )
+        bar_series.append((bars, heights))
+
+    if has_proj6:
+        offset = width / 2 if has_proj3 else 0.0
+        heights = np.array(proj6_vals, dtype=float)
+        bars = ax.bar(
+            x + offset,
+            heights,
+            width=width,
+            label="Proyección 6M",
+            color="#34a853",
+            alpha=0.85,
+        )
+        bar_series.append((bars, heights))
+
+    actual_arr = np.array(actual_vals, dtype=float)
+    ax.plot(x, actual_arr, color="#1a1a1a", marker="o", linewidth=2, label="Rendimiento actual")
+
+    for bars, heights in bar_series:
+        for rect, val in zip(bars, heights):
+            if math.isnan(val):
+                continue
+            height = rect.get_height()
+            offset = max(1.0, abs(height) * 0.08)
+            if height >= 0:
+                y = height + offset
+                va = "bottom"
+            else:
+                y = height - offset
+                va = "top"
+            ax.text(
+                rect.get_x() + rect.get_width() / 2,
+                y,
+                f"{val:+.1f}%",
+                ha="center",
+                va=va,
+                fontsize=8,
+                color="#1a1a1a",
+            )
+
+    for xi, val in zip(x, actual_arr):
+        if math.isnan(val):
+            continue
+        offset = max(1.0, abs(val) * 0.08)
+        if val >= 0:
+            y = val + offset
+            va = "bottom"
+        else:
+            y = val - offset
+            va = "top"
+        ax.text(
+            xi,
+            y,
+            f"{val:+.1f}%",
+            ha="center",
+            va=va,
+            fontsize=8,
+            color="#1a1a1a",
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.set_ylabel("Variación %")
+    ax.set_title(title + (f"\n{subtitle}" if subtitle else ""))
+
+    ax.legend()
+    ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
 def _return_bar_image(
     points: List[Tuple[str, Optional[float]]],
     title: str,
@@ -4725,7 +4869,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     pf = pf_get(chat_id)
     if not pf["items"]:
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Agregá instrumentos primero."); return
-    snapshot, last_ts, _, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
+    snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
     if total_actual <= 0:
         await _send_below_menu(context, chat_id, text="Sin valores suficientes para proyectar."); return
 
@@ -4736,11 +4880,14 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     w3 = 0.0
     w6 = 0.0
     detail: List[str] = []
+    comparison_points: List[Dict[str, Optional[float]]] = []
+    has_projection_data = False
     for entry in snapshot:
         metrics = entry.get('metrics') or {}
         weight = entry.get('peso') or 0.0
         if not metrics:
             continue
+        has_projection_data = True
         p3 = projection_3m(metrics)
         p6 = projection_6m(metrics)
         w3 += weight * p3
@@ -4756,8 +4903,21 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
             f"• {short_label} → 3M {pct(p3,2)} | 6M {pct(p6,2)} (" + " · ".join(extras) + ")"
         )
 
+        invertido = float(entry.get('invertido') or 0.0)
+        valor_actual = float(entry.get('valor_actual') or 0.0)
+        actual_pct = ((valor_actual / invertido) - 1.0) * 100.0 if invertido > 0 else None
+        comparison_points.append(
+            {
+                "label": short_label,
+                "proj3": p3,
+                "proj6": p6,
+                "actual": actual_pct,
+            }
+        )
+
     forecast3 = total_actual * (1.0 + w3/100.0)
     forecast6 = total_actual * (1.0 + w6/100.0)
+    total_pct = ((total_actual / total_invertido) - 1.0) * 100.0 if total_invertido > 0 else math.nan
 
     header = "<b>🔮 Proyección del Portafolio</b>"
     if fecha:
@@ -4798,6 +4958,45 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     )
     if img:
         await _send_below_menu(context, chat_id, photo_bytes=img)
+
+    comparison_clean: List[Dict[str, Optional[float]]] = []
+    for pt in comparison_points:
+        raw_actual = pt.get("actual")
+        try:
+            actual_val = float(raw_actual) if raw_actual is not None else math.nan
+        except (TypeError, ValueError):
+            actual_val = math.nan
+        if math.isnan(actual_val):
+            continue
+        if pt.get("proj3") is None and pt.get("proj6") is None:
+            continue
+        cleaned_entry = dict(pt)
+        cleaned_entry["actual"] = actual_val
+        comparison_clean.append(cleaned_entry)
+    if comparison_clean:
+        comp_img = _projection_vs_return_image(
+            comparison_clean,
+            "Proyección vs. rendimiento por instrumento",
+            "Variaciones estimadas vs. reales",
+        )
+        if comp_img:
+            await _send_below_menu(context, chat_id, photo_bytes=comp_img)
+
+    if has_projection_data and not math.isnan(total_pct):
+        overall_img = _projection_vs_return_image(
+            [
+                {
+                    "label": "Portafolio",
+                    "proj3": w3,
+                    "proj6": w6,
+                    "actual": total_pct,
+                }
+            ],
+            "Proyección vs. rendimiento del portafolio",
+            "Variaciones porcentuales acumuladas",
+        )
+        if overall_img:
+            await _send_below_menu(context, chat_id, photo_bytes=overall_img)
 
 # ============================ RESUMEN DIARIO ============================
 
