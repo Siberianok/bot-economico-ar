@@ -610,6 +610,15 @@ def format_quantity(sym: str, qty: Optional[float]) -> Optional[str]:
     except Exception:
         return str(qty) if qty is not None else None
 
+def format_added_date(ts: Optional[int]) -> Optional[str]:
+    if ts in (None, 0):
+        return None
+    try:
+        dt = datetime.fromtimestamp(int(ts), TZ)
+    except Exception:
+        return None
+    return dt.strftime("%d/%m/%Y")
+
 def anchor(href: str, text: str) -> str: return f'<a href="{_html.escape(href, True)}">{_html.escape(text)}</a>'
 def html_op(op: str) -> str: return "↑" if op == ">" else "↓"
 def pad(s: str, width: int) -> str: s=s[:width]; return s+(" "*(width-len(s)))
@@ -3383,6 +3392,8 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "fecha_valuacion",
             "item_fx_rate",
             "item_fx_timestamp",
+            "fecha_alta",
+            "added_timestamp",
         ])
         fecha_val = datetime.fromtimestamp(last_ts, TZ).strftime("%Y-%m-%d") if last_ts else ""
         tc_fecha = datetime.fromtimestamp(tc_ts, TZ).strftime("%Y-%m-%d %H:%M") if tc_ts else ""
@@ -3392,6 +3403,12 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             item_fx_rate = entry.get("fx_rate")
             item_fx_ts = entry.get("fx_ts")
             item_fx_fecha = datetime.fromtimestamp(item_fx_ts, TZ).strftime("%Y-%m-%d %H:%M") if item_fx_ts else ""
+            added_ts_raw = entry.get("raw", {}).get("added_ts") if entry.get("raw") else entry.get("added_ts")
+            try:
+                added_ts = int(added_ts_raw) if added_ts_raw is not None else None
+            except (TypeError, ValueError):
+                added_ts = None
+            added_fecha = datetime.fromtimestamp(added_ts, TZ).strftime("%Y-%m-%d %H:%M") if added_ts else ""
             writer.writerow([
                 sym,
                 entry.get("label") or sym or entry.get("tipo") or "",
@@ -3407,6 +3424,8 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 fecha_val,
                 item_fx_rate if item_fx_rate is not None else "",
                 item_fx_fecha,
+                added_fecha,
+                added_ts if added_ts is not None else "",
             ])
         csv_bytes = buf.getvalue().encode("utf-8")
         filename = f"portafolio_{datetime.now(TZ).strftime('%Y%m%d_%H%M')}.csv"
@@ -3702,6 +3721,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if needs_fx:
             item["fx_rate"] = float(fx_rate_used) if fx_rate_used is not None else tc_val if tc_val is not None else None
             item["fx_ts"] = fx_ts_used
+        item["added_ts"] = int(time())
         pf["items"].append(item); save_state()
 
         pf_base = pf["base"]["moneda"].upper()
@@ -3865,6 +3885,11 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             fx_ts_item = int(fx_ts_raw) if fx_ts_raw is not None else None
         except (TypeError, ValueError):
             fx_ts_item = None
+        added_ts_raw = it.get("added_ts")
+        try:
+            added_ts = int(added_ts_raw) if added_ts_raw is not None else None
+        except (TypeError, ValueError):
+            added_ts = None
         effective_tc = fx_rate_item if fx_rate_item is not None else tc_val
         effective_ts = fx_ts_item if fx_rate_item is not None else tc_ts
         price_native = met.get("last_px") if met else None
@@ -3894,6 +3919,7 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             "daily_change": met.get("last_chg") if met else None,
             "fx_rate": effective_tc,
             "fx_ts": effective_ts,
+            "added_ts": added_ts,
         })
 
     for entry in enriched:
@@ -4371,6 +4397,9 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             linea += f" · Cant: {qty_txt}"
         if entry.get('peso'):
             linea += f" · Peso: {pct_plain(entry['peso']*100.0,1)}"
+        added_str = format_added_date(entry.get('added_ts'))
+        if added_str:
+            linea += f" · Desde: {added_str}"
         lines.append(linea)
     if not HAS_MPL:
         lines.append("")
@@ -4433,6 +4462,9 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
             detail += f" · Día: {pct(daily,2)}"
         if entry.get('peso'):
             detail += f" · Peso: {pct_plain(entry['peso']*100.0,1)}"
+        added_str = format_added_date(entry.get('added_ts'))
+        if added_str:
+            detail += f" · Desde: {added_str}"
         lines.append(detail)
 
         short_label = _label_short(entry['symbol']) if entry.get('symbol') else label
@@ -4517,7 +4549,13 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         short_label = _label_short(entry['symbol']) if entry.get('symbol') else entry['label']
         if detail:
             detail.append("")
-        detail.append(f"• {short_label} → 3M {pct(p3,2)} | 6M {pct(p6,2)} (peso {pct_plain(weight*100.0,1)})")
+        extras = [f"peso {pct_plain(weight*100.0,1)}"]
+        added_str = format_added_date(entry.get('added_ts'))
+        if added_str:
+            extras.append(f"desde {added_str}")
+        detail.append(
+            f"• {short_label} → 3M {pct(p3,2)} | 6M {pct(p6,2)} (" + " · ".join(extras) + ")"
+        )
 
     forecast3 = total_actual * (1.0 + w3/100.0)
     forecast6 = total_actual * (1.0 + w6/100.0)
