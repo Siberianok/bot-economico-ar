@@ -4328,12 +4328,29 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
     ax_info.set_xlim(0, 1.05)
     ax_info.set_ylim(0, 1)
 
-    ax_info.text(0.02, 0.95, "Detalle por instrumento", fontsize=12, fontweight="bold", va="center")
+    ax_info.text(
+        0.02,
+        0.95,
+        "Detalle por instrumento",
+        fontsize=12,
+        fontweight="bold",
+        va="center",
+        ha="left",
+    )
     headers = ["Instrumento", "%", "Actual", "Invertido", "Variación"]
-    col_x = [0.08, 0.4, 0.66, 0.86, 1.02]
+    col_x = [0.08, 0.48, 0.72, 0.9, 1.02]
+    header_align = ["left", "center", "right", "right", "right"]
     header_y = 0.85
-    for x, header in zip(col_x, headers):
-        ax_info.text(x, header_y, header, fontsize=10, fontweight="bold", va="center")
+    for x, header, align in zip(col_x, headers, header_align):
+        ax_info.text(
+            x,
+            header_y,
+            header,
+            fontsize=10,
+            fontweight="bold",
+            va="center",
+            ha=align,
+        )
 
     n_rows = len(selected_details)
     row_spacing = 0.65 / max(1, n_rows)
@@ -4344,11 +4361,11 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
         invertido = detail.get("invertido", 0.0)
         variacion = detail["valor_actual"] - invertido
         ax_info.scatter(0.03, start_y, color=color, s=80, marker="s")
-        ax_info.text(0.08, start_y, detail["label"], fontsize=9, va="center")
-        ax_info.text(0.4, start_y, pct_plain(pct_value, 1), fontsize=9, va="center")
-        ax_info.text(0.66, start_y, f_money(detail["valor_actual"]), fontsize=9, va="center")
-        ax_info.text(0.86, start_y, f_money(invertido), fontsize=9, va="center")
-        ax_info.text(1.02, start_y, f_money(variacion), fontsize=9, va="center")
+        ax_info.text(0.08, start_y, detail["label"], fontsize=9, va="center", ha="left")
+        ax_info.text(0.48, start_y, pct_plain(pct_value, 1), fontsize=9, va="center", ha="center")
+        ax_info.text(0.72, start_y, f_money(detail["valor_actual"]), fontsize=9, va="center", ha="right")
+        ax_info.text(0.9, start_y, f_money(invertido), fontsize=9, va="center", ha="right")
+        ax_info.text(1.02, start_y, f_money(variacion), fontsize=9, va="center", ha="right")
         start_y -= row_spacing
 
     ax_info.text(
@@ -4460,141 +4477,129 @@ def _projection_bar_image(
     return buf.read()
 
 
-def _projection_vs_return_image(
-    entries: List[Dict[str, Optional[float]]],
+def _projection_by_instrument_image(
+    points: List[Tuple[str, Optional[float], Optional[float]]],
     title: str,
     subtitle: Optional[str] = None,
+    formatter: Callable[[float], str] = lambda v: f"{v:+.1f}%",
 ) -> Optional[bytes]:
-    if not HAS_MPL:
+    if not HAS_MPL or np is None:
         return None
 
-    cleaned: List[Dict[str, float]] = []
-    for entry in entries:
-        label = entry.get("label")
-        if not label:
+    cleaned: List[Tuple[str, Optional[float], Optional[float]]] = []
+    for label, val_3m, val_6m in points:
+        if val_3m is None and val_6m is None:
             continue
-        try:
-            proj3 = float(entry["proj3"]) if entry.get("proj3") is not None else math.nan
-        except (TypeError, ValueError):
-            proj3 = math.nan
-        try:
-            proj6 = float(entry["proj6"]) if entry.get("proj6") is not None else math.nan
-        except (TypeError, ValueError):
-            proj6 = math.nan
-        try:
-            actual = float(entry["actual"]) if entry.get("actual") is not None else math.nan
-        except (TypeError, ValueError):
-            actual = math.nan
-
-        if math.isnan(actual) and math.isnan(proj3) and math.isnan(proj6):
-            continue
-        cleaned.append(
-            {
-                "label": str(label),
-                "proj3": proj3,
-                "proj6": proj6,
-                "actual": actual,
-            }
-        )
+        cleaned.append((label, val_3m, val_6m))
 
     if not cleaned:
         return None
 
-    labels = [entry["label"] for entry in cleaned]
-    proj3_vals = [entry["proj3"] for entry in cleaned]
-    proj6_vals = [entry["proj6"] for entry in cleaned]
-    actual_vals = [entry["actual"] for entry in cleaned]
+    labels: List[str] = []
+    values_3m: List[float] = []
+    values_6m: List[float] = []
+    missing_3m: List[bool] = []
+    missing_6m: List[bool] = []
+    for label, val_3m, val_6m in cleaned:
+        labels.append(label)
+        missing_3m.append(val_3m is None)
+        missing_6m.append(val_6m is None)
+        values_3m.append(val_3m if val_3m is not None else 0.0)
+        values_6m.append(val_6m if val_6m is not None else 0.0)
 
-    has_proj3 = any(not math.isnan(val) for val in proj3_vals)
-    has_proj6 = any(not math.isnan(val) for val in proj6_vals)
+    all_values = [abs(v) for v, miss in zip(values_3m, missing_3m) if not miss]
+    all_values += [abs(v) for v, miss in zip(values_6m, missing_6m) if not miss]
+    max_abs = max(all_values) if all_values else 0.0
+    if max_abs <= 0:
+        max_abs = 1.0
 
     x = np.arange(len(labels))
-    width = 0.34 if has_proj3 and has_proj6 else 0.44
+    width = 0.38
 
-    fig, ax = plt.subplots(figsize=(7.5, 4.5), dpi=180)
+    def _color(val: float, missing: bool) -> str:
+        if missing:
+            return "#9aa0a6"
+        if val > 0:
+            return "#34a853"
+        if val < 0:
+            return "#ea4335"
+        return "#9aa0a6"
 
-    bar_series: List[Tuple[Any, np.ndarray]] = []
+    fig, ax = plt.subplots(figsize=(7, 4), dpi=160)
+    bars_3m = ax.bar(
+        x - width / 2,
+        values_3m,
+        width,
+        color=[_color(v, miss) for v, miss in zip(values_3m, missing_3m)],
+        label="3M",
+    )
+    bars_6m = ax.bar(
+        x + width / 2,
+        values_6m,
+        width,
+        color=[_color(v, miss) for v, miss in zip(values_6m, missing_6m)],
+        label="6M",
+    )
 
-    if has_proj3:
-        offset = -width / 2 if has_proj6 else 0.0
-        heights = np.array(proj3_vals, dtype=float)
-        bars = ax.bar(
-            x + offset,
-            heights,
-            width=width,
-            label="Proyección 3M",
-            color="#3478bc",
-            alpha=0.85,
-        )
-        bar_series.append((bars, heights))
+    outer_offset = max_abs * 0.08
+    inner_offset = max_abs * 0.06
 
-    if has_proj6:
-        offset = width / 2 if has_proj3 else 0.0
-        heights = np.array(proj6_vals, dtype=float)
-        bars = ax.bar(
-            x + offset,
-            heights,
-            width=width,
-            label="Proyección 6M",
-            color="#34a853",
-            alpha=0.85,
-        )
-        bar_series.append((bars, heights))
-
-    actual_arr = np.array(actual_vals, dtype=float)
-    ax.plot(x, actual_arr, color="#1a1a1a", marker="o", linewidth=2, label="Rendimiento actual")
-
-    for bars, heights in bar_series:
-        for rect, val in zip(bars, heights):
-            if math.isnan(val):
-                continue
-            height = rect.get_height()
-            offset = max(1.0, abs(height) * 0.08)
-            if height >= 0:
-                y = height + offset
-                va = "bottom"
-            else:
-                y = height - offset
-                va = "top"
-            ax.text(
-                rect.get_x() + rect.get_width() / 2,
-                y,
-                f"{val:+.1f}%",
-                ha="center",
-                va=va,
-                fontsize=8,
-                color="#1a1a1a",
-            )
-
-    for xi, val in zip(x, actual_arr):
-        if math.isnan(val):
-            continue
-        offset = max(1.0, abs(val) * 0.08)
-        if val >= 0:
-            y = val + offset
+    def _annotate_bar(bar, val: float, missing: bool) -> None:
+        height = bar.get_height()
+        text = "N/D" if missing else formatter(val)
+        if missing:
+            y = height + outer_offset
             va = "bottom"
+            color = "#1a1a1a"
+        elif val > 0:
+            if height > max_abs * 0.18:
+                y = height - inner_offset
+                va = "top"
+                color = "#ffffff"
+            else:
+                y = height + outer_offset
+                va = "bottom"
+                color = "#1a1a1a"
+        elif val < 0:
+            if abs(height) > max_abs * 0.18:
+                y = height + inner_offset
+                va = "bottom"
+                color = "#ffffff"
+            else:
+                y = height - outer_offset
+                va = "top"
+                color = "#1a1a1a"
         else:
-            y = val - offset
-            va = "top"
+            y = height + outer_offset
+            va = "bottom"
+            color = "#1a1a1a"
+
         ax.text(
-            xi,
+            bar.get_x() + bar.get_width() / 2,
             y,
-            f"{val:+.1f}%",
+            text,
             ha="center",
             va=va,
             fontsize=8,
-            color="#1a1a1a",
+            color=color,
         )
+
+    for bar, val, miss in zip(bars_3m, values_3m, missing_3m):
+        _annotate_bar(bar, val, miss)
+    for bar, val, miss in zip(bars_6m, values_6m, missing_6m):
+        _annotate_bar(bar, val, miss)
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.axhline(0, color="#4a4a4a", linewidth=0.8)
     ax.set_ylabel("Variación %")
     ax.set_title(title + (f"\n{subtitle}" if subtitle else ""))
-
-    ax.legend()
     ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+    ax.legend()
     for spine in ("top", "right"):
         ax.spines[spine].set_visible(False)
+
+    ax.set_ylim(-max_abs * 1.25, max_abs * 1.25)
 
     fig.tight_layout()
     buf = io.BytesIO()
@@ -4631,7 +4636,7 @@ def _return_bar_image(
     if max_abs <= 0:
         max_abs = 1.0
 
-    fig, ax = plt.subplots(figsize=(6, 4), dpi=160)
+    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=160)
     colors = []
     for val in values:
         if val > 0:
@@ -4684,7 +4689,8 @@ def _return_bar_image(
         )
 
     ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
+    ax.margins(x=0.05)
     ax.axhline(0, color="#4a4a4a", linewidth=0.8)
     ax.set_ylabel("Variación %")
     ax.set_title(title + (f"\n{subtitle}" if subtitle else ""))
@@ -4836,22 +4842,6 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
 
     await _send_below_menu(context, chat_id, text="\n".join(lines))
 
-    total_pct = (delta_t / total_invertido * 100.0) if total_invertido > 0 else None
-    if total_pct is not None:
-        return_points.append(("Portafolio", total_pct))
-    if has_daily_data:
-        daily_points.append(("Portafolio", daily_sum if daily_sum is not None else None))
-
-    if return_points:
-        img = _return_bar_image(
-            return_points,
-            "Rendimiento por instrumento",
-            "Variación acumulada vs. invertido",
-            formatter=lambda v: f"{v:+.1f}%",
-        )
-        if img:
-            await _send_below_menu(context, chat_id, photo_bytes=img)
-
     cleaned_daily = [pt for pt in daily_points if pt[1] is not None]
     if cleaned_daily:
         daily_img = _return_bar_image(
@@ -4862,6 +4852,16 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         )
         if daily_img:
             await _send_below_menu(context, chat_id, photo_bytes=daily_img)
+
+    if return_points:
+        img = _return_bar_image(
+            return_points,
+            "Rendimiento por instrumento",
+            "Variación acumulada vs. invertido",
+            formatter=lambda v: f"{v:+.1f}%",
+        )
+        if img:
+            await _send_below_menu(context, chat_id, photo_bytes=img)
 
 # --- Proyección (debajo del menú) ---
 
@@ -4880,8 +4880,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     w3 = 0.0
     w6 = 0.0
     detail: List[str] = []
-    comparison_points: List[Dict[str, Optional[float]]] = []
-    has_projection_data = False
+    per_instrument_points: List[Tuple[str, Optional[float], Optional[float]]] = []
     for entry in snapshot:
         metrics = entry.get('metrics') or {}
         weight = entry.get('peso') or 0.0
@@ -4893,6 +4892,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         w3 += weight * p3
         w6 += weight * p6
         short_label = _label_short(entry['symbol']) if entry.get('symbol') else entry['label']
+        per_instrument_points.append((short_label, p3, p6))
         if detail:
             detail.append("")
         extras = [f"peso {pct_plain(weight*100.0,1)}"]
@@ -4959,44 +4959,13 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     if img:
         await _send_below_menu(context, chat_id, photo_bytes=img)
 
-    comparison_clean: List[Dict[str, Optional[float]]] = []
-    for pt in comparison_points:
-        raw_actual = pt.get("actual")
-        try:
-            actual_val = float(raw_actual) if raw_actual is not None else math.nan
-        except (TypeError, ValueError):
-            actual_val = math.nan
-        if math.isnan(actual_val):
-            continue
-        if pt.get("proj3") is None and pt.get("proj6") is None:
-            continue
-        cleaned_entry = dict(pt)
-        cleaned_entry["actual"] = actual_val
-        comparison_clean.append(cleaned_entry)
-    if comparison_clean:
-        comp_img = _projection_vs_return_image(
-            comparison_clean,
-            "Proyección vs. rendimiento por instrumento",
-            "Variaciones estimadas vs. reales",
-        )
-        if comp_img:
-            await _send_below_menu(context, chat_id, photo_bytes=comp_img)
-
-    if has_projection_data and not math.isnan(total_pct):
-        overall_img = _projection_vs_return_image(
-            [
-                {
-                    "label": "Portafolio",
-                    "proj3": w3,
-                    "proj6": w6,
-                    "actual": total_pct,
-                }
-            ],
-            "Proyección vs. rendimiento del portafolio",
-            "Variaciones porcentuales acumuladas",
-        )
-        if overall_img:
-            await _send_below_menu(context, chat_id, photo_bytes=overall_img)
+    per_instrument_img = _projection_by_instrument_image(
+        per_instrument_points,
+        "Proyección por instrumento",
+        "Variación porcentual esperada",
+    )
+    if per_instrument_img:
+        await _send_below_menu(context, chat_id, photo_bytes=per_instrument_img)
 
 # ============================ RESUMEN DIARIO ============================
 
