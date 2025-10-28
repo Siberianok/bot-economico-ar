@@ -908,24 +908,61 @@ async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Option
     except: return None
 
 async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str]]]:
-    for suf in ("/riesgo-pais/ultimo", "/riesgo-pais"):
-        base_ok = None
-        for base in ARG_DATOS_BASES:
-            j = await fetch_json(session, base+suf)
-            if j:
-                base_ok = j; break
-        if base_ok:
-            j = base_ok; break
-        else: j = None
-    if isinstance(j, dict):
-        val = j.get("valor"); f = j.get("fecha") or j.get("periodo")
-        try: return (int(float(val)), f) if val is not None else None
-        except Exception: return None
-    if isinstance(j, list) and j:
-        last = j[-1]; val = last.get("valor"); f = last.get("fecha") or last.get("periodo")
-        try: return (int(float(val)), f) if val is not None else None
-        except Exception: return None
-    return None
+    data = await _fetch_rava_profile(session, "riesgo pais")
+    if not data:
+        return None
+
+    val: Optional[float] = None
+    fecha: Optional[str] = None
+
+    quotes = data.get("cotizaciones") if isinstance(data, dict) else None
+    if isinstance(quotes, list) and quotes:
+        row = quotes[0] if isinstance(quotes[0], dict) else None
+        if isinstance(row, dict):
+            raw_val = row.get("ultimo")
+            if raw_val is None:
+                raw_val = row.get("cierre")
+            try:
+                val = float(raw_val) if raw_val is not None else None
+            except (TypeError, ValueError):
+                val = None
+            fecha_raw = row.get("fecha")
+            hora_raw = row.get("hora")
+            if fecha_raw:
+                if hora_raw:
+                    fecha = f"{fecha_raw} {hora_raw}"
+                else:
+                    fecha = str(fecha_raw)
+
+    if val is None:
+        history = data.get("coti_hist") if isinstance(data, dict) else None
+        if isinstance(history, list) and history:
+            last = history[-1] if isinstance(history[-1], dict) else None
+            if isinstance(last, dict):
+                raw_val = last.get("ultimo")
+                if raw_val is None:
+                    raw_val = last.get("cierre")
+                try:
+                    val = float(raw_val) if raw_val is not None else None
+                except (TypeError, ValueError):
+                    val = None
+                ts = last.get("timestamp")
+                if ts:
+                    try:
+                        dt = datetime.fromtimestamp(float(ts), tz=TZ)
+                        fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        fecha = fecha or last.get("fecha")
+                elif last.get("fecha") and not fecha:
+                    fecha = str(last.get("fecha"))
+
+    if val is None:
+        return None
+
+    try:
+        return (int(round(val)), fecha)
+    except Exception:
+        return None
 
 async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
     for suf in ("/inflacion", "/inflacion/mensual/ultimo", "/inflacion/mensual"):

@@ -27,7 +27,7 @@
   Fuente principal: DolarAPI (Ámbito); fallback: CriptoYa.
 - `/reservas` — Reservas BCRA (series oficiales via `apis.datos.gob.ar`).
 - `/inflacion` — Inflación (variación mensual, INDEC via `apis.datos.gob.ar`).
-- `/riesgo` — Riesgo país (ArgentinaDatos).
+- `/riesgo` — Riesgo país (Rava).
 - `/acciones` — Top 3 BYMA por rendimiento 3M (Yahoo Finance).
 - `/cedears` — Top 3 CEDEARs por rendimiento 3M.
 - `/ranking_acciones` — Top 5 BYMA por proyección 6M (0.1·1m + 0.3·3m + 0.6·6m).
