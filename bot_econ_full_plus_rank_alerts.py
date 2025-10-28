@@ -4869,7 +4869,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     pf = pf_get(chat_id)
     if not pf["items"]:
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Agregá instrumentos primero."); return
-    snapshot, last_ts, _, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
+    snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
     if total_actual <= 0:
         await _send_below_menu(context, chat_id, text="Sin valores suficientes para proyectar."); return
 
@@ -4886,6 +4886,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         weight = entry.get('peso') or 0.0
         if not metrics:
             continue
+        has_projection_data = True
         p3 = projection_3m(metrics)
         p6 = projection_6m(metrics)
         w3 += weight * p3
@@ -4902,8 +4903,21 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
             f"• {short_label} → 3M {pct(p3,2)} | 6M {pct(p6,2)} (" + " · ".join(extras) + ")"
         )
 
+        invertido = float(entry.get('invertido') or 0.0)
+        valor_actual = float(entry.get('valor_actual') or 0.0)
+        actual_pct = ((valor_actual / invertido) - 1.0) * 100.0 if invertido > 0 else None
+        comparison_points.append(
+            {
+                "label": short_label,
+                "proj3": p3,
+                "proj6": p6,
+                "actual": actual_pct,
+            }
+        )
+
     forecast3 = total_actual * (1.0 + w3/100.0)
     forecast6 = total_actual * (1.0 + w6/100.0)
+    total_pct = ((total_actual / total_invertido) - 1.0) * 100.0 if total_invertido > 0 else math.nan
 
     header = "<b>🔮 Proyección del Portafolio</b>"
     if fecha:
