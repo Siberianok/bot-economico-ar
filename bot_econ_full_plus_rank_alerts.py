@@ -4758,6 +4758,7 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     img = _pie_image_from_items(pf, snapshot)
     if img:
         await _send_below_menu(context, chat_id, photo_bytes=img)
+    await pf_refresh_menu(context, chat_id)
 
 # --- Rendimiento (debajo del menú) ---
 
@@ -4862,6 +4863,7 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         )
         if img:
             await _send_below_menu(context, chat_id, photo_bytes=img)
+    await pf_refresh_menu(context, chat_id)
 
 # --- Proyección (debajo del menú) ---
 
@@ -4966,6 +4968,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     )
     if per_instrument_img:
         await _send_below_menu(context, chat_id, photo_bytes=per_instrument_img)
+    await pf_refresh_menu(context, chat_id)
 
 # ============================ RESUMEN DIARIO ============================
 
