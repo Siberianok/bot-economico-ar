@@ -158,6 +158,151 @@ CUSTOM_CRYPTO_ENTRIES: Dict[str, Dict[str, Any]] = {
 }
 
 
+FCI_DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "fci_data.json")
+_fci_series_cache: Optional[Dict[str, List[Tuple[int, float]]]] = None
+
+
+def _load_fci_series() -> Dict[str, List[Tuple[int, float]]]:
+    global _fci_series_cache
+    if _fci_series_cache is not None:
+        return _fci_series_cache
+
+    series: Dict[str, List[Tuple[int, float]]] = {}
+    try:
+        with open(FCI_DATA_PATH, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        log.warning("No se encontró archivo de series FCI en %s", FCI_DATA_PATH)
+        _fci_series_cache = {}
+        return _fci_series_cache
+    except Exception as exc:
+        log.warning("Error cargando series FCI (%s): %s", FCI_DATA_PATH, exc)
+        _fci_series_cache = {}
+        return _fci_series_cache
+
+    for symbol, rows in raw.items():
+        points: List[Tuple[int, float]] = []
+        if isinstance(rows, list):
+            for row in rows:
+                if not isinstance(row, (list, tuple)) or len(row) < 2:
+                    continue
+                date_raw, value_raw = row[0], row[1]
+                try:
+                    if isinstance(date_raw, (int, float)):
+                        dt = datetime.fromtimestamp(float(date_raw), tz=TZ)
+                    else:
+                        dt = datetime.fromisoformat(str(date_raw))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=TZ)
+                except Exception:
+                    continue
+                try:
+                    val = float(value_raw)
+                except (TypeError, ValueError):
+                    continue
+                ts = int(datetime.combine(dt.date(), dtime(17, 0), tzinfo=TZ).timestamp())
+                points.append((ts, val))
+        if points:
+            points.sort(key=lambda x: x[0])
+            series[symbol] = points
+
+    _fci_series_cache = series
+    return _fci_series_cache
+
+
+def _fci_metrics(symbol: str) -> Dict[str, Optional[float]]:
+    base = {
+        "6m": None,
+        "3m": None,
+        "1m": None,
+        "last_ts": None,
+        "vol_ann": None,
+        "dd6m": None,
+        "hi52": None,
+        "slope50": None,
+        "trend_flag": None,
+        "last_px": None,
+        "prev_px": None,
+        "last_chg": None,
+        "currency": "USD" if "USD" in symbol.upper() else "ARS",
+    }
+
+    series = _load_fci_series().get(symbol)
+    if not series:
+        return base
+
+    last_ts, last_val = series[-1]
+    base["last_ts"] = last_ts
+    base["last_px"] = float(last_val)
+
+    prev_val: Optional[float] = None
+    for ts, value in reversed(series[:-1]):
+        if value is not None:
+            prev_val = float(value)
+            break
+    if prev_val is not None and prev_val > 0:
+        base["prev_px"] = prev_val
+        base["last_chg"] = (last_val / prev_val - 1.0) * 100.0
+
+    def _value_on_or_after(target_ts: int) -> Optional[float]:
+        for ts, value in series:
+            if ts >= target_ts:
+                return float(value)
+        return float(series[0][1]) if series else None
+
+    day = 24 * 3600
+    for label, days in (("6m", 180), ("3m", 90), ("1m", 30)):
+        ref = _value_on_or_after(last_ts - days * day)
+        if ref and ref > 0:
+            base[label] = (last_val / ref - 1.0) * 100.0
+
+    closes = [float(val) for _, val in series]
+    if len(closes) >= 2:
+        rets = []
+        for i in range(1, len(closes)):
+            if closes[i - 1] > 0:
+                rets.append(closes[i] / closes[i - 1] - 1.0)
+        if len(rets) >= 10:
+            window_sample = rets[-60:] if len(rets) >= 60 else list(rets)
+            mu = sum(window_sample) / len(window_sample)
+            if len(window_sample) > 1:
+                var = sum((r - mu) ** 2 for r in window_sample) / (len(window_sample) - 1)
+                base["vol_ann"] = math.sqrt(max(var, 0.0)) * math.sqrt(252) * 100.0
+
+        look_back_ts = last_ts - 180 * day
+        peak = closes[0]
+        dd_min = 0.0
+        for ts, value in series:
+            if ts < look_back_ts:
+                continue
+            if value > peak:
+                peak = value
+            drawdown = value / peak - 1.0
+            if drawdown < dd_min:
+                dd_min = drawdown
+        base["dd6m"] = abs(dd_min) * 100.0 if dd_min < 0 else 0.0
+
+        max_val = max(closes)
+        if max_val:
+            base["hi52"] = (last_val / max_val - 1.0) * 100.0
+
+        window = 50 if len(closes) >= 50 else len(closes)
+        if window >= 5:
+            sma = sum(closes[-window:]) / window
+            prev_window = closes[-window - 5 : -5] if len(closes) >= window + 5 else closes[:-5]
+            if prev_window:
+                sma_prev = sum(prev_window) / len(prev_window)
+                if sma_prev:
+                    base["slope50"] = (sma / sma_prev - 1.0) * 100.0
+
+        long_window = 100 if len(closes) >= 100 else len(closes)
+        if long_window >= 10:
+            sma_long = sum(closes[-long_window:]) / long_window
+            base["trend_flag"] = 1.0 if last_val > sma_long else (-1.0 if last_val < sma_long else 0.0)
+
+    return base
+
+
 def _build_custom_crypto_map(entries: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
     mapping: Dict[str, Dict[str, str]] = {}
     for key, info in entries.items():
@@ -1238,7 +1383,9 @@ async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
     sem = asyncio.Semaphore(4)
     async def work(sym: str):
         async with sem:
-            if sym in BONOS_AR:
+            if sym.startswith("FCI-"):
+                out[sym] = _fci_metrics(sym)
+            elif sym in BONOS_AR:
                 out[sym] = await _rava_metrics(session, sym)
             else:
                 out[sym] = await _yf_metrics_1y(session, sym)
