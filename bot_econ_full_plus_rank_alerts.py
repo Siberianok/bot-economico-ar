@@ -4460,6 +4460,138 @@ def _projection_bar_image(
     return buf.read()
 
 
+def _projection_by_instrument_image(
+    points: List[Tuple[str, Optional[float], Optional[float]]],
+    title: str,
+    subtitle: Optional[str] = None,
+    formatter: Callable[[float], str] = lambda v: f"{v:+.1f}%",
+) -> Optional[bytes]:
+    if not HAS_MPL or np is None:
+        return None
+
+    cleaned: List[Tuple[str, Optional[float], Optional[float]]] = []
+    for label, val_3m, val_6m in points:
+        if val_3m is None and val_6m is None:
+            continue
+        cleaned.append((label, val_3m, val_6m))
+
+    if not cleaned:
+        return None
+
+    labels: List[str] = []
+    values_3m: List[float] = []
+    values_6m: List[float] = []
+    missing_3m: List[bool] = []
+    missing_6m: List[bool] = []
+    for label, val_3m, val_6m in cleaned:
+        labels.append(label)
+        missing_3m.append(val_3m is None)
+        missing_6m.append(val_6m is None)
+        values_3m.append(val_3m if val_3m is not None else 0.0)
+        values_6m.append(val_6m if val_6m is not None else 0.0)
+
+    all_values = [abs(v) for v, miss in zip(values_3m, missing_3m) if not miss]
+    all_values += [abs(v) for v, miss in zip(values_6m, missing_6m) if not miss]
+    max_abs = max(all_values) if all_values else 0.0
+    if max_abs <= 0:
+        max_abs = 1.0
+
+    x = np.arange(len(labels))
+    width = 0.38
+
+    def _color(val: float, missing: bool) -> str:
+        if missing:
+            return "#9aa0a6"
+        if val > 0:
+            return "#34a853"
+        if val < 0:
+            return "#ea4335"
+        return "#9aa0a6"
+
+    fig, ax = plt.subplots(figsize=(7, 4), dpi=160)
+    bars_3m = ax.bar(
+        x - width / 2,
+        values_3m,
+        width,
+        color=[_color(v, miss) for v, miss in zip(values_3m, missing_3m)],
+        label="3M",
+    )
+    bars_6m = ax.bar(
+        x + width / 2,
+        values_6m,
+        width,
+        color=[_color(v, miss) for v, miss in zip(values_6m, missing_6m)],
+        label="6M",
+    )
+
+    outer_offset = max_abs * 0.08
+    inner_offset = max_abs * 0.06
+
+    def _annotate_bar(bar, val: float, missing: bool) -> None:
+        height = bar.get_height()
+        text = "N/D" if missing else formatter(val)
+        if missing:
+            y = height + outer_offset
+            va = "bottom"
+            color = "#1a1a1a"
+        elif val > 0:
+            if height > max_abs * 0.18:
+                y = height - inner_offset
+                va = "top"
+                color = "#ffffff"
+            else:
+                y = height + outer_offset
+                va = "bottom"
+                color = "#1a1a1a"
+        elif val < 0:
+            if abs(height) > max_abs * 0.18:
+                y = height + inner_offset
+                va = "bottom"
+                color = "#ffffff"
+            else:
+                y = height - outer_offset
+                va = "top"
+                color = "#1a1a1a"
+        else:
+            y = height + outer_offset
+            va = "bottom"
+            color = "#1a1a1a"
+
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            y,
+            text,
+            ha="center",
+            va=va,
+            fontsize=8,
+            color=color,
+        )
+
+    for bar, val, miss in zip(bars_3m, values_3m, missing_3m):
+        _annotate_bar(bar, val, miss)
+    for bar, val, miss in zip(bars_6m, values_6m, missing_6m):
+        _annotate_bar(bar, val, miss)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.axhline(0, color="#4a4a4a", linewidth=0.8)
+    ax.set_ylabel("Variación %")
+    ax.set_title(title + (f"\n{subtitle}" if subtitle else ""))
+    ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+    ax.legend()
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
+    ax.set_ylim(-max_abs * 1.25, max_abs * 1.25)
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
+
 def _return_bar_image(
     points: List[Tuple[str, Optional[float]]],
     title: str,
@@ -4736,6 +4868,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     w3 = 0.0
     w6 = 0.0
     detail: List[str] = []
+    per_instrument_points: List[Tuple[str, Optional[float], Optional[float]]] = []
     for entry in snapshot:
         metrics = entry.get('metrics') or {}
         weight = entry.get('peso') or 0.0
@@ -4746,6 +4879,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         w3 += weight * p3
         w6 += weight * p6
         short_label = _label_short(entry['symbol']) if entry.get('symbol') else entry['label']
+        per_instrument_points.append((short_label, p3, p6))
         if detail:
             detail.append("")
         extras = [f"peso {pct_plain(weight*100.0,1)}"]
@@ -4798,6 +4932,14 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     )
     if img:
         await _send_below_menu(context, chat_id, photo_bytes=img)
+
+    per_instrument_img = _projection_by_instrument_image(
+        per_instrument_points,
+        "Proyección por instrumento",
+        "Variación porcentual esperada",
+    )
+    if per_instrument_img:
+        await _send_below_menu(context, chat_id, photo_bytes=per_instrument_img)
 
 # ============================ RESUMEN DIARIO ============================
 
