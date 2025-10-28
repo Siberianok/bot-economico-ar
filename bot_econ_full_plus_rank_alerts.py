@@ -4293,9 +4293,9 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
     fig, (ax_pie, ax_info) = plt.subplots(
         1,
         2,
-        figsize=(12, 6.5),
+        figsize=(13, 6.5),
         dpi=200,
-        gridspec_kw={"width_ratios": [3.4, 2.6]},
+        gridspec_kw={"width_ratios": [3.6, 2.4]},
     )
 
     cmap = plt.get_cmap("tab20c")
@@ -4334,7 +4334,7 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
     ax_pie.axis("off")
 
     ax_info.axis("off")
-    ax_info.set_xlim(0, 1.25)
+    ax_info.set_xlim(0, 1.45)
     ax_info.set_ylim(0, 1)
 
     ax_info.text(
@@ -4347,7 +4347,7 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
         ha="left",
     )
     headers = ["Instrumento", "%", "Actual", "Invertido", "Variación"]
-    col_x = [0.1, 0.5, 0.82, 1.05, 1.22]
+    col_x = [0.08, 0.38, 0.72, 1.04, 1.32]
     header_align = ["left", "center", "right", "right", "right"]
     header_y = 0.85
     for x, header, align in zip(col_x, headers, header_align):
@@ -4369,12 +4369,12 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
         pct_value = detail["valor_actual"] / total * 100.0 if total else 0.0
         invertido = detail.get("invertido", 0.0)
         variacion = detail["valor_actual"] - invertido
-        ax_info.scatter(0.05, start_y, color=color, s=70, marker="s")
-        ax_info.text(0.1, start_y, detail["label"], fontsize=8.5, va="center", ha="left")
-        ax_info.text(0.5, start_y, pct_plain(pct_value, 1), fontsize=8.5, va="center", ha="center")
-        ax_info.text(0.82, start_y, f_money(detail["valor_actual"]), fontsize=8.5, va="center", ha="right")
-        ax_info.text(1.05, start_y, f_money(invertido), fontsize=8.5, va="center", ha="right")
-        ax_info.text(1.22, start_y, f_money(variacion), fontsize=8.5, va="center", ha="right")
+        ax_info.scatter(0.03, start_y, color=color, s=70, marker="s")
+        ax_info.text(0.08, start_y, detail["label"], fontsize=8.5, va="center", ha="left")
+        ax_info.text(0.38, start_y, pct_plain(pct_value, 1), fontsize=8.5, va="center", ha="center")
+        ax_info.text(0.72, start_y, f_money(detail["valor_actual"]), fontsize=8.5, va="center", ha="right")
+        ax_info.text(1.04, start_y, f_money(invertido), fontsize=8.5, va="center", ha="right")
+        ax_info.text(1.32, start_y, f_money(variacion), fontsize=8.5, va="center", ha="right")
         start_y -= row_spacing
 
     ax_info.text(
@@ -4386,7 +4386,7 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
         va="center",
     )
 
-    fig.subplots_adjust(wspace=0.15)
+    fig.subplots_adjust(wspace=0.25, left=0.04, right=0.98)
 
     fig.suptitle("Composición del Portafolio", fontsize=14, fontweight="bold")
     buf = io.BytesIO()
