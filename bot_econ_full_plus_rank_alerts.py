@@ -3296,6 +3296,8 @@ def kb_pf_main() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Fijar base", callback_data="PF:SETBASE"), InlineKeyboardButton("Fijar monto", callback_data="PF:SETMONTO")],
         [InlineKeyboardButton("Agregar instrumento", callback_data="PF:ADD")],
         [InlineKeyboardButton("Ver composición", callback_data="PF:LIST"), InlineKeyboardButton("Editar instrumento", callback_data="PF:EDIT")],
+        # El botón «Proyección» muestra las gráficas de proyección vs. rendimiento
+        # (barras vs. línea) calculadas en pf_show_projection_below.
         [InlineKeyboardButton("Rendimiento", callback_data="PF:RET"), InlineKeyboardButton("Proyección", callback_data="PF:PROJ")],
         [InlineKeyboardButton("Exportar", callback_data="PF:EXPORT")],
         [InlineKeyboardButton("Eliminar portafolio", callback_data="PF:CLEAR")],
@@ -4894,6 +4896,7 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
 # --- Proyección (debajo del menú) ---
 
 async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Renderiza y envía las comparativas de proyección vs. rendimiento."""
     pf = pf_get(chat_id)
     if not pf["items"]:
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Agregá instrumentos primero."); return
@@ -4927,8 +4930,44 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         added_str = format_added_date(entry.get('added_ts'))
         if added_str:
             extras.append(f"desde {added_str}")
+        invertido = float(entry.get('invertido') or 0.0)
+        valor_actual = float(entry.get('valor_actual') or 0.0)
+        delta = valor_actual - invertido
+        if invertido > 0:
+            actual_pct = (delta / invertido) * 100.0
+            actual_txt = pct(actual_pct, 2)
+        else:
+            actual_pct = 0.0
+            actual_txt = "—"
+        proj_txt = f"3M {pct(p3,2)} | 6M {pct(p6,2)}" if has_metrics else "3M/6M s/d (se asume 0%)"
+        delta_txt = f"Δ {f_money(delta)}"
         detail.append(
-            f"• {short_label} → 3M {pct(p3,2)} | 6M {pct(p6,2)} (" + " · ".join(extras) + ")"
+            "• "
+            + short_label
+            + f" → Rend. actual {actual_txt} ({delta_txt}) | Proyección {proj_txt} ("
+            + " · ".join(extras)
+            + ")"
+        )
+
+        comparison_points.append(
+            {
+                "label": short_label,
+                "proj3": p3,
+                "proj6": p6,
+                "actual": actual_pct,
+            }
+        )
+
+        actual_profit = delta
+        proj_profit3 = valor_actual * (p3 / 100.0)
+        proj_profit6 = valor_actual * (p6 / 100.0)
+        profit_points.append(
+            {
+                "label": short_label,
+                "proj3": proj_profit3,
+                "proj6": proj_profit6,
+                "actual": actual_profit,
+            }
         )
 
         invertido = float(entry.get('invertido') or 0.0)
@@ -4978,7 +5017,11 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     sin_datos = [entry['label'] for entry in snapshot if not entry.get('metrics')]
     if sin_datos:
         lines.append("")
-        lines.append("Sin datos de mercado para: " + ", ".join(sin_datos) + ". Se asumió variación 0%.")
+        lines.append(
+            "Sin datos de mercado para: "
+            + ", ".join(sin_datos)
+            + ". Se asumió proyección 0% para esos instrumentos."
+        )
 
     if not HAS_MPL:
         lines.append("")
