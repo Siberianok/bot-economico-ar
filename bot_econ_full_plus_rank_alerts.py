@@ -5137,85 +5137,40 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     detail: List[str] = []
     per_instrument_points: List[Tuple[str, Optional[float], Optional[float]]] = []
     for entry in snapshot:
-        metrics = entry.get('metrics') or {}
-        weight = entry.get('peso') or 0.0
+        metrics = entry.get("metrics") or {}
+        weight = float(entry.get("peso") or 0.0)
         if not metrics:
             continue
-        has_projection_data = True
+
         p3 = projection_3m(metrics)
         p6 = projection_6m(metrics)
         w3 += weight * p3
         w6 += weight * p6
-        short_label = _label_short(entry['symbol']) if entry.get('symbol') else entry['label']
+
+        short_label = _label_short(entry["symbol"]) if entry.get("symbol") else entry["label"]
         per_instrument_points.append((short_label, p3, p6))
+
         if detail:
             detail.append("")
-        extras = [f"peso {pct_plain(weight*100.0,1)}"]
-        added_str = format_added_date(entry.get('added_ts'))
+        extras = [f"peso {pct_plain(weight * 100.0, 1)}"]
+        added_str = format_added_date(entry.get("added_ts"))
         if added_str:
             extras.append(f"desde {added_str}")
-        invertido = float(entry.get('invertido') or 0.0)
-        valor_actual = float(entry.get('valor_actual') or 0.0)
+
+        invertido = float(entry.get("invertido") or 0.0)
+        valor_actual = float(entry.get("valor_actual") or 0.0)
         delta = valor_actual - invertido
-        if invertido > 0:
-            actual_pct = (delta / invertido) * 100.0
-            actual_txt = pct(actual_pct, 2)
-        else:
-            actual_pct = 0.0
-            actual_txt = "—"
-        proj_txt = f"3M {pct(p3,2)} | 6M {pct(p6,2)}" if has_metrics else "3M/6M s/d (se asume 0%)"
+        actual_pct = (delta / invertido) * 100.0 if invertido > 0 else None
+        actual_txt = pct(actual_pct, 2)
+        proj_txt = f"3M {pct(p3, 2)} | 6M {pct(p6, 2)}"
         delta_txt = f"Δ {f_money(delta)}"
+
         detail.append(
             "• "
             + short_label
             + f" → Rend. actual {actual_txt} ({delta_txt}) | Proyección {proj_txt} ("
             + " · ".join(extras)
             + ")"
-        )
-
-        comparison_points.append(
-            {
-                "label": short_label,
-                "proj3": p3,
-                "proj6": p6,
-                "actual": actual_pct,
-            }
-        )
-
-        actual_profit = delta
-        proj_profit3 = valor_actual * (p3 / 100.0)
-        proj_profit6 = valor_actual * (p6 / 100.0)
-        profit_points.append(
-            {
-                "label": short_label,
-                "proj3": proj_profit3,
-                "proj6": proj_profit6,
-                "actual": actual_profit,
-            }
-        )
-
-        invertido = float(entry.get('invertido') or 0.0)
-        valor_actual = float(entry.get('valor_actual') or 0.0)
-        actual_pct = ((valor_actual / invertido) - 1.0) * 100.0 if invertido > 0 else None
-        comparison_points.append(
-            {
-                "label": short_label,
-                "proj3": p3,
-                "proj6": p6,
-                "actual": actual_pct,
-            }
-        )
-
-        actual_profit = valor_actual - invertido
-        proj_profit3 = valor_actual * (p3 / 100.0)
-        proj_profit6 = valor_actual * (p6 / 100.0)
-        profit_points.append(
-            {
-                "label": short_label,
-                "proj3": proj_profit3,
-                "proj6": proj_profit6,
-                "actual": actual_profit,
-            }
         )
 
     forecast3 = total_actual * (1.0 + w3/100.0)
