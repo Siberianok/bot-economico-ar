@@ -3759,13 +3759,46 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pf = pf_get(chat_id)
         if not pf["items"]:
             await _send_below_menu(context, chat_id, text="No hay instrumentos para editar."); return
+        base_conf = pf.get("base", {})
+        base_currency = (base_conf.get("moneda") or "ARS").upper()
+        f_money = fmt_money_ars if base_currency == "ARS" else fmt_money_usd
+
+        lines = ["<b>Elegí instrumento a editar</b>"]
         buttons = []
-        for i,it in enumerate(pf["items"],1):
-            label = f"{i}. " + (_label_long(it['simbolo']) if it.get("simbolo") else it.get("tipo","").upper())
-            buttons.append([InlineKeyboardButton(label, callback_data=f"PF:EDIT:{i-1}")])
+        for i, it in enumerate(pf["items"], 1):
+            sym = it.get("simbolo") or ""
+            label = _label_long(sym) if sym else (it.get("tipo", "").upper() or "Instrumento")
+            qty = it.get("cantidad")
+            qty_str = None
+            if qty is not None:
+                try:
+                    qty_val = float(qty)
+                    if requires_integer_units(sym):
+                        qty_str = f"cant: {int(qty_val)}"
+                    else:
+                        qty_str = f"cant: {qty_val:.4f}".rstrip("0").rstrip(".")
+                except (TypeError, ValueError):
+                    qty_str = None
+            importe = it.get("importe")
+            importe_str = None
+            if importe is not None:
+                try:
+                    importe_str = f"importe: {f_money(float(importe))}"
+                except (TypeError, ValueError):
+                    importe_str = None
+            extra = ", ".join(v for v in [qty_str, importe_str] if v)
+            line_detail = f"{i}. {label}"
+            if extra:
+                line_detail += f" — {extra}"
+            lines.append(line_detail)
+            buttons.append([InlineKeyboardButton(f"{i}. {label}", callback_data=f"PF:EDIT:{i-1}")])
         buttons.append([InlineKeyboardButton("Volver", callback_data="PF:BACK")])
-        await _send_below_menu(context, chat_id, text="Elegí instrumento a editar:")
-        await context.bot.send_message(chat_id, " ", reply_markup=InlineKeyboardMarkup(buttons))
+        await _send_below_menu(
+            context,
+            chat_id,
+            text="\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
         return
 
     if data.startswith("PF:EDIT:"):
