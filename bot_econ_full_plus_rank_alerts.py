@@ -471,6 +471,46 @@ def price_to_base(price: Optional[float], inst_currency: str, base_currency: str
         return float(price) / float(tc_val)
     return None
 
+
+def metric_last_price(metrics: Dict[str, Any]) -> Optional[float]:
+    """Return the last available native price contained in a metrics dict.
+
+    Prefers explicit ``last_px`` values, but can infer the value from
+    ``prev_px`` and ``last_chg`` (variation %) when intraday quotes are
+    unavailable. As a last resort it falls back to ``prev_px`` alone so the
+    instrument still contributes to portfolio valuations with the most recent
+    close on record.
+    """
+
+    if not metrics:
+        return None
+
+    last_raw = metrics.get("last_px")
+    if last_raw is not None:
+        try:
+            return float(last_raw)
+        except (TypeError, ValueError):
+            pass
+
+    prev_raw = metrics.get("prev_px")
+    chg_raw = metrics.get("last_chg")
+
+    if prev_raw is not None and chg_raw is not None:
+        try:
+            prev_val = float(prev_raw)
+            chg_val = float(chg_raw)
+            return prev_val * (1.0 + chg_val / 100.0)
+        except (TypeError, ValueError):
+            pass
+
+    if prev_raw is not None:
+        try:
+            return float(prev_raw)
+        except (TypeError, ValueError):
+            pass
+
+    return None
+
 # ============================ LOGGING ============================
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
@@ -1274,6 +1314,24 @@ def _metrics_from_rava_history(history: List[Dict[str, Any]]) -> Dict[str, Optio
     if sma200[-1] is not None:
         trend_flag = 1.0 if last > sma200[-1] else -1.0
 
+    last_px: Optional[float] = None
+    prev_px: Optional[float] = None
+    last_chg: Optional[float] = None
+    try:
+        last_px = float(last)
+    except Exception:
+        last_px = None
+    if prev is not None:
+        try:
+            prev_px = float(prev)
+        except Exception:
+            prev_px = None
+        if prev_px not in (None, 0.0):
+            try:
+                last_chg = ((last_px / prev_px) - 1.0) * 100.0 if last_px is not None else None
+            except Exception:
+                last_chg = None
+
     return {
         "6m": ret6,
         "3m": ret3,
@@ -1284,7 +1342,9 @@ def _metrics_from_rava_history(history: List[Dict[str, Any]]) -> Dict[str, Optio
         "hi52": hi52,
         "slope50": slope50,
         "trend_flag": trend_flag,
-        "prev_px": float(prev) if prev is not None else None,
+        "last_px": last_px,
+        "prev_px": prev_px,
+        "last_chg": last_chg,
     }
 
 async def _rava_metrics(session: ClientSession, symbol: str) -> Dict[str, Optional[float]]:
@@ -4127,9 +4187,8 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         price_native = None  # precio en MONEDA NATIVA
         async with ClientSession() as session:
-            if yfsym.endswith(".BA") or yfsym.endswith("-USD"):
-                mets, _ = await metrics_for_symbols(session, [yfsym])
-                price_native = mets.get(yfsym,{}).get("last_px")
+            mets, _ = await metrics_for_symbols(session, [yfsym])
+            price_native = metric_last_price(mets.get(yfsym, {})) if mets else None
             if needs_fx and (not tc_val or tc_val <= 0):
                 tc_val = await get_tc_value(session, tc_key)
                 tc_ts = int(time()) if tc_val is not None else None
@@ -4344,9 +4403,13 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         tipo = it.get("tipo", "")
         qty = float(it["cantidad"]) if it.get("cantidad") is not None else None
         invertido = float(it.get("importe") or 0.0)
-        met = mets.get(sym, {}) if sym in mets else {}
-        if met and met.get("last_px") is None:
+        met_raw = mets.get(sym, {}) if sym in mets else {}
+        met = dict(met_raw) if met_raw else {}
+        price_native = metric_last_price(met) if met else None
+        if price_native is None:
             met = {}
+        else:
+            met["last_px"] = price_native
         met_currency = met.get("currency") if met else None
         inst_cur = instrument_currency(sym, tipo) if sym else base_currency
         if met_currency:
@@ -4368,7 +4431,6 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             added_ts = None
         effective_tc = fx_rate_item if fx_rate_item is not None else tc_val
         effective_ts = fx_ts_item if fx_rate_item is not None else tc_ts
-        price_native = met.get("last_px") if met else None
         price_base = price_to_base(price_native, inst_cur, base_currency, effective_tc) if price_native is not None else None
         derived_qty = False
         if qty is None and price_base and price_base > 0 and invertido > 0:
