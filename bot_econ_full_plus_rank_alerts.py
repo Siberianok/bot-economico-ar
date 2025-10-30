@@ -9,7 +9,7 @@ from time import time
 from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Tuple, Any, Optional, Set, Callable
+from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable
 from urllib.parse import urlparse, quote
 
 # ====== matplotlib opcional (no rompe si no está instalado) ======
@@ -1505,6 +1505,7 @@ RSS_FEEDS = [
     "https://www.telam.com.ar/rss2/economia.xml",
     "https://www.cronista.com/files/rss/economia.xml",
     "https://www.cronista.com/files/rss/finanzas-mercados.xml",
+    "https://eleconomista.com.ar/rss/economia.xml",
     "https://www.clarin.com/rss/economia/",
     "https://www.lanacion.com.ar/economia/rss/",
     "https://www.pagina12.com.ar/rss/secciones/economia/notas",
@@ -1549,29 +1550,40 @@ def _score_title(title: str) -> int:
         if kw in t: score += 1
     return score
 
-def _parse_feed_entries(xml: str) -> List[Tuple[str, str]]:
-    out: List[Tuple[str, str]] = []
+def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
+    out: List[Tuple[str, str, Optional[str]]] = []
     try:
         root = ET.fromstring(xml)
     except Exception:
         return out
     for item in root.findall(".//item"):
         t_el = item.find("title"); l_el = item.find("link")
+        d_el = item.find("description")
         t = (t_el.text or "").strip() if (t_el is not None and t_el.text) else None
         l = (l_el.text or "").strip() if (l_el is not None and l_el.text) else None
-        if t and l and l.startswith("http"): out.append((t, l))
+        desc = None
+        if d_el is not None and d_el.text:
+            desc = d_el.text.strip()
+        if t and l and l.startswith("http"):
+            out.append((t, l, desc))
     for entry in root.findall(".//{*}entry"):
         t_el = entry.find(".//{*}title")
         link_el = entry.find(".//{*}link[@rel='alternate']") or entry.find(".//{*}link")
+        summary_el = entry.find(".//{*}summary")
         t = (t_el.text or "").strip() if (t_el is not None and t_el.text) else None
         l = link_el.get("href").strip() if (link_el is not None and link_el.get("href")) else None
         if (not l) and entry.find(".//{*}id") is not None:
             l = (entry.find(".//{*}id").text or "").strip()
-        if t and l and l.startswith("http"): out.append((t, l))
+        desc = None
+        if summary_el is not None and summary_el.text:
+            desc = summary_el.text.strip()
+        if t and l and l.startswith("http"):
+            out.append((t, l, desc))
     if not out:
         for m in re.finditer(r"<title>(.*?)</title>.*?<link>(https?://[^<]+)</link>", xml, flags=re.S|re.I):
             t = re.sub(r"<.*?>", "", m.group(1)).strip(); l = m.group(2).strip()
-            if t and l: out.append((t, l))
+            if t and l:
+                out.append((t, l, None))
     return out
 
 def _impact_lines(title: str) -> str:
@@ -1593,28 +1605,97 @@ def _impact_lines(title: str) -> str:
                  "Qué mirar: precios relativos y expectativas."]
     return "\n".join([f"<i>{p}</i>" for p in parts])
 
+_PAYWALL_MARKERS: Dict[str, List[str]] = {
+    "clarin.com": ["class=\"paywall", "paywall_content", "suscriptor", "suscriptores"],
+}
+
+
+def _paywall_normalized_domain(url: str) -> str:
+    dom = domain_of(url)
+    if dom.startswith("www."):
+        dom = dom[4:]
+    return dom
+
+
+def _clarin_amp_url(url: str) -> str:
+    if "clarin.com" not in domain_of(url):
+        return url
+    sep = "&" if "?" in url else "?"
+    if "output=amp" in url:
+        return url
+    return f"{url}{sep}output=amp"
+
+
+async def _clarin_is_paywalled(session: ClientSession, url: str) -> bool:
+    amp_url = _clarin_amp_url(url)
+    text = await fetch_text(session, amp_url, timeout=ClientTimeout(total=10))
+    if not text:
+        return False
+    low = text.lower()
+    return any(marker in low for marker in _PAYWALL_MARKERS["clarin.com"])
+
+
+PAYWALL_CHECKERS: Dict[str, Callable[[ClientSession, str], Awaitable[bool]]] = {
+    "clarin.com": _clarin_is_paywalled,
+}
+
+
+def _paywall_friendly_link(url: str) -> str:
+    dom = _paywall_normalized_domain(url)
+    if dom == "clarin.com":
+        return _clarin_amp_url(url)
+    return url
+
+
 async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tuple[str, str]]:
-    entries: List[Tuple[str, str]] = []
+    raw_entries: List[Tuple[str, str, Optional[str]]] = []
     for url in RSS_FEEDS:
         xml = await fetch_text(session, url, headers={"Accept":"application/rss+xml, application/atom+xml, */*"})
-        if not xml: continue
-        try: entries.extend(_parse_feed_entries(xml))
-        except Exception as e: log.warning("RSS parse %s: %s", url, e)
+        if not xml:
+            continue
+        try:
+            raw_entries.extend(_parse_feed_entries(xml))
+        except Exception as e:
+            log.warning("RSS parse %s: %s", url, e)
 
-    uniq: Dict[str, str] = {l:t for t,l in entries if l.startswith("http")}
-    if not uniq:
+    entries_meta: Dict[str, Tuple[str, Optional[str]]] = {}
+    for title, link, desc in raw_entries:
+        if link.startswith("http"):
+            entries_meta[link] = (title, desc)
+
+    if not entries_meta:
         return [("Mercados: sin novedades relevantes", "https://www.ambito.com/"),
                 ("Actividad: esperando datos de inflación", "https://www.cronista.com/"),
                 ("Dólar: foco en brecha y CCL/MEP", "https://www.infobae.com/economia/")][:limit]
 
-    scored = sorted([(t,l,_score_title(t), domain_of(l)) for l,t in uniq.items()], key=lambda x: x[2], reverse=True)
+    scored: List[Tuple[str, str, Optional[str], int, str]] = []
+    for link, (title, desc) in entries_meta.items():
+        scored.append((title, link, desc, _score_title(title), domain_of(link)))
+    scored.sort(key=lambda x: x[3], reverse=True)
+
     picked: List[Tuple[str,str]] = []
     used_domains: Set[str] = set()
     topic_counts: Dict[str, int] = {}
+    paywall_cache: Dict[str, bool] = {}
 
-    def attempt_pick(topic_cap: Optional[int], enforce_domain: bool) -> None:
+    async def is_paywalled(link: str, domain: str) -> bool:
+        ndom = _paywall_normalized_domain(domain)
+        if ndom not in PAYWALL_CHECKERS:
+            return False
+        if link in paywall_cache:
+            return paywall_cache[link]
+        checker = PAYWALL_CHECKERS[ndom]
+        try:
+            result = await checker(session, link)
+        except Exception as exc:
+            log.debug("paywall check %s failed: %s", link, exc)
+            result = False
+        paywall_cache[link] = result
+        return result
+
+    async def attempt_pick(topic_cap: Optional[int], enforce_domain: bool) -> None:
         nonlocal picked, used_domains, topic_counts
-        for title, link, _, dom in scored:
+        for title, link, desc, _, dom in scored:
             if len(picked) >= limit:
                 break
             if (title, link) in picked:
@@ -1624,15 +1705,18 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
                 continue
             if enforce_domain and dom in used_domains and len(used_domains) < 4:
                 continue
-            picked.append((title, link))
+            if await is_paywalled(link, dom):
+                continue
+            friendly_link = _paywall_friendly_link(link)
+            picked.append((title, friendly_link))
             topic_counts[topic] = topic_counts.get(topic, 0) + 1
             used_domains.add(dom)
 
-    attempt_pick(topic_cap=1, enforce_domain=True)
+    await attempt_pick(topic_cap=1, enforce_domain=True)
     if len(picked) < limit:
-        attempt_pick(topic_cap=2, enforce_domain=True)
+        await attempt_pick(topic_cap=2, enforce_domain=True)
     if len(picked) < limit:
-        attempt_pick(topic_cap=None, enforce_domain=False)
+        await attempt_pick(topic_cap=None, enforce_domain=False)
     return picked[:limit]
 
 def _short_title(text: str, limit: int = 32) -> str:
