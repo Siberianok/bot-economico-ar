@@ -1703,16 +1703,16 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
 
 def format_top3_table(title: str, fecha: Optional[str], rows_syms: List[str], retmap: Dict[str, Dict[str, Optional[float]]]) -> str:
     head = f"<b>{title}</b>" + (f" <i>Últ. Dato: {fecha}</i>" if fecha else "")
-    lines = [head, "<pre>Rank Empresa (Ticker)             1M        3M        6M</pre>"]
+    lines = [head, "<pre>Rank Empresa (Ticker)             6M        3M        1M</pre>"]
     out = []
     for idx, sym in enumerate(rows_syms[:3], start=1):
         d = retmap.get(sym, {})
-        p1 = pct(d.get("1m"), 2) if d.get("1m") is not None else "—"
-        p3 = pct(d.get("3m"), 2) if d.get("3m") is not None else "—"
         p6 = pct(d.get("6m"), 2) if d.get("6m") is not None else "—"
+        p3 = pct(d.get("3m"), 2) if d.get("3m") is not None else "—"
+        p1 = pct(d.get("1m"), 2) if d.get("1m") is not None else "—"
         label = pad(_label_short(sym), 28)
-        c1 = center_text(p1, 10); c3 = center_text(p3, 10); c6 = center_text(p6, 10)
-        l = f"{idx:<4} {label}{c1}{c3}{c6}"
+        c6 = center_text(p6, 10); c3 = center_text(p3, 10); c1 = center_text(p1, 10)
+        l = f"{idx:<4} {label}{c6}{c3}{c1}"
         out.append(f"<pre>{l}</pre>")
     if not out: out.append("<pre>—</pre>")
     return "\n".join([lines[0], lines[1]] + out)
@@ -1825,7 +1825,7 @@ async def _rank_top3(update: Update, symbols: List[str], title: str):
             for sym, _ in pairs[:3]:
                 metrics = mets.get(sym, {})
                 values: List[Optional[float]] = []
-                for key in ("1m", "3m", "6m"):
+                for key in ("6m", "3m", "1m"):
                     raw_val = metrics.get(key)
                     if raw_val is None:
                         values.append(None)
@@ -1840,9 +1840,9 @@ async def _rank_top3(update: Update, symbols: List[str], title: str):
             subtitle = f"Datos al {fecha}" if fecha else None
             img = _bar_image_from_rank(
                 chart_rows,
-                title=f"{title} — Rendimientos 1/3/6M",
+                title=f"{title} — Rendimientos 6/3/1M",
                 subtitle=subtitle,
-                series_labels=["Rend. 1M", "Rend. 3M", "Rend. 6M"],
+                series_labels=["Rend. 6M", "Rend. 3M", "Rend. 1M"],
             )
             if img:
                 await update.effective_message.reply_photo(photo=img)
