@@ -1891,6 +1891,13 @@ def projection_6m(m: Dict[str, Optional[float]]) -> float:
             pass
     return (math.exp(mu * 126) - 1.0) * 100.0
 
+RET_SERIES_ORDER: List[Tuple[str, str]] = [
+    ("6m", "Rend. 6M"),
+    ("3m", "Rend. 3M"),
+    ("1m", "Rend. 1M"),
+]
+
+
 async def _rank_top3(update: Update, symbols: List[str], title: str):
     async with ClientSession() as session:
         mets, last_ts = await metrics_for_symbols(session, symbols)
@@ -1909,7 +1916,7 @@ async def _rank_top3(update: Update, symbols: List[str], title: str):
             for sym, _ in pairs[:3]:
                 metrics = mets.get(sym, {})
                 values: List[Optional[float]] = []
-                for key in ("6m", "3m", "1m"):
+                for key, _ in RET_SERIES_ORDER:
                     raw_val = metrics.get(key)
                     if raw_val is None:
                         values.append(None)
@@ -1926,7 +1933,7 @@ async def _rank_top3(update: Update, symbols: List[str], title: str):
                 chart_rows,
                 title=f"{title} — Rendimientos 6/3/1M",
                 subtitle=subtitle,
-                series_labels=["Rend. 6M", "Rend. 3M", "Rend. 1M"],
+                series_labels=[label for _, label in RET_SERIES_ORDER],
             )
             if img:
                 await update.effective_message.reply_photo(photo=img)
