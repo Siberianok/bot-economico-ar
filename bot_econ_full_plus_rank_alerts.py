@@ -1514,6 +1514,17 @@ KEYWORDS = ["inflación","ipc","índice de precios","devalu","dólar","ccl","mep
             "bcra","reservas","tasas","pases","fmi","deuda","riesgo país",
             "cepo","importaciones","exportaciones","merval","acciones","bonos","brecha",
             "subsidios","retenciones","tarifas","liquidez","recaudación","déficit"]
+DOLLAR_NEWS_KEYWORDS = [
+    "dolar",
+    "dolares",
+    "dolarizacion",
+    "dolarizar",
+    "usd",
+    "blue",
+    "mep",
+    "ccl",
+    "contado con liqui",
+]
 NEWS_TOPICS = [
     ("cambio", ["dolar", "blue", "mep", "ccl", "brecha", "cambio", "oficial", "mayorista", "contado con liqui"]),
     ("inflacion", ["inflacion", "ipc", "precios", "indice de precios", "inflacionaria"]),
@@ -1529,6 +1540,19 @@ NEWS_TOPICS = [
 def _normalize_topic_text(text: str) -> str:
     normalized = unicodedata.normalize("NFD", text.lower())
     return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+
+
+def _normalize_news_title(title: str) -> str:
+    norm = _normalize_topic_text(title)
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", norm).split())
+
+
+def _is_dollar_related(title: str, desc: Optional[str]) -> bool:
+    parts = [_normalize_topic_text(title)]
+    if desc:
+        parts.append(_normalize_topic_text(desc))
+    joined = " ".join(parts)
+    return any(kw in joined for kw in DOLLAR_NEWS_KEYWORDS)
 
 
 def _topic_for_title(title: str) -> str:
@@ -1659,14 +1683,23 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             log.warning("RSS parse %s: %s", url, e)
 
     entries_meta: Dict[str, Tuple[str, Optional[str]]] = {}
+    seen_titles: Set[str] = set()
     for title, link, desc in raw_entries:
         if link.startswith("http"):
+            if _is_dollar_related(title, desc):
+                continue
+            norm_title = _normalize_news_title(title)
+            if norm_title in seen_titles:
+                continue
+            seen_titles.add(norm_title)
             entries_meta[link] = (title, desc)
 
     if not entries_meta:
-        return [("Mercados: sin novedades relevantes", "https://www.ambito.com/"),
-                ("Actividad: esperando datos de inflación", "https://www.cronista.com/"),
-                ("Dólar: foco en brecha y CCL/MEP", "https://www.infobae.com/economia/")][:limit]
+        return [
+            ("Mercados: sin novedades relevantes", "https://www.ambito.com/"),
+            ("Actividad: esperando datos de inflación", "https://www.cronista.com/"),
+            ("Consumo: expectativa por ventas minoristas", "https://www.perfil.com/"),
+        ][:limit]
 
     scored: List[Tuple[str, str, Optional[str], int, str]] = []
     for link, (title, desc) in entries_meta.items():
