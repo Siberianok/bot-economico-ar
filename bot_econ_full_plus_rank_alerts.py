@@ -1510,6 +1510,19 @@ RSS_FEEDS = [
     "https://www.lanacion.com.ar/economia/rss/",
     "https://www.pagina12.com.ar/rss/secciones/economia/notas",
 ]
+NATIONAL_NEWS_DOMAINS: Set[str] = {
+    "ambito.com",
+    "iprofesional.com",
+    "infobae.com",
+    "perfil.com",
+    "baenegocios.com",
+    "telam.com.ar",
+    "cronista.com",
+    "eleconomista.com.ar",
+    "clarin.com",
+    "lanacion.com.ar",
+    "pagina12.com.ar",
+}
 KEYWORDS = ["inflación","ipc","índice de precios","devalu","dólar","ccl","mep","blue",
             "bcra","reservas","tasas","pases","fmi","deuda","riesgo país",
             "cepo","importaciones","exportaciones","merval","acciones","bonos","brecha",
@@ -1703,7 +1716,11 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
 
     scored: List[Tuple[str, str, Optional[str], int, str]] = []
     for link, (title, desc) in entries_meta.items():
-        scored.append((title, link, desc, _score_title(title), domain_of(link)))
+        dom = domain_of(link)
+        norm_dom = dom[4:] if dom.startswith("www.") else dom
+        if norm_dom not in NATIONAL_NEWS_DOMAINS:
+            continue
+        scored.append((title, link, desc, _score_title(title), norm_dom))
     scored.sort(key=lambda x: x[3], reverse=True)
 
     picked: List[Tuple[str,str]] = []
@@ -1726,7 +1743,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         paywall_cache[link] = result
         return result
 
-    async def attempt_pick(topic_cap: Optional[int], enforce_domain: bool) -> None:
+    async def attempt_pick(topic_cap: Optional[int]) -> None:
         nonlocal picked, used_domains, topic_counts
         for title, link, desc, _, dom in scored:
             if len(picked) >= limit:
@@ -1736,7 +1753,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             topic = _topic_for_title(title)
             if topic_cap is not None and topic_counts.get(topic, 0) >= topic_cap:
                 continue
-            if enforce_domain and dom in used_domains and len(used_domains) < 4:
+            if dom in used_domains:
                 continue
             if await is_paywalled(link, dom):
                 continue
@@ -1745,11 +1762,11 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             topic_counts[topic] = topic_counts.get(topic, 0) + 1
             used_domains.add(dom)
 
-    await attempt_pick(topic_cap=1, enforce_domain=True)
+    await attempt_pick(topic_cap=1)
     if len(picked) < limit:
-        await attempt_pick(topic_cap=2, enforce_domain=True)
+        await attempt_pick(topic_cap=2)
     if len(picked) < limit:
-        await attempt_pick(topic_cap=None, enforce_domain=False)
+        await attempt_pick(topic_cap=None)
     return picked[:limit]
 
 def _short_title(text: str, limit: int = 32) -> str:
@@ -1767,21 +1784,10 @@ def _build_news_layout(news: List[Tuple[str, str]]) -> Tuple[str, Optional[Inlin
     if not news:
         return header, None, []
 
-    rows: List[List[InlineKeyboardButton]] = []
-    current_row: List[InlineKeyboardButton] = []
     body_lines: List[str] = []
     for title, link in news:
         body_lines.append(_format_news_item(title, link))
-        btn = InlineKeyboardButton(_short_title(title, 36), url=link)
-        current_row.append(btn)
-        if len(current_row) == 2:
-            rows.append(current_row)
-            current_row = []
-    if current_row:
-        rows.append(current_row)
-
-    markup = InlineKeyboardMarkup(rows) if rows else None
-    return header, markup, body_lines
+    return header, None, body_lines
 
 
 def format_news_block(news: List[Tuple[str, str]]) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
