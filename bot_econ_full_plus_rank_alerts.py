@@ -1684,6 +1684,32 @@ def _paywall_friendly_link(url: str) -> str:
     return url
 
 
+def _mentions_argentina(title: str, desc: Optional[str]) -> bool:
+    parts = [title or ""]
+    if desc:
+        parts.append(desc)
+    text = " ".join(parts)
+    normalized = unicodedata.normalize("NFKD", text)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    low = normalized.lower()
+    keywords = [
+        "argentina",
+        "argentino",
+        "argentinos",
+        "argentinas",
+        "argent",
+        "buenos aires",
+        "bs as",
+        "caba",
+        "rosario",
+        "cordoba",
+        "mendoza",
+        "neuquen",
+        "patagonia",
+    ]
+    return any(k in low for k in keywords)
+
+
 async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tuple[str, str]]:
     raw_entries: List[Tuple[str, str, Optional[str]]] = []
     for url in RSS_FEEDS:
@@ -1714,14 +1740,33 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             ("Consumo: expectativa por ventas minoristas", "https://www.perfil.com/"),
         ][:limit]
 
-    scored: List[Tuple[str, str, Optional[str], int, str]] = []
+    scored: List[Dict[str, Any]] = []
     for link, (title, desc) in entries_meta.items():
         dom = domain_of(link)
         norm_dom = dom[4:] if dom.startswith("www.") else dom
-        if norm_dom not in NATIONAL_NEWS_DOMAINS:
+        mentions_ar = _mentions_argentina(title, desc)
+        is_national = norm_dom in NATIONAL_NEWS_DOMAINS
+        if not is_national and not mentions_ar:
             continue
-        scored.append((title, link, desc, _score_title(title), norm_dom))
-    scored.sort(key=lambda x: x[3], reverse=True)
+        scored.append(
+            {
+                "title": title,
+                "link": link,
+                "desc": desc,
+                "score": _score_title(title),
+                "domain": norm_dom,
+                "is_national": is_national,
+                "mentions": mentions_ar,
+            }
+        )
+    scored.sort(
+        key=lambda item: (
+            1 if item["is_national"] else 0,
+            1 if item["mentions"] else 0,
+            item["score"],
+        ),
+        reverse=True,
+    )
 
     picked: List[Tuple[str,str]] = []
     used_domains: Set[str] = set()
@@ -1743,17 +1788,20 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         paywall_cache[link] = result
         return result
 
-    async def attempt_pick(topic_cap: Optional[int]) -> None:
+    async def attempt_pick(topic_cap: Optional[int], *, enforce_domain: bool = True) -> None:
         nonlocal picked, used_domains, topic_counts
-        for title, link, desc, _, dom in scored:
+        for entry in scored:
             if len(picked) >= limit:
                 break
+            title = entry["title"]
+            link = entry["link"]
+            dom = entry["domain"]
             if (title, link) in picked:
                 continue
             topic = _topic_for_title(title)
             if topic_cap is not None and topic_counts.get(topic, 0) >= topic_cap:
                 continue
-            if dom in used_domains:
+            if enforce_domain and dom in used_domains:
                 continue
             if await is_paywalled(link, dom):
                 continue
@@ -1762,11 +1810,13 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             topic_counts[topic] = topic_counts.get(topic, 0) + 1
             used_domains.add(dom)
 
-    await attempt_pick(topic_cap=1)
+    await attempt_pick(topic_cap=1, enforce_domain=True)
     if len(picked) < limit:
-        await attempt_pick(topic_cap=2)
+        await attempt_pick(topic_cap=2, enforce_domain=True)
     if len(picked) < limit:
-        await attempt_pick(topic_cap=None)
+        await attempt_pick(topic_cap=None, enforce_domain=True)
+    if len(picked) < limit:
+        await attempt_pick(topic_cap=None, enforce_domain=False)
     return picked[:limit]
 
 def _short_title(text: str, limit: int = 32) -> str:
@@ -2219,8 +2269,18 @@ def _alerts_match(existing: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
     return False
 
 
-def _has_duplicate_alert(rules: List[Dict[str, Any]], candidate: Dict[str, Any]) -> bool:
-    return any(_alerts_match(r, candidate) for r in rules)
+def _has_duplicate_alert(
+    rules: List[Dict[str, Any]],
+    candidate: Dict[str, Any],
+    *,
+    skip_idx: Optional[int] = None,
+) -> bool:
+    for idx, rule in enumerate(rules):
+        if skip_idx is not None and idx == skip_idx:
+            continue
+        if _alerts_match(rule, candidate):
+            return True
+    return False
 
 def kb(rows: List[List[Tuple[str,str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=data) for text, data in r] for r in rows])
@@ -2377,9 +2437,9 @@ async def get_top_crypto_bases(
 
 def kb_alertas_menu() -> InlineKeyboardMarkup:
     return kb([
-        [("Listar","AL:LIST"),("Agregar","AL:ADD")],
-        [("Borrar","AL:CLEAR")],
-        [("Pausar","AL:PAUSE"),("Reanudar","AL:RESUME")],
+        [("Listar", "AL:LIST"), ("Agregar", "AL:ADD")],
+        [("Modificar", "AL:EDIT"), ("Borrar", "AL:CLEAR")],
+        [("Pausar", "AL:PAUSE"), ("Reanudar", "AL:RESUME")],
     ])
 
 
@@ -2390,6 +2450,7 @@ async def cmd_alertas_menu(
     *,
     edit: bool = False,
 ) -> None:
+    context.user_data.pop("al_edit_idx", None)
     text = "🔔 Menú Alertas" if not prefix else f"{prefix}\n\n🔔 Menú Alertas"
     markup = kb_alertas_menu()
     if edit and update.callback_query:
@@ -2403,6 +2464,8 @@ async def alertas_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "AL:LIST":
         await cmd_alertas_list(update, context)
         await cmd_alertas_menu(update, context)
+    elif data == "AL:EDIT":
+        await cmd_alertas_edit(update, context)
     elif data == "AL:CLEAR":
         await cmd_alertas_clear(update, context)
     elif data == "AL:PAUSE":
@@ -2433,6 +2496,176 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"\n<i>Alertas en pausa hasta {until.strftime('%d/%m %H:%M')}</i>")
         txt = "\n".join(lines)
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
+
+async def cmd_alertas_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    rules = ALERTS.get(chat_id, [])
+    if not rules:
+        await update.effective_message.reply_text("No tenés alertas guardadas.")
+        await cmd_alertas_menu(update, context)
+        return
+    buttons: List[List[Tuple[str, str]]] = []
+    for i, r in enumerate(rules, 1):
+        label = f"{i}. {_alert_rule_label(r)}"
+        buttons.append([(label[:64], f"AL:EDIT:{i-1}")])
+    buttons.append([("Volver", "AL:MENU"), ("Cancelar", "AL:EDIT:CANCEL")])
+    kb_markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(text, callback_data=data) for text, data in row] for row in buttons]
+    )
+    await update.effective_message.reply_text("Elegí qué alerta modificar:", reply_markup=kb_markup)
+
+
+async def alertas_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
+
+
+def _infer_segment_for_symbol(sym: Optional[str]) -> Optional[str]:
+    if not sym:
+        return None
+    if sym in ACCIONES_BA:
+        return "acciones"
+    if sym in CEDEARS_BA:
+        return "cedears"
+    return None
+
+
+async def alertas_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    parts = q.data.split(":", 2)
+    if len(parts) < 3:
+        await q.edit_message_text("No pude identificar la alerta.")
+        await cmd_alertas_menu(update, context, edit=True)
+        return ConversationHandler.END
+    try:
+        idx = int(parts[2])
+    except ValueError:
+        await q.edit_message_text("Número de alerta inválido.")
+        await cmd_alertas_menu(update, context, edit=True)
+        return ConversationHandler.END
+    chat_id = q.message.chat_id
+    rules = ALERTS.get(chat_id, [])
+    if not (0 <= idx < len(rules)):
+        await q.edit_message_text("Esa alerta ya no existe.")
+        await cmd_alertas_menu(update, context, edit=True)
+        return ConversationHandler.END
+    rule = copy.deepcopy(rules[idx])
+    context.user_data["al_edit_idx"] = idx
+    kind = rule.get("kind")
+    al: Dict[str, Any] = {"kind": kind}
+    context.user_data["al"] = al
+
+    if kind == "fx":
+        al.update({
+            "type": rule.get("type"),
+            "side": rule.get("side"),
+            "op": rule.get("op"),
+            "mode": rule.get("mode"),
+        })
+        type_raw = (al.get("type") or "").lower()
+        label = FX_TYPE_LABELS.get(type_raw, type_raw.upper() or "?")
+        side_raw = al.get("side") or ""
+        side_label = SIDE_LABELS.get(side_raw, side_raw or "?")
+        op_val = al.get("op")
+        op_text = "↑ Sube" if op_val == ">" else "↓ Baja" if op_val == "<" else "?"
+        current = fmt_money_ars(rule.get("value"))
+        kb_mode = kb([
+            [("Ingresar Importe", "MODE:absolute"), ("Ingresar % vs valor actual", "MODE:percent")],
+            [("Volver", "BACK:OP"), ("Cancelar", "CANCEL")],
+        ])
+        msg = (
+            f"Tipo: {label} | Lado: {side_label} | Condición: {op_text}\n"
+            f"Objetivo actual: {current}\n¿Cómo querés definir el nuevo umbral?"
+        )
+        await q.edit_message_text(msg, reply_markup=kb_mode)
+        return AL_MODE
+
+    if kind == "metric":
+        al.update({
+            "type": rule.get("type"),
+            "op": rule.get("op"),
+            "mode": rule.get("mode"),
+        })
+        type_raw = al.get("type") or ""
+        label = METRIC_TYPE_LABELS.get(type_raw, type_raw.capitalize() or "?")
+        op_val = al.get("op")
+        op_text = "↑ Sube" if op_val == ">" else "↓ Baja" if op_val == "<" else "?"
+        if type_raw == "riesgo":
+            current = f"{(rule.get('value') or 0):.0f} pb"
+        elif type_raw == "reservas":
+            current = f"{fmt_number(rule.get('value'), 0)} MUS$"
+        else:
+            try:
+                current = f"{str(round(float(rule.get('value') or 0), 1)).replace('.', ',')}%"
+            except Exception:
+                current = f"{rule.get('value')}%"
+        kb_mode = kb([
+            [("Ingresar Importe", "MODE:absolute"), ("Ingresar % vs valor actual", "MODE:percent")],
+            [("Volver", "BACK:OP"), ("Cancelar", "CANCEL")],
+        ])
+        msg = (
+            f"Métrica: {label} | Condición: {op_text}\n"
+            f"Objetivo actual: {current}\n¿Cómo querés definir el nuevo umbral?"
+        )
+        await q.edit_message_text(msg, reply_markup=kb_mode)
+        return AL_MODE
+
+    if kind == "crypto":
+        al.update({
+            "symbol": (rule.get("symbol") or "").upper(),
+            "crypto_base": (rule.get("base") or rule.get("crypto_base") or "").upper(),
+            "crypto_quote": (rule.get("quote") or rule.get("crypto_quote") or "").upper(),
+            "op": rule.get("op"),
+            "mode": rule.get("mode"),
+        })
+        label = crypto_display_name(al.get("symbol"), al.get("crypto_base"), al.get("crypto_quote"))
+        op_val = al.get("op")
+        op_text = "↑ Sube" if op_val == ">" else "↓ Baja" if op_val == "<" else "?"
+        current = fmt_crypto_price(rule.get("value"), al.get("crypto_quote"))
+        kb_mode = kb([
+            [("Ingresar Importe", "MODE:absolute"), ("Ingresar % vs valor actual", "MODE:percent")],
+            [("Volver", "BACK:OP"), ("Cancelar", "CANCEL")],
+        ])
+        msg = (
+            f"Cripto: {label} | Condición: {op_text}\n"
+            f"Objetivo actual: {current}\n¿Cómo querés definir el nuevo umbral?"
+        )
+        await q.edit_message_text(msg, reply_markup=kb_mode)
+        return AL_MODE
+
+    if kind == "ticker":
+        sym = (rule.get("symbol") or "").upper()
+        segment = rule.get("segment") or _infer_segment_for_symbol(sym) or "acciones"
+        al.update({
+            "symbol": sym,
+            "op": rule.get("op"),
+            "segment": segment,
+        })
+        current = fmt_money_ars(rule.get("value"))
+        current_op = rule.get("op")
+        op_label = "↑ Sube" if current_op == ">" else "↓ Baja" if current_op == "<" else "?"
+        kb_op = kb([
+            [("↑ Sube", "OP:>"), ("↓ Baja", "OP:<")],
+            [
+                (
+                    "Volver",
+                    "BACK:" + ("TICKERS_ACC" if segment == "acciones" else "TICKERS_CEDEARS"),
+                ),
+                ("Cancelar", "CANCEL"),
+            ],
+        ])
+        msg = (
+            f"Ticker: {_label_long(sym)}\nCondición actual: {op_label}\n"
+            f"Objetivo actual: {current}\nElegí la nueva condición:"
+        )
+        await q.edit_message_text(msg, reply_markup=kb_op)
+        return AL_OP
+
+    await q.edit_message_text("Esta alerta no se puede modificar desde el bot.")
+    await cmd_alertas_menu(update, context, edit=True)
+    return ConversationHandler.END
 
 async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -3413,6 +3646,11 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ingresá solo número (sin $ ni % ni separadores)."); return AL_VALUE
     chat_id = update.effective_chat.id
     rules = ALERTS.setdefault(chat_id, [])
+    edit_idx = context.user_data.get("al_edit_idx")
+    if not isinstance(edit_idx, int):
+        edit_idx = None
+    is_edit = isinstance(edit_idx, int) and 0 <= edit_idx < len(rules)
+    prev_rule = rules[edit_idx] if is_edit else None
     async with ClientSession() as session:
         if al.get("kind") == "fx":
             fx = await get_dolares(session); row = fx.get(al["type"], {}) or {}
@@ -3424,14 +3662,29 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if al.get("mode") == "absolute":
                 if (al["op"] == ">" and thr <= cur) or (al["op"] == "<" and thr >= cur):
                     await update.message.reply_text(f"El objetivo debe ser {'mayor' if al['op']=='>' else 'menor'} que {fmt_money_ars(cur)}."); return AL_VALUE
-            candidate = {"kind":"fx","type":al["type"],"side":al["side"],"op":al["op"],"value":float(thr)}
-            if _has_duplicate_alert(rules, candidate):
+            candidate = {
+                "kind": "fx",
+                "type": al["type"],
+                "side": al["side"],
+                "op": al["op"],
+                "value": float(thr),
+                "mode": al.get("mode"),
+            }
+            if _has_duplicate_alert(rules, candidate, skip_idx=edit_idx if is_edit else None):
                 await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
                 return AL_VALUE
-            rules.append(candidate)
+            if is_edit:
+                if prev_rule:
+                    for key in ("pause_until", "pause_indef"):
+                        if key in prev_rule:
+                            candidate[key] = prev_rule[key]
+                rules[edit_idx] = candidate
+            else:
+                rules.append(candidate)
             _record_alert_usage(chat_id, al)
             save_state()
-            await update.message.reply_text("Listo. Alerta agregada ✅")
+            msg = "Listo. Alerta actualizada ✅" if is_edit else "Listo. Alerta agregada ✅"
+            await update.message.reply_text(msg)
             await cmd_alertas_menu(update, context)
             return ConversationHandler.END
 
@@ -3446,14 +3699,28 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if al.get("mode") == "absolute":
                 if (al["op"] == ">" and thr <= cur) or (al["op"] == "<" and thr >= cur):
                     await update.message.reply_text("El objetivo debe ser válido respecto al valor actual."); return AL_VALUE
-            candidate = {"kind":"metric","type":al["type"],"op":al["op"],"value":float(thr)}
-            if _has_duplicate_alert(rules, candidate):
+            candidate = {
+                "kind": "metric",
+                "type": al["type"],
+                "op": al["op"],
+                "value": float(thr),
+                "mode": al.get("mode"),
+            }
+            if _has_duplicate_alert(rules, candidate, skip_idx=edit_idx if is_edit else None):
                 await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
                 return AL_VALUE
-            rules.append(candidate)
+            if is_edit:
+                if prev_rule:
+                    for key in ("pause_until", "pause_indef"):
+                        if key in prev_rule:
+                            candidate[key] = prev_rule[key]
+                rules[edit_idx] = candidate
+            else:
+                rules.append(candidate)
             _record_alert_usage(chat_id, al)
             save_state()
-            await update.message.reply_text("Listo. Alerta agregada ✅")
+            msg = "Listo. Alerta actualizada ✅" if is_edit else "Listo. Alerta agregada ✅"
+            await update.message.reply_text(msg)
             await cmd_alertas_menu(update, context)
             return ConversationHandler.END
 
@@ -3481,16 +3748,24 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "base": (base or "").upper(),
                 "quote": (quote or "").upper(),
             }
-            if _has_duplicate_alert(rules, candidate):
+            if _has_duplicate_alert(rules, candidate, skip_idx=edit_idx if is_edit else None):
                 await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
                 return AL_VALUE
-            rules.append(candidate)
+            if is_edit:
+                if prev_rule:
+                    for key in ("pause_until", "pause_indef"):
+                        if key in prev_rule:
+                            candidate[key] = prev_rule[key]
+                rules[edit_idx] = candidate
+            else:
+                rules.append(candidate)
             _record_alert_usage(chat_id, al)
             save_state()
             target_s = fmt_crypto_price(thr, quote)
             direction = "sube a" if op == ">" else "baja a"
+            prefix = "Listo. Alerta actualizada ✅" if is_edit else "Listo. Alerta agregada ✅"
             await update.message.reply_text(
-                f"Listo. Alerta agregada ✅\nSe disparará si el precio {direction} {target_s}."
+                f"{prefix}\nSe disparará si el precio {direction} {target_s}."
             )
             await cmd_alertas_menu(update, context)
             return ConversationHandler.END
@@ -3504,14 +3779,29 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         thr = val
         if (op == ">" and thr <= last_px) or (op == "<" and thr >= last_px):
             await update.message.reply_text(f"El precio objetivo debe ser {'mayor' if op=='>' else 'menor'} que {fmt_money_ars(last_px)}."); return AL_VALUE
-        candidate = {"kind":"ticker","symbol":sym,"op":op,"value":float(thr),"mode":"absolute"}
-        if _has_duplicate_alert(rules, candidate):
+        candidate = {
+            "kind": "ticker",
+            "symbol": sym,
+            "op": op,
+            "value": float(thr),
+            "mode": "absolute",
+            "segment": al.get("segment"),
+        }
+        if _has_duplicate_alert(rules, candidate, skip_idx=edit_idx if is_edit else None):
             await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
             return AL_VALUE
-        rules.append(candidate)
+        if is_edit:
+            if prev_rule:
+                for key in ("pause_until", "pause_indef"):
+                    if key in prev_rule:
+                        candidate[key] = prev_rule[key]
+            rules[edit_idx] = candidate
+        else:
+            rules.append(candidate)
         _record_alert_usage(chat_id, al)
         save_state()
-        await update.message.reply_text("Listo. Alerta agregada ✅")
+        msg = "Listo. Alerta actualizada ✅" if is_edit else "Listo. Alerta agregada ✅"
+        await update.message.reply_text(msg)
         await cmd_alertas_menu(update, context)
         return ConversationHandler.END
 
@@ -5572,14 +5862,18 @@ def build_application() -> Application:
 
     # Alertas - menú simple
     app.add_handler(CommandHandler("alertas_menu", cmd_alertas_menu))
-    app.add_handler(CallbackQueryHandler(alertas_menu_cb, pattern="^AL:(LIST|CLEAR|PAUSE|RESUME)$"))
+    app.add_handler(CallbackQueryHandler(alertas_menu_cb, pattern="^AL:(LIST|EDIT|CLEAR|PAUSE|RESUME)$"))
+    app.add_handler(CallbackQueryHandler(alertas_edit_cancel, pattern="^AL:EDIT:CANCEL$"))
     app.add_handler(CallbackQueryHandler(alertas_clear_cb, pattern="^CLR:"))
     app.add_handler(CommandHandler("alertas_pause", cmd_alertas_pause))
     app.add_handler(CallbackQueryHandler(alerts_pause_cb, pattern="^AP:"))
 
     # Alertas - conversación Agregar
     alert_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(alertas_add_start, pattern="^AL:ADD$")],
+        entry_points=[
+            CallbackQueryHandler(alertas_add_start, pattern="^AL:ADD$"),
+            CallbackQueryHandler(alertas_edit_start, pattern="^AL:EDIT:[0-9]+$"),
+        ],
         states={
             AL_KIND: [
                 CallbackQueryHandler(alertas_add_suggestion, pattern="^SUG:"),
