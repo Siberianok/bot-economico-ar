@@ -1560,6 +1560,14 @@ def _normalize_news_title(title: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", norm).split())
 
 
+def _news_dedup_key(title: str, max_words: int = 9) -> str:
+    normalized = _normalize_news_title(title)
+    parts = normalized.split()
+    if len(parts) > max_words:
+        parts = parts[:max_words]
+    return " ".join(parts)
+
+
 def _is_dollar_related(title: str, desc: Optional[str]) -> bool:
     parts = [_normalize_topic_text(title)]
     if desc:
@@ -1586,6 +1594,26 @@ def _score_title(title: str) -> int:
     for kw in ("sube","baja","récord","acelera","cae","acuerdo","medida","ley","resolución","reperfil","brecha","dólar","inflación"):
         if kw in t: score += 1
     return score
+
+
+def _is_economic_relevant(title: str, desc: Optional[str]) -> bool:
+    text = " ".join(filter(None, [title, desc or ""]))
+    normalized = _normalize_topic_text(text)
+    if any(kw in normalized for kw in KEYWORDS):
+        return True
+    for _, keywords in NEWS_TOPICS:
+        if any(kw in normalized for kw in keywords):
+            return True
+    return False
+
+
+def _canonical_news_link(link: str) -> str:
+    try:
+        parsed = urlparse(link)
+        cleaned = parsed._replace(query="", fragment="", params="")
+        return cleaned.geturl()
+    except Exception:
+        return link
 
 def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
     out: List[Tuple[str, str, Optional[str]]] = []
@@ -1723,15 +1751,24 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
 
     entries_meta: Dict[str, Tuple[str, Optional[str]]] = {}
     seen_titles: Set[str] = set()
+    seen_stems: Set[str] = set()
+    seen_links: Set[str] = set()
     for title, link, desc in raw_entries:
-        if link.startswith("http"):
-            if _is_dollar_related(title, desc):
-                continue
-            norm_title = _normalize_news_title(title)
-            if norm_title in seen_titles:
-                continue
-            seen_titles.add(norm_title)
-            entries_meta[link] = (title, desc)
+        if not link.startswith("http"):
+            continue
+        if _is_dollar_related(title, desc):
+            continue
+        if not _is_economic_relevant(title, desc):
+            continue
+        norm_title = _normalize_news_title(title)
+        stem_key = _news_dedup_key(title)
+        clean_link = _canonical_news_link(link)
+        if norm_title in seen_titles or stem_key in seen_stems or clean_link in seen_links:
+            continue
+        seen_titles.add(norm_title)
+        seen_stems.add(stem_key)
+        seen_links.add(clean_link)
+        entries_meta[link] = (title, desc)
 
     if not entries_meta:
         return [
@@ -1817,6 +1854,14 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         await attempt_pick(topic_cap=None, enforce_domain=True)
     if len(picked) < limit:
         await attempt_pick(topic_cap=None, enforce_domain=False)
+    if len(picked) < limit:
+        for entry in scored:
+            if len(picked) >= limit:
+                break
+            candidate = (entry["title"], _paywall_friendly_link(entry["link"]))
+            if candidate in picked:
+                continue
+            picked.append(candidate)
     return picked[:limit]
 
 def _short_title(text: str, limit: int = 32) -> str:
