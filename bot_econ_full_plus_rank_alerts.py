@@ -1808,7 +1808,30 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     picked: List[Tuple[str,str]] = []
     used_domains: Set[str] = set()
     topic_counts: Dict[str, int] = {}
+    domain_counts: Dict[str, int] = {}
     paywall_cache: Dict[str, bool] = {}
+    picked_titles: Set[str] = set()
+    picked_stems: Set[str] = set()
+    picked_links: Set[str] = set()
+
+    def _already_picked(title: str, link: str) -> bool:
+        norm_title = _normalize_news_title(title)
+        stem_key = _news_dedup_key(title)
+        clean_link = _canonical_news_link(link)
+        return (
+            norm_title in picked_titles
+            or stem_key in picked_stems
+            or clean_link in picked_links
+        )
+
+    def _register_pick(title: str, link: str, domain: str) -> None:
+        norm_title = _normalize_news_title(title)
+        stem_key = _news_dedup_key(title)
+        clean_link = _canonical_news_link(link)
+        picked_titles.add(norm_title)
+        picked_stems.add(stem_key)
+        picked_links.add(clean_link)
+        domain_counts[domain] = domain_counts.get(domain, 0) + 1
 
     async def is_paywalled(link: str, domain: str) -> bool:
         ndom = _paywall_normalized_domain(domain)
@@ -1825,7 +1848,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         paywall_cache[link] = result
         return result
 
-    async def attempt_pick(topic_cap: Optional[int], *, enforce_domain: bool = True) -> None:
+    async def attempt_pick(topic_cap: Optional[int], *, enforce_domain: bool = True, domain_cap: Optional[int] = None) -> None:
         nonlocal picked, used_domains, topic_counts
         for entry in scored:
             if len(picked) >= limit:
@@ -1833,12 +1856,14 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             title = entry["title"]
             link = entry["link"]
             dom = entry["domain"]
-            if (title, link) in picked:
+            if _already_picked(title, link):
                 continue
             topic = _topic_for_title(title)
             if topic_cap is not None and topic_counts.get(topic, 0) >= topic_cap:
                 continue
             if enforce_domain and dom in used_domains:
+                continue
+            if domain_cap is not None and domain_counts.get(dom, 0) >= domain_cap:
                 continue
             if await is_paywalled(link, dom):
                 continue
@@ -1846,6 +1871,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             picked.append((title, friendly_link))
             topic_counts[topic] = topic_counts.get(topic, 0) + 1
             used_domains.add(dom)
+            _register_pick(title, link, dom)
 
     await attempt_pick(topic_cap=1, enforce_domain=True)
     if len(picked) < limit:
@@ -1853,15 +1879,18 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     if len(picked) < limit:
         await attempt_pick(topic_cap=None, enforce_domain=True)
     if len(picked) < limit:
-        await attempt_pick(topic_cap=None, enforce_domain=False)
+        await attempt_pick(topic_cap=None, enforce_domain=False, domain_cap=2)
     if len(picked) < limit:
         for entry in scored:
             if len(picked) >= limit:
                 break
-            candidate = (entry["title"], _paywall_friendly_link(entry["link"]))
-            if candidate in picked:
+            title = entry["title"]
+            link = entry["link"]
+            dom = entry["domain"]
+            if _already_picked(title, link) or (domain_counts.get(dom, 0) >= 2):
                 continue
-            picked.append(candidate)
+            picked.append((title, _paywall_friendly_link(link)))
+            _register_pick(title, link, dom)
     return picked[:limit]
 
 def _short_title(text: str, limit: int = 32) -> str:
