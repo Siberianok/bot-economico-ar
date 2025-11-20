@@ -543,6 +543,7 @@ ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 SUBS: Dict[int, Dict[str, Any]] = {}
 PF: Dict[int, Dict[str, Any]] = {}
 ALERT_USAGE: Dict[int, Dict[str, Dict[str, Any]]] = {}
+NEWS_HISTORY: List[Tuple[str, float]] = []
 
 _REDIS_CLIENT: Optional[Any] = None
 _REDIS_CLIENT_INITIALIZED = False
@@ -680,7 +681,7 @@ def _save_state_to_redis(payload: Dict[str, Any]) -> bool:
 
 
 def load_state():
-    global ALERTS, SUBS, PF, ALERT_USAGE
+    global ALERTS, SUBS, PF, ALERT_USAGE, NEWS_HISTORY
     data: Optional[Dict[str, Any]] = None
     if USE_UPSTASH:
         data = _load_state_from_upstash()
@@ -699,6 +700,19 @@ def load_state():
         SUBS = {int(k): v for k, v in data.get("subs", {}).items()}
         PF = {int(k): v for k, v in data.get("pf", {}).items()}
         ALERT_USAGE = {int(k): v for k, v in data.get("alert_usage", {}).items()}
+        raw_history = data.get("news_history", [])
+        if isinstance(raw_history, list):
+            NEWS_HISTORY = []
+            for item in raw_history:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    continue
+                stem, ts = item[0], item[1]
+                try:
+                    stem_str = str(stem)
+                    ts_val = float(ts)
+                except Exception:
+                    continue
+                NEWS_HISTORY.append((stem_str, ts_val))
         log.info(
             "State loaded. alerts=%d subs=%d pf=%d",
             sum(len(v) for v in ALERTS.values()),
@@ -708,9 +722,22 @@ def load_state():
     else:
         log.info("No previous state found.")
 
+def _prune_news_history(now: Optional[float] = None, window_hours: int = 72) -> None:
+    global NEWS_HISTORY
+    ts_now = now if now is not None else time()
+    cutoff = ts_now - (window_hours * 3600)
+    NEWS_HISTORY = [(stem, ts) for stem, ts in NEWS_HISTORY if ts >= cutoff]
+
 
 def save_state():
-    payload = {"alerts": ALERTS, "subs": SUBS, "pf": PF, "alert_usage": ALERT_USAGE}
+    _prune_news_history()
+    payload = {
+        "alerts": ALERTS,
+        "subs": SUBS,
+        "pf": PF,
+        "alert_usage": ALERT_USAGE,
+        "news_history": NEWS_HISTORY,
+    }
     if USE_UPSTASH:
         _save_state_to_upstash(payload)
         return
@@ -1739,6 +1766,11 @@ def _mentions_argentina(title: str, desc: Optional[str]) -> bool:
 
 
 async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tuple[str, str]]:
+    global NEWS_HISTORY
+    now_ts = time()
+    _prune_news_history(now_ts)
+    history_stems: Set[str] = {stem for stem, _ in NEWS_HISTORY}
+
     raw_entries: List[Tuple[str, str, Optional[str]]] = []
     for url in RSS_FEEDS:
         xml = await fetch_text(session, url, headers={"Accept":"application/rss+xml, application/atom+xml, */*"})
@@ -1763,7 +1795,12 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         norm_title = _normalize_news_title(title)
         stem_key = _news_dedup_key(title)
         clean_link = _canonical_news_link(link)
-        if norm_title in seen_titles or stem_key in seen_stems or clean_link in seen_links:
+        if (
+            norm_title in seen_titles
+            or stem_key in seen_stems
+            or clean_link in seen_links
+            or stem_key in history_stems
+        ):
             continue
         seen_titles.add(norm_title)
         seen_stems.add(stem_key)
@@ -1872,6 +1909,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             topic_counts[topic] = topic_counts.get(topic, 0) + 1
             used_domains.add(dom)
             _register_pick(title, link, dom)
+            NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
 
     await attempt_pick(topic_cap=1, enforce_domain=True)
     if len(picked) < limit:
@@ -1879,9 +1917,15 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     if len(picked) < limit:
         await attempt_pick(topic_cap=None, enforce_domain=True)
     if len(picked) < limit:
+        await attempt_pick(topic_cap=None, enforce_domain=False, domain_cap=1)
+    if len(picked) < limit:
         await attempt_pick(topic_cap=None, enforce_domain=False, domain_cap=2)
     if len(picked) < limit:
-        for entry in scored:
+        scored_sorted = sorted(
+            scored,
+            key=lambda item: (domain_counts.get(item["domain"], 0), -item["score"]),
+        )
+        for entry in scored_sorted:
             if len(picked) >= limit:
                 break
             title = entry["title"]
@@ -1891,6 +1935,8 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
                 continue
             picked.append((title, _paywall_friendly_link(link)))
             _register_pick(title, link, dom)
+            NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
+    save_state()
     return picked[:limit]
 
 def _short_title(text: str, limit: int = 32) -> str:
