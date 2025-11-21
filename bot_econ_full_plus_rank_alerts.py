@@ -67,6 +67,7 @@ ARG_DATOS_BASES = [
     "https://argentinadatos.com/v1/finanzas/indices",
 ]
 
+DOLARITO_RIESGO_API = "https://api.dolarito.ar/api/frontend/indices/riesgoPais"
 CRIPTOYA_RIESGO_URL = "https://criptoya.com/charts/riesgo-pais"
 
 LAMACRO_RESERVAS_URL = "https://www.lamacro.ar/variables/1"
@@ -1179,34 +1180,83 @@ async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Option
     try: return float(v) if v is not None else None
     except: return None
 
-async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str]]]:
+async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str], Optional[float]]]:
     val: Optional[float] = None
     fecha: Optional[str] = None
+    variation: Optional[float] = None
 
-    for base in ARG_DATOS_BASES:
-        for suf in ("/riesgo-pais/ultimo/", "/riesgo-pais/ultimo", "/riesgo-pais/"):
-            j = await fetch_json(session, base + suf)
-            if not j:
-                continue
-            if isinstance(j, list):
-                last = j[-1] if j and isinstance(j[-1], dict) else None
-            elif isinstance(j, dict):
-                last = j
-            else:
-                last = None
-            if not isinstance(last, dict):
-                continue
-            raw_val = last.get("valor")
+    # 1) Dolarito (fuente principal)
+    dolarito_data = await fetch_json(session, DOLARITO_RIESGO_API, headers=REQ_HEADERS)
+    if isinstance(dolarito_data, dict):
+        # Intentamos cubrir distintos posibles nombres de campos
+        val_candidates = (
+            dolarito_data.get("valor"),
+            dolarito_data.get("value"),
+            dolarito_data.get("ultimo"),
+            dolarito_data.get("last"),
+        )
+        for raw_val in val_candidates:
             try:
+                if raw_val is not None:
+                    val = float(raw_val)
+                    break
+            except (TypeError, ValueError):
+                continue
+
+        if "fecha" in dolarito_data and dolarito_data.get("fecha"):
+            fecha = str(dolarito_data.get("fecha"))
+        elif "updatedAt" in dolarito_data and dolarito_data.get("updatedAt"):
+            fecha = str(dolarito_data.get("updatedAt"))
+
+        prev_val = None
+        for key in ("valorAnterior", "previous", "prev", "anterior"):
+            try:
+                if dolarito_data.get(key) is not None:
+                    prev_val = float(dolarito_data[key])
+                    break
+            except (TypeError, ValueError):
+                continue
+        if prev_val and val not in (None, 0):
+            try:
+                variation = ((val - prev_val) / prev_val) * 100.0
+            except Exception:
+                variation = None
+
+    # 2) ArgentinaDatos
+    if val is None or variation is None:
+        for base in ARG_DATOS_BASES:
+            history: List[Dict[str, Any]] = []
+            for suf in ("/riesgo-pais/", "/riesgo-pais/ultimo/", "/riesgo-pais/ultimo"):
+                j = await fetch_json(session, base + suf)
+                if not j:
+                    continue
+                if isinstance(j, list):
+                    history = [row for row in j if isinstance(row, dict)]
+                elif isinstance(j, dict):
+                    history = [j]
+                if history:
+                    break
+            if not history:
+                continue
+
+            last = history[-1]
+            prev = history[-2] if len(history) > 1 else None
+            try:
+                raw_val = last.get("valor")
                 if raw_val is not None:
                     val = float(raw_val)
             except (TypeError, ValueError):
                 val = None
             fecha = str(last.get("fecha")) if last.get("fecha") else fecha
+            if prev:
+                try:
+                    prev_val = float(prev.get("valor")) if prev.get("valor") is not None else None
+                    if prev_val not in (None, 0) and val is not None:
+                        variation = ((val - prev_val) / prev_val) * 100.0
+                except (TypeError, ValueError):
+                    variation = variation
             if val is not None:
                 break
-        if val is not None:
-            break
 
     if val is None:
         data = await _fetch_rava_profile(session, "riesgo pais")
@@ -1327,9 +1377,18 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
         return None
 
     try:
-        return (int(round(val)), fecha)
+        return (int(round(val)), fecha, variation)
     except Exception:
         return None
+
+
+def _format_riesgo_variation(var: Optional[float]) -> str:
+    if not isinstance(var, (int, float)):
+        return ""
+    arrow = "🔻" if var < 0 else "🔺" if var > 0 else "➡️"
+    color = "#0abf53" if var < 0 else "#d7263d" if var > 0 else "#888"
+    sign = "" if var < 0 else "+" if var > 0 else ""
+    return f" <span style='color:{color}'>{arrow} {sign}{var:.2f}%</span>"
 
 async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
     for suf in ("/inflacion", "/inflacion/mensual/ultimo", "/inflacion/mensual"):
@@ -2700,8 +2759,10 @@ async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tup is None:
         txt = "No pude obtener riesgo país ahora."
     else:
-        rp, f = tup; f_str = parse_iso_ddmmyyyy(f)
-        txt = f"<b>📈 Riesgo País</b>{f' <i>{f_str}</i>' if f_str else ''}\n<b>{rp} pb</b>\n<i>Fuente: ArgentinaDatos</i>"
+        rp, f, var = tup; f_str = parse_iso_ddmmyyyy(f)
+        change_txt = _format_riesgo_variation(var)
+        txt = (f"<b>📈 Riesgo País</b>{f' <i>{f_str}</i>' if f_str else ''}\n"
+               f"<b>{rp} pb</b>{change_txt}\n<i>Fuente: Dolarito.ar</i>")
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6281,7 +6342,11 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if fx:
         partes.append(format_dolar_message(fx))
     if rp:
-        partes.append(f"<b>📈 Riesgo País</b> {rp[0]} pb" + (f" <i>({parse_iso_ddmmyyyy(rp[1])})</i>" if rp[1] else ""))
+        change_txt = _format_riesgo_variation(rp[2])
+        partes.append(
+            f"<b>📈 Riesgo País</b> {rp[0]} pb{change_txt}"
+            + (f" <i>({parse_iso_ddmmyyyy(rp[1])})</i>" if rp[1] else "")
+        )
     if infl:
         partes.append(f"<b>📉 Inflación Mensual</b> {str(round(infl[0],1)).replace('.',',')}%" + (f" <i>({infl[1]})</i>" if infl[1] else ""))
     if rv:
