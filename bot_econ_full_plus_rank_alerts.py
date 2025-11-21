@@ -2193,11 +2193,12 @@ def _label_short(sym: str) -> str:
     if sym.endswith(".BA"): return f"{NAME_ABBR.get(sym, sym)} ({sym[:-3]})"
     return label_with_currency(sym)
 
-def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
+def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     fecha = None
     for row in d.values():
         f = row.get("fecha")
-        if f: fecha = parse_iso_ddmmyyyy(f)
+        if f:
+            fecha = parse_iso_ddmmyyyy(f)
     header = "<b>💵 Dólares</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
     lines = [header, "<pre>Tipo         Compra        Venta    Var. día</pre>"]
     rows = []
@@ -2472,8 +2473,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         data = await get_dolares(session)
-    msg = format_dolar_message(data) if data else "No pude obtener cotizaciones ahora."
-    await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    if not data:
+        await update.effective_message.reply_text(
+            "No pude obtener cotizaciones ahora.",
+            parse_mode=ParseMode.HTML,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+        return
+
+    compra_msg, venta_msg = format_dolar_panels(data)
+    await update.effective_message.reply_text(
+        compra_msg,
+        parse_mode=ParseMode.HTML,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+    await update.effective_message.reply_text(
+        venta_msg,
+        parse_mode=ParseMode.HTML,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
 
 async def cmd_acciones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_menu_counter(context, "acciones", 2)
