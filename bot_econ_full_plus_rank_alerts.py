@@ -2385,7 +2385,9 @@ def _short_title(text: str, limit: int = 32) -> str:
 
 
 def _format_news_item(title: str, link: str) -> str:
-    return f"• {anchor(link, title)}\n{_impact_lines(title)}"
+    safe_title = _html.escape(title)
+    safe_link = _html.escape(link, True)
+    return f"• {safe_title}\n{safe_link}\n{_impact_lines(title)}"
 
 
 def _build_news_layout(news: List[Tuple[str, str]]) -> Tuple[str, Optional[InlineKeyboardMarkup], List[str]]:
