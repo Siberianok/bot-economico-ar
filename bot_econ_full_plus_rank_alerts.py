@@ -2104,9 +2104,9 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     ]
     if NEWS_CACHE.get("date") == today and NEWS_CACHE.get("items"):
         cached_items = _dedup_news_items(NEWS_CACHE.get("items", []), limit=target_limit)
-        # Si el cache solo tiene portadas/genéricos, volvemos a buscar noticias reales
+        # Reutilizar solo si el cache tiene suficientes ítems y al menos una nota real
         cache_has_articles = any(_is_probably_article_url(l) for _, l in cached_items)
-        if cache_has_articles:
+        if cache_has_articles and len(cached_items) >= target_limit:
             if len(cached_items) != len(NEWS_CACHE.get("items", [])):
                 NEWS_CACHE["items"] = cached_items
                 save_state()
