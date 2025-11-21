@@ -1727,6 +1727,27 @@ def _canonical_news_link(link: str) -> str:
     except Exception:
         return link
 
+def _is_probably_article_url(link: str) -> bool:
+    try:
+        parsed = urlparse(link)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    path = (parsed.path or "").strip()
+    if not path or path == "/":
+        return False
+    parts = [p for p in path.strip("/").split("/") if p]
+    if not parts:
+        return False
+    tail = parts[-1].lower()
+    if tail in {"economia", "finanzas", "finanzas-mercados", "finanzas-y-mercados"}:
+        return False
+    if len(parts) == 1 and len(tail) < 10:
+        return False
+    has_signal = ("-" in tail) or any(ch.isdigit() for ch in tail) or len(tail) >= 10
+    return has_signal or len(parts) >= 2
+
 def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
     out: List[Tuple[str, str, Optional[str]]] = []
     try:
@@ -1741,7 +1762,7 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
         desc = None
         if d_el is not None and d_el.text:
             desc = d_el.text.strip()
-        if t and l and l.startswith("http"):
+        if t and l and l.startswith("http") and _is_probably_article_url(l):
             out.append((t, l, desc))
     for entry in root.findall(".//{*}entry"):
         t_el = entry.find(".//{*}title")
@@ -1754,12 +1775,12 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
         desc = None
         if summary_el is not None and summary_el.text:
             desc = summary_el.text.strip()
-        if t and l and l.startswith("http"):
+        if t and l and l.startswith("http") and _is_probably_article_url(l):
             out.append((t, l, desc))
     if not out:
         for m in re.finditer(r"<title>(.*?)</title>.*?<link>(https?://[^<]+)</link>", xml, flags=re.S|re.I):
             t = re.sub(r"<.*?>", "", m.group(1)).strip(); l = m.group(2).strip()
-            if t and l:
+            if t and l and _is_probably_article_url(l):
                 out.append((t, l, None))
     return out
 
@@ -1880,6 +1901,8 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     seen_links: Set[str] = set()
     for title, link, desc in raw_entries:
         if not link.startswith("http"):
+            continue
+        if not _is_probably_article_url(link):
             continue
         if _is_dollar_related(title, desc):
             continue
