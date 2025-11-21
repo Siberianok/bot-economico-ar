@@ -544,6 +544,7 @@ SUBS: Dict[int, Dict[str, Any]] = {}
 PF: Dict[int, Dict[str, Any]] = {}
 ALERT_USAGE: Dict[int, Dict[str, Dict[str, Any]]] = {}
 NEWS_HISTORY: List[Tuple[str, float]] = []
+NEWS_CACHE: Dict[str, Any] = {"date": "", "items": []}
 
 _REDIS_CLIENT: Optional[Any] = None
 _REDIS_CLIENT_INITIALIZED = False
@@ -681,7 +682,7 @@ def _save_state_to_redis(payload: Dict[str, Any]) -> bool:
 
 
 def load_state():
-    global ALERTS, SUBS, PF, ALERT_USAGE, NEWS_HISTORY
+    global ALERTS, SUBS, PF, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE
     data: Optional[Dict[str, Any]] = None
     if USE_UPSTASH:
         data = _load_state_from_upstash()
@@ -713,6 +714,12 @@ def load_state():
                 except Exception:
                     continue
                 NEWS_HISTORY.append((stem_str, ts_val))
+        cache_date = data.get("news_cache_date")
+        cache_items = data.get("news_cache_items")
+        if isinstance(cache_items, list) and isinstance(cache_date, str):
+            NEWS_CACHE = {"date": cache_date, "items": cache_items}
+        else:
+            NEWS_CACHE = {"date": "", "items": []}
         log.info(
             "State loaded. alerts=%d subs=%d pf=%d",
             sum(len(v) for v in ALERTS.values()),
@@ -737,6 +744,8 @@ def save_state():
         "pf": PF,
         "alert_usage": ALERT_USAGE,
         "news_history": NEWS_HISTORY,
+        "news_cache_date": NEWS_CACHE.get("date", ""),
+        "news_cache_items": NEWS_CACHE.get("items", []),
     }
     if USE_UPSTASH:
         _save_state_to_upstash(payload)
@@ -1643,6 +1652,26 @@ def _news_dedup_key(title: str, max_words: int = 9) -> str:
     return " ".join(parts)
 
 
+def _dedup_news_items(items: List[Tuple[str, str]], limit: Optional[int] = None) -> List[Tuple[str, str]]:
+    seen_titles: Set[str] = set()
+    seen_stems: Set[str] = set()
+    seen_links: Set[str] = set()
+    deduped: List[Tuple[str, str]] = []
+    for title, link in items:
+        norm_title = _normalize_news_title(title)
+        stem_key = _news_dedup_key(title)
+        clean_link = _canonical_news_link(link)
+        if norm_title in seen_titles or stem_key in seen_stems or clean_link in seen_links:
+            continue
+        seen_titles.add(norm_title)
+        seen_stems.add(stem_key)
+        seen_links.add(clean_link)
+        deduped.append((title, link))
+        if limit is not None and len(deduped) >= limit:
+            break
+    return deduped
+
+
 def _is_dollar_related(title: str, desc: Optional[str]) -> bool:
     parts = [_normalize_topic_text(title)]
     if desc:
@@ -1663,11 +1692,19 @@ def domain_of(url: str) -> str:
     except Exception: return ""
 
 def _score_title(title: str) -> int:
+    """Puntaje determinista que prioriza términos macro y de mercados locales."""
     t = title.lower(); score = 0
+    # Peso fuerte para macro local
     for kw in KEYWORDS:
+        if kw in t: score += 5
+    # Dinámica de dólar e inflación
+    for kw in ("dólar","dolar","inflación","ipc","brecha","ccl","mep"):
         if kw in t: score += 3
-    for kw in ("sube","baja","récord","acelera","cae","acuerdo","medida","ley","resolución","reperfil","brecha","dólar","inflación"):
+    # Medidas, leyes y shocks
+    for kw in ("sube","baja","récord","acelera","cae","acuerdo","medida","ley","resolución","reperfil","anuncio","emergencia"):
         if kw in t: score += 1
+    # Títulos más largos suelen ser más descriptivos
+    score += min(len(t) // 12, 3)
     return score
 
 
@@ -1690,6 +1727,27 @@ def _canonical_news_link(link: str) -> str:
     except Exception:
         return link
 
+def _is_probably_article_url(link: str) -> bool:
+    try:
+        parsed = urlparse(link)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    path = (parsed.path or "").strip()
+    if not path or path == "/":
+        return False
+    parts = [p for p in path.strip("/").split("/") if p]
+    if not parts:
+        return False
+    tail = parts[-1].lower()
+    if tail in {"economia", "finanzas", "finanzas-mercados", "finanzas-y-mercados"}:
+        return False
+    if len(parts) == 1 and len(tail) < 10:
+        return False
+    has_signal = ("-" in tail) or any(ch.isdigit() for ch in tail) or len(tail) >= 10
+    return has_signal or len(parts) >= 2
+
 def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
     out: List[Tuple[str, str, Optional[str]]] = []
     try:
@@ -1704,7 +1762,7 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
         desc = None
         if d_el is not None and d_el.text:
             desc = d_el.text.strip()
-        if t and l and l.startswith("http"):
+        if t and l and l.startswith("http") and _is_probably_article_url(l):
             out.append((t, l, desc))
     for entry in root.findall(".//{*}entry"):
         t_el = entry.find(".//{*}title")
@@ -1717,12 +1775,12 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
         desc = None
         if summary_el is not None and summary_el.text:
             desc = summary_el.text.strip()
-        if t and l and l.startswith("http"):
+        if t and l and l.startswith("http") and _is_probably_article_url(l):
             out.append((t, l, desc))
     if not out:
         for m in re.finditer(r"<title>(.*?)</title>.*?<link>(https?://[^<]+)</link>", xml, flags=re.S|re.I):
             t = re.sub(r"<.*?>", "", m.group(1)).strip(); l = m.group(2).strip()
-            if t and l:
+            if t and l and _is_probably_article_url(l):
                 out.append((t, l, None))
     return out
 
@@ -1814,9 +1872,17 @@ def _mentions_argentina(title: str, desc: Optional[str]) -> bool:
 
 
 async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tuple[str, str]]:
-    global NEWS_HISTORY
+    global NEWS_HISTORY, NEWS_CACHE
     now_ts = time()
     _prune_news_history(now_ts)
+    today = datetime.utcfromtimestamp(now_ts).date().isoformat()
+    target_limit = max(limit, 5)
+    if NEWS_CACHE.get("date") == today and NEWS_CACHE.get("items"):
+        cached_items = _dedup_news_items(NEWS_CACHE.get("items", []), limit=target_limit)
+        if len(cached_items) != len(NEWS_CACHE.get("items", [])):
+            NEWS_CACHE["items"] = cached_items
+            save_state()
+        return cached_items[:limit]
     history_stems: Set[str] = {stem for stem, _ in NEWS_HISTORY}
 
     raw_entries: List[Tuple[str, str, Optional[str]]] = []
@@ -1835,6 +1901,8 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     seen_links: Set[str] = set()
     for title, link, desc in raw_entries:
         if not link.startswith("http"):
+            continue
+        if not _is_probably_article_url(link):
             continue
         if _is_dollar_related(title, desc):
             continue
@@ -1856,11 +1924,9 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         entries_meta[link] = (title, desc)
 
     if not entries_meta:
-        return [
-            ("Mercados: sin novedades relevantes", "https://www.ambito.com/"),
-            ("Actividad: esperando datos de inflación", "https://www.cronista.com/"),
-            ("Consumo: expectativa por ventas minoristas", "https://www.perfil.com/"),
-        ][:limit]
+        NEWS_CACHE = {"date": today, "items": []}
+        save_state()
+        return []
 
     scored: List[Dict[str, Any]] = []
     for link, (title, desc) in entries_meta.items():
@@ -1886,6 +1952,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             1 if item["is_national"] else 0,
             1 if item["mentions"] else 0,
             item["score"],
+            item["title"].lower(),
         ),
         reverse=True,
     )
@@ -1936,7 +2003,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     async def attempt_pick(topic_cap: Optional[int], *, enforce_domain: bool = True, domain_cap: Optional[int] = None) -> None:
         nonlocal picked, used_domains, topic_counts
         for entry in scored:
-            if len(picked) >= limit:
+            if len(picked) >= target_limit:
                 break
             title = entry["title"]
             link = entry["link"]
@@ -1960,21 +2027,21 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
 
     await attempt_pick(topic_cap=1, enforce_domain=True)
-    if len(picked) < limit:
+    if len(picked) < target_limit:
         await attempt_pick(topic_cap=2, enforce_domain=True)
-    if len(picked) < limit:
+    if len(picked) < target_limit:
         await attempt_pick(topic_cap=None, enforce_domain=True)
-    if len(picked) < limit:
+    if len(picked) < target_limit:
         await attempt_pick(topic_cap=None, enforce_domain=False, domain_cap=1)
-    if len(picked) < limit:
+    if len(picked) < target_limit:
         await attempt_pick(topic_cap=None, enforce_domain=False, domain_cap=2)
-    if len(picked) < limit:
+    if len(picked) < target_limit:
         scored_sorted = sorted(
             scored,
             key=lambda item: (domain_counts.get(item["domain"], 0), -item["score"]),
         )
         for entry in scored_sorted:
-            if len(picked) >= limit:
+            if len(picked) >= target_limit:
                 break
             title = entry["title"]
             link = entry["link"]
@@ -1984,8 +2051,10 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             picked.append((title, _paywall_friendly_link(link)))
             _register_pick(title, link, dom)
             NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
+    deduped_final = _dedup_news_items(picked, target_limit)
+    NEWS_CACHE = {"date": today, "items": deduped_final[:target_limit]}
     save_state()
-    return picked[:limit]
+    return NEWS_CACHE["items"][:limit]
 
 def _short_title(text: str, limit: int = 32) -> str:
     if len(text) <= limit:
