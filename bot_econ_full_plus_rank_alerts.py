@@ -1924,9 +1924,16 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         entries_meta[link] = (title, desc)
 
     if not entries_meta:
-        NEWS_CACHE = {"date": today, "items": []}
+        fallback = [
+            ("Mercados: sin novedades relevantes", "https://www.ambito.com/"),
+            ("Actividad: esperando datos de inflación", "https://www.cronista.com/"),
+            ("Consumo: expectativa por ventas minoristas", "https://www.perfil.com/"),
+            ("Créditos: panorama de tasas y costos", "https://www.infobae.com/"),
+            ("Comercio exterior: dinámica de importaciones", "https://www.pagina12.com.ar/"),
+        ]
+        NEWS_CACHE = {"date": today, "items": fallback[:target_limit]}
         save_state()
-        return []
+        return NEWS_CACHE["items"][:limit]
 
     scored: List[Dict[str, Any]] = []
     for link, (title, desc) in entries_meta.items():
