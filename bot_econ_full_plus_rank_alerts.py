@@ -2783,11 +2783,26 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
     inf_txt = fmt_money_ars(banda_inf) if banda_inf is not None else "—"
     pct_txt = pct(pct_val, 2) if pct_val is not None else "—"
 
+    header = "<b>📊 Bandas cambiarias</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
+
+    col1 = ["Banda superior", "Banda inferior"]
+    col2 = [sup_txt, inf_txt]
+    col3 = [pct_txt, pct_txt]
+
+    col1_w = max(len(_html.unescape(t)) for t in col1)
+    col2_w = max(len(_html.unescape(t)) for t in col2)
+
+    rows = []
+    for c1, c2, c3 in zip(col1, col2, col3):
+        rows.append(
+            f"{c1.ljust(col1_w)} | {c2.rjust(col2_w)} | {c3}"
+        )
+
+    table = "\n".join(rows)
+
     lines = [
-        "<b>📊 Bandas cambiarias</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else ""),
-        f"Banda superior: <b>{sup_txt}</b>",
-        f"Banda inferior: <b>{inf_txt}</b>",
-        f"Variación diaria: <b>{pct_txt}</b>",
+        header,
+        "<pre>Nombre           | Importe | Variación\n" + table + "</pre>",
         "<i>Fuente: DolarAPI</i>",
     ]
     return "\n".join(lines)
