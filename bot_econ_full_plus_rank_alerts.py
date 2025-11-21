@@ -1223,35 +1223,62 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
     # 1) Dolarito (fuente principal)
     dolarito_data = await fetch_json(session, DOLARITO_RIESGO_API, headers=REQ_HEADERS)
     if isinstance(dolarito_data, dict):
-        # Intentamos cubrir distintos posibles nombres de campos
-        val_candidates = (
-            dolarito_data.get("valor"),
-            dolarito_data.get("value"),
-            dolarito_data.get("ultimo"),
-            dolarito_data.get("last"),
+        def _get_from_paths(paths: Iterable[Tuple[str, ...]]) -> Any:
+            for path in paths:
+                current: Any = dolarito_data
+                for key in path:
+                    if isinstance(current, dict) and key in current:
+                        current = current.get(key)
+                    else:
+                        current = None
+                        break
+                if current is not None:
+                    return current
+            return None
+
+        def _safe_number(raw: Any) -> Optional[float]:
+            try:
+                num = float(raw)
+                return num if math.isfinite(num) and num > 0 else None
+            except (TypeError, ValueError):
+                return None
+
+        val_raw = _get_from_paths(
+            (
+                ("valor",),
+                ("value",),
+                ("ultimo",),
+                ("last",),
+                ("data", "valor"),
+                ("data", "value"),
+                ("data", "ultimo"),
+                ("data", "last"),
+            )
         )
-        for raw_val in val_candidates:
-            try:
-                if raw_val is not None:
-                    val = float(raw_val)
-                    break
-            except (TypeError, ValueError):
-                continue
+        parsed_val = _safe_number(val_raw)
+        if parsed_val is not None:
+            val = parsed_val
 
-        if "fecha" in dolarito_data and dolarito_data.get("fecha"):
-            fecha = str(dolarito_data.get("fecha"))
-        elif "updatedAt" in dolarito_data and dolarito_data.get("updatedAt"):
-            fecha = str(dolarito_data.get("updatedAt"))
+        fecha_raw = _get_from_paths((("fecha",), ("updatedAt",), ("data", "fecha"), ("data", "updatedAt")))
+        if fecha_raw:
+            fecha = str(fecha_raw)
 
-        prev_val = None
-        for key in ("valorAnterior", "previous", "prev", "anterior"):
-            try:
-                if dolarito_data.get(key) is not None:
-                    prev_val = float(dolarito_data[key])
-                    break
-            except (TypeError, ValueError):
-                continue
-        if prev_val and val not in (None, 0):
+        prev_val = _safe_number(
+            _get_from_paths(
+                (
+                    ("valorAnterior",),
+                    ("previous",),
+                    ("prev",),
+                    ("anterior",),
+                    ("data", "valorAnterior"),
+                    ("data", "previous"),
+                    ("data", "prev"),
+                    ("data", "anterior"),
+                )
+            )
+        )
+
+        if prev_val not in (None, 0) and val is not None:
             try:
                 variation = ((val - prev_val) / prev_val) * 100.0
             except Exception:
@@ -1278,19 +1305,19 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
             prev = history[-2] if len(history) > 1 else None
             try:
                 raw_val = last.get("valor")
-                if raw_val is not None:
+                if val is None and raw_val is not None:
                     val = float(raw_val)
             except (TypeError, ValueError):
-                val = None
+                val = val if val is not None else None
             fecha = str(last.get("fecha")) if last.get("fecha") else fecha
             if prev:
                 try:
                     prev_val = float(prev.get("valor")) if prev.get("valor") is not None else None
-                    if prev_val not in (None, 0) and val is not None:
+                    if prev_val not in (None, 0) and val is not None and variation is None:
                         variation = ((val - prev_val) / prev_val) * 100.0
                 except (TypeError, ValueError):
                     variation = variation
-            if val is not None:
+            if val is not None and variation is not None:
                 fuente = "ArgentinaDatos"
                 break
 
