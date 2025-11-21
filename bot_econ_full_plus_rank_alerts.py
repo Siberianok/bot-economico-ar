@@ -2105,6 +2105,17 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
     lines = [header, "<pre>Tipo         Compra        Venta    Var. día</pre>"]
     rows = []
     order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
+    def _fmt_var(val: Optional[float]) -> str:
+        if val is None:
+            return "—"
+        arrow = "🟢⬇️" if val < 0 else "🔴⬆️" if val > 0 else "⏺️"
+        return f"{arrow} {abs(val):.2f}%"
+
+    compra_lines = ["<b>📥 Compra</b>", "<pre>Tipo         Compra        Var. día</pre>"]
+    venta_lines = ["<b>📤 Venta</b>", "<pre>Tipo         Venta         Var. día</pre>"]
+    compra_rows: List[str] = []
+    venta_rows: List[str] = []
+
     for k, label in order:
         row = d.get(k)
         if not row: continue
