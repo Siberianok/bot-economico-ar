@@ -1679,11 +1679,11 @@ async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
 
 from xml.etree import ElementTree as ET
 RSS_FEEDS = [
-    # RSS de secciones económicas locales (links directos a notas)
-    "https://www.ambito.com/rss/economia.xml",
-    "https://www.clarin.com/rss/economia/",
-    "https://www.cronista.com/rss/economia/",
-    "https://www.iprofesional.com/rss/economia",
+    # Google News queries acotadas a Argentina y a las últimas 24hs.
+    "https://news.google.com/rss/search?q=econom%C3%ADa+argentina+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=finanzas+argentinas+OR+mercados+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=empresas+argentina+OR+negocios+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=inflaci%C3%B3n+argentina+OR+bcra+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
 ]
 NATIONAL_NEWS_DOMAINS: Set[str] = {
     "ambito.com",
@@ -2460,22 +2460,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     kb_rows = [
         [
-            InlineKeyboardButton("💵 Dólar y Reservas", callback_data="ECO:DOLAR"),
+            InlineKeyboardButton("💵 Tipos de cambio", callback_data="ECO:DOLAR"),
+            InlineKeyboardButton("🏦 Reservas", callback_data="ECO:RESERVAS"),
+        ],
+        [
             InlineKeyboardButton("📰 Noticias", callback_data="ECO:NOTICIAS"),
-        ],
-        [
             InlineKeyboardButton("📈 Acciones Top 3", callback_data="ACC:TOP3"),
+        ],
+        [
             InlineKeyboardButton("🏁 Acciones Proyección", callback_data="ACC:TOP5"),
-        ],
-        [
             InlineKeyboardButton("🌎 Cedears Top 3", callback_data="CED:TOP3"),
-            InlineKeyboardButton("🌐 Cedears Proyección", callback_data="CED:TOP5"),
         ],
         [
+            InlineKeyboardButton("🌐 Cedears Proyección", callback_data="CED:TOP5"),
             InlineKeyboardButton("🔔 Mis alertas", callback_data="AL:LIST"),
-            InlineKeyboardButton("🧾 Resumen diario", callback_data="ST:SUBS"),
         ],
-        [InlineKeyboardButton("💼 Portafolio", callback_data="PF:MENU")],
+        [
+            InlineKeyboardButton("🧾 Resumen diario", callback_data="ST:SUBS"),
+            InlineKeyboardButton("💼 Portafolio", callback_data="PF:MENU"),
+        ],
     ]
 
     await update.effective_message.reply_text(
