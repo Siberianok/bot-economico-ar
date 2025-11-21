@@ -2213,7 +2213,7 @@ def _label_short(sym: str) -> str:
     if sym.endswith(".BA"): return f"{NAME_ABBR.get(sym, sym)} ({sym[:-3]})"
     return label_with_currency(sym)
 
-def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> str:
+def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     fecha = None
     for row in d.values():
         f = row.get("fecha")
@@ -2518,12 +2518,13 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    msg = format_dolar_panels(data)
-    await update.effective_message.reply_text(
-        msg,
-        parse_mode=ParseMode.HTML,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
-    )
+    compra_msg, venta_msg = format_dolar_panels(data)
+    for msg in (compra_msg, venta_msg):
+        await update.effective_message.reply_text(
+            msg,
+            parse_mode=ParseMode.HTML,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
 
 async def cmd_acciones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_menu_counter(context, "acciones", 2)
