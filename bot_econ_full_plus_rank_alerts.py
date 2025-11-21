@@ -62,6 +62,7 @@ WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 CRYPTOYA_DOLAR_URL = "https://criptoya.com/api/dolar"
 DOLARAPI_BASE = "https://dolarapi.com/v1"
 BANDAS_CAMBIARIAS_URL = f"{DOLARAPI_BASE}/bandas-cambiarias"
+DOLARITO_BANDAS_HTML = "https://dolarito.ar/dolar/bandas-cambiarias"
 
 ARG_DATOS_BASES = [
     "https://api.argentinadatos.com/v1/finanzas/indices",
@@ -2749,7 +2750,59 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
 
+async def _parse_dolarito_bandas_html(html: str) -> Optional[Dict[str, Any]]:
+    match = re.search(r'bands\\":\{.*?\},\\"timestamp\\":\d+', html, re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        decoded = match.group(0).encode("utf-8").decode("unicode_escape")
+        parsed = json.loads("{" + decoded + "}")
+    except Exception as exc:
+        log.warning("No se pudo parsear bandas de Dolarito: %s", exc)
+        return None
+
+    bands = parsed.get("bands") if isinstance(parsed, dict) else None
+    if not isinstance(bands, dict):
+        return None
+
+    data: Dict[str, Any] = {
+        "banda_superior": bands.get("upper"),
+        "banda_inferior": bands.get("lower"),
+        "variacion_diaria": (bands.get("dolarMayorista") or {}).get("variation"),
+        "fecha": None,
+        "fuente": "Dolarito.ar",
+    }
+
+    ts_candidates = [bands.get("timestamp"), parsed.get("timestamp")]
+    for ts in ts_candidates:
+        try:
+            if ts is None:
+                continue
+            dt = datetime.fromtimestamp(float(ts) / 1000.0, tz=TZ)
+            data["fecha"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+            break
+        except Exception:
+            continue
+
+    return data
+
+async def _fetch_dolarito_bandas(session: ClientSession) -> Optional[Dict[str, Any]]:
+    html = await fetch_text(
+        session,
+        DOLARITO_BANDAS_HTML,
+        headers=REQ_HEADERS,
+    )
+    if not html:
+        return None
+
+    return await _parse_dolarito_bandas_html(html)
+
 async def get_bandas_cambiarias(session: ClientSession) -> Optional[Dict[str, Any]]:
+    data = await _fetch_dolarito_bandas(session)
+    if data:
+        return data
+
     try:
         async with session.get(BANDAS_CAMBIARIAS_URL, headers=REQ_HEADERS, timeout=ClientTimeout(total=10)) as resp:
             if resp.status != 200:
@@ -2758,6 +2811,7 @@ async def get_bandas_cambiarias(session: ClientSession) -> Optional[Dict[str, An
             data = await resp.json()
             if not isinstance(data, dict):
                 return None
+            data["fuente"] = "DolarAPI (respaldo)"
             return data
     except Exception as exc:
         log.warning("Error obteniendo bandas cambiarias: %s", exc)
@@ -2812,10 +2866,12 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
 
     table = "\n".join(rows)
 
+    fuente = data.get("fuente") or "DolarAPI"
+
     lines = [
         header,
         "<pre>Nombre           | Importe | Variación\n" + table + "</pre>",
-        "<i>Fuente: DolarAPI</i>",
+        f"<i>Fuente: {fuente}</i>",
     ]
     return "\n".join(lines)
 
