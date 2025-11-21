@@ -2216,8 +2216,6 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> str:
             fecha = parse_iso_ddmmyyyy(f)
 
     header = "<b>💵 Dólares</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
-    lines = [header, "<pre>Tipo         Compra        Venta    Var. día</pre>"]
-    rows: List[str] = []
     order = [
         ("oficial", "Oficial"),
         ("mayorista", "Mayorista"),
@@ -2236,6 +2234,11 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> str:
         display = f"{arrow} {abs(val):.2f}%"
         return f"<span style=\"color:{color}\">{display:>10}</span>"
 
+    compra_lines = [header, "<b>📥 Compra</b>", "<pre>Tipo         Compra        Var. día</pre>"]
+    venta_lines = ["<b>📤 Venta</b>", "<pre>Tipo         Venta         Var. día</pre>"]
+    compra_rows: List[str] = []
+    venta_rows: List[str] = []
+
     for k, label in order:
         row = d.get(k)
         if not row:
@@ -2248,11 +2251,16 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> str:
         venta = fmt_money_ars(venta_val) if venta_val is not None else "—"
         var_txt = _fmt_var(var_val)
 
-        l = f"{label:<12}{compra:>12} {venta:>12} {var_txt}"
-        rows.append(f"<pre>{l}</pre>")
+        compra_rows.append(f"<pre>{label:<12}{compra:>12} {var_txt}</pre>")
+        venta_rows.append(f"<pre>{label:<12}{venta:>12} {var_txt}</pre>")
 
-    rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
-    return "\n".join(lines + rows)
+    compra_rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
+    venta_rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
+
+    compra_msg = "\n".join(compra_lines + compra_rows)
+    venta_msg = "\n".join(venta_lines + venta_rows)
+
+    return compra_msg, venta_msg
 
 def format_top3_table(title: str, fecha: Optional[str], rows_syms: List[str], retmap: Dict[str, Dict[str, Optional[float]]]) -> str:
     head = f"<b>{title}</b>" + (f" <i>Últ. Dato: {fecha}</i>" if fecha else "")
