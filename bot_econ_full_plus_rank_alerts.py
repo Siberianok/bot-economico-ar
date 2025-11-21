@@ -1131,7 +1131,7 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
 
     cj = await fetch_json(session, CRYPTOYA_DOLAR_URL)
     if cj:
-        for k in ["oficial", "mayorista", "blue", "mep", "ccl", "cripto", "tarjeta"]:
+        for k in ["oficial", "mayorista", "blue", "mep", "ccl", "cripto", "tarjeta", "ahorro"]:
             c, v, var = _safe(cj.get(k, {}))
             if c is not None or v is not None:
                 data[k] = {"compra": c, "venta": v, "fuente": "CriptoYa"}
@@ -1171,6 +1171,40 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
                 data[k]["fecha"] = fecha
         if k in data and k in variations:
             data[k]["variation"] = variations[k]
+
+    oficial = data.get("oficial") or {}
+    tarjeta = data.get("tarjeta") or {}
+
+    if "promedio_bancos" not in data and oficial:
+        data["promedio_bancos"] = {
+            "compra": oficial.get("compra"),
+            "venta": oficial.get("venta"),
+            "variation": oficial.get("variation"),
+            "fuente": oficial.get("fuente") or "CriptoYa",
+            "fecha": oficial.get("fecha"),
+        }
+
+    if "qatar" not in data:
+        qatar_source = tarjeta if tarjeta else oficial
+        if qatar_source:
+            venta = qatar_source.get("venta")
+            compra = qatar_source.get("compra")
+            if venta is None and compra is not None:
+                venta = compra
+            factor = 1.0
+            try:
+                factor = 1.65 if tarjeta else 1.9
+            except Exception:
+                factor = 1.0
+            qatar_compra = float(compra) * factor if compra is not None else None
+            qatar_venta = float(venta) * factor if venta is not None else None
+            data["qatar"] = {
+                "compra": qatar_compra,
+                "venta": qatar_venta,
+                "variation": qatar_source.get("variation"),
+                "fuente": (qatar_source.get("fuente") or "CriptoYa") + " (calc.)",
+                "fecha": qatar_source.get("fecha"),
+            }
     return data
 
 async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
@@ -2382,10 +2416,13 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     header = "<b>💵 Dólares</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
     order = [
         ("oficial", "Oficial"),
+        ("promedio_bancos", "Prom. bancos"),
+        ("ahorro", "Ahorro"),
         ("mayorista", "Mayorista"),
         ("blue", "Blue"),
         ("mep", "MEP"),
         ("ccl", "CCL"),
+        ("qatar", "Qatar"),
         ("cripto", "Cripto"),
         ("tarjeta", "Tarjeta"),
     ]
