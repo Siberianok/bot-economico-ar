@@ -2208,7 +2208,7 @@ def _label_short(sym: str) -> str:
     if sym.endswith(".BA"): return f"{NAME_ABBR.get(sym, sym)} ({sym[:-3]})"
     return label_with_currency(sym)
 
-def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
+def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> str:
     fecha = None
     for row in d.values():
         f = row.get("fecha")
@@ -2513,14 +2513,9 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    compra_msg, venta_msg = format_dolar_panels(data)
+    msg = format_dolar_panels(data)
     await update.effective_message.reply_text(
-        compra_msg,
-        parse_mode=ParseMode.HTML,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
-    )
-    await update.effective_message.reply_text(
-        venta_msg,
+        msg,
         parse_mode=ParseMode.HTML,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
