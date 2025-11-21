@@ -2175,6 +2175,54 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             picked.append((title, _paywall_friendly_link(link)))
             _register_pick(title, link, dom)
             NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
+    if len(picked) < target_limit:
+        fallback_scored: List[Dict[str, Any]] = []
+        for title, link, desc in raw_entries:
+            if not link.startswith("http"):
+                continue
+            if not _is_probably_article_url(link):
+                continue
+            if _already_picked(title, link):
+                continue
+            if _is_dollar_related(title, desc):
+                continue
+            if not _is_economic_relevant(title, desc):
+                continue
+            norm_dom = domain_of(link)
+            norm_dom = norm_dom[4:] if norm_dom.startswith("www.") else norm_dom
+            fallback_scored.append(
+                {
+                    "title": title,
+                    "link": link,
+                    "score": _score_title(title),
+                    "domain": norm_dom,
+                    "is_national": norm_dom in NATIONAL_NEWS_DOMAINS,
+                    "mentions": _mentions_argentina(title, desc),
+                }
+            )
+
+        fallback_scored.sort(
+            key=lambda item: (
+                1 if item["is_national"] else 0,
+                1 if item["mentions"] else 0,
+                item["score"],
+                item["title"].lower(),
+            ),
+            reverse=True,
+        )
+
+        for entry in fallback_scored:
+            if len(picked) >= target_limit:
+                break
+            title = entry["title"]
+            link = entry["link"]
+            dom = entry["domain"]
+            if await is_paywalled(link, dom):
+                continue
+            picked.append((title, _paywall_friendly_link(link)))
+            _register_pick(title, link, dom)
+            NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
+
     deduped_final = _dedup_news_items(picked, target_limit)
     NEWS_CACHE = {"date": today, "items": deduped_final[:target_limit]}
     save_state()
