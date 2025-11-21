@@ -2283,9 +2283,8 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
         if val is None:
             return "—"
         arrow = "🔻" if val < 0 else "🔺" if val > 0 else "⏺️"
-        color = "#2e7d32" if val < 0 else "#c62828" if val > 0 else "#616161"
         display = f"{arrow} {abs(val):.2f}%"
-        return f"<span style=\"color:{color}\">{display:>10}</span>"
+        return f"{display:>10}"
 
     compra_lines = [header, "<b>📥 Compra</b>", "<pre>Tipo         Compra        Var. día</pre>"]
     venta_lines = ["<b>📤 Venta</b>", "<pre>Tipo         Venta         Var. día</pre>"]
