@@ -2208,45 +2208,51 @@ def _label_short(sym: str) -> str:
     if sym.endswith(".BA"): return f"{NAME_ABBR.get(sym, sym)} ({sym[:-3]})"
     return label_with_currency(sym)
 
-def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
+def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> str:
     fecha = None
     for row in d.values():
         f = row.get("fecha")
         if f:
             fecha = parse_iso_ddmmyyyy(f)
+
     header = "<b>💵 Dólares</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
     lines = [header, "<pre>Tipo         Compra        Venta    Var. día</pre>"]
-    rows = []
-    order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
+    rows: List[str] = []
+    order = [
+        ("oficial", "Oficial"),
+        ("mayorista", "Mayorista"),
+        ("blue", "Blue"),
+        ("mep", "MEP"),
+        ("ccl", "CCL"),
+        ("cripto", "Cripto"),
+        ("tarjeta", "Tarjeta"),
+    ]
+
     def _fmt_var(val: Optional[float]) -> str:
         if val is None:
             return "—"
-        arrow = "🟢⬇️" if val < 0 else "🔴⬆️" if val > 0 else "⏺️"
-        return f"{arrow} {abs(val):.2f}%"
-
-    compra_lines = ["<b>📥 Compra</b>", "<pre>Tipo         Compra        Var. día</pre>"]
-    venta_lines = ["<b>📤 Venta</b>", "<pre>Tipo         Venta         Var. día</pre>"]
-    compra_rows: List[str] = []
-    venta_rows: List[str] = []
+        arrow = "🔻" if val < 0 else "🔺" if val > 0 else "⏺️"
+        color = "#2e7d32" if val < 0 else "#c62828" if val > 0 else "#616161"
+        display = f"{arrow} {abs(val):.2f}%"
+        return f"<span style=\"color:{color}\">{display:>10}</span>"
 
     for k, label in order:
         row = d.get(k)
-        if not row: continue
-        compra_val = row.get("compra"); venta_val = row.get("venta")
+        if not row:
+            continue
+        compra_val = row.get("compra")
+        venta_val = row.get("venta")
         var_val = row.get("variation")
-        # La tabla se muestra desde la perspectiva del usuario que compraría dólares
-        # al precio "venta" de la casa y vendería al precio "compra".
-        compra = fmt_money_ars(venta_val) if venta_val is not None else "—"
-        venta = fmt_money_ars(compra_val) if compra_val is not None else "—"
-        if var_val is None:
-            var_txt = "—"
-        else:
-            arrow = "🟢⬇️" if var_val < 0 else "🔴⬆️" if var_val > 0 else "⏺️"
-            var_txt = f"{arrow} {abs(var_val):.2f}%"
-        l = f"{label:<12}{compra:>12} {venta:>12} {var_txt:>10}"
+
+        compra = fmt_money_ars(compra_val) if compra_val is not None else "—"
+        venta = fmt_money_ars(venta_val) if venta_val is not None else "—"
+        var_txt = _fmt_var(var_val)
+
+        l = f"{label:<12}{compra:>12} {venta:>12} {var_txt}"
         rows.append(f"<pre>{l}</pre>")
+
     rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
-    return "\n".join([lines[0], lines[1]] + rows)
+    return "\n".join(lines + rows)
 
 def format_top3_table(title: str, fecha: Optional[str], rows_syms: List[str], retmap: Dict[str, Dict[str, Optional[float]]]) -> str:
     head = f"<b>{title}</b>" + (f" <i>Últ. Dato: {fecha}</i>" if fecha else "")
@@ -2499,14 +2505,9 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    compra_msg, venta_msg = format_dolar_panels(data)
+    msg = format_dolar_panels(data)
     await update.effective_message.reply_text(
-        compra_msg,
-        parse_mode=ParseMode.HTML,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
-    )
-    await update.effective_message.reply_text(
-        venta_msg,
+        msg,
         parse_mode=ParseMode.HTML,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
