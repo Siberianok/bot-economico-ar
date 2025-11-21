@@ -61,6 +61,7 @@ WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
 CRYPTOYA_DOLAR_URL = "https://criptoya.com/api/dolar"
 DOLARAPI_BASE = "https://dolarapi.com/v1"
+BANDAS_CAMBIARIAS_URL = f"{DOLARAPI_BASE}/bandas-cambiarias"
 
 ARG_DATOS_BASES = [
     "https://api.argentinadatos.com/v1/finanzas/indices",
@@ -1129,7 +1130,7 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
 
     cj = await fetch_json(session, CRYPTOYA_DOLAR_URL)
     if cj:
-        for k in ["oficial", "mayorista", "blue", "mep", "ccl", "cripto", "tarjeta"]:
+        for k in ["oficial", "mayorista", "blue", "mep", "ccl", "cripto", "tarjeta", "ahorro"]:
             c, v, var = _safe(cj.get(k, {}))
             if c is not None or v is not None:
                 data[k] = {"compra": c, "venta": v, "fuente": "CriptoYa"}
@@ -1169,6 +1170,40 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
                 data[k]["fecha"] = fecha
         if k in data and k in variations:
             data[k]["variation"] = variations[k]
+
+    oficial = data.get("oficial") or {}
+    tarjeta = data.get("tarjeta") or {}
+
+    if "promedio_bancos" not in data and oficial:
+        data["promedio_bancos"] = {
+            "compra": oficial.get("compra"),
+            "venta": oficial.get("venta"),
+            "variation": oficial.get("variation"),
+            "fuente": oficial.get("fuente") or "CriptoYa",
+            "fecha": oficial.get("fecha"),
+        }
+
+    if "qatar" not in data:
+        qatar_source = tarjeta if tarjeta else oficial
+        if qatar_source:
+            venta = qatar_source.get("venta")
+            compra = qatar_source.get("compra")
+            if venta is None and compra is not None:
+                venta = compra
+            factor = 1.0
+            try:
+                factor = 1.65 if tarjeta else 1.9
+            except Exception:
+                factor = 1.0
+            qatar_compra = float(compra) * factor if compra is not None else None
+            qatar_venta = float(venta) * factor if venta is not None else None
+            data["qatar"] = {
+                "compra": qatar_compra,
+                "venta": qatar_venta,
+                "variation": qatar_source.get("variation"),
+                "fuente": (qatar_source.get("fuente") or "CriptoYa") + " (calc.)",
+                "fecha": qatar_source.get("fecha"),
+            }
     return data
 
 async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
@@ -2271,23 +2306,41 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     header = "<b>💵 Dólares</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
     order = [
         ("oficial", "Oficial"),
+        ("promedio_bancos", "Prom. bancos"),
+        ("ahorro", "Ahorro"),
         ("mayorista", "Mayorista"),
         ("blue", "Blue"),
         ("mep", "MEP"),
         ("ccl", "CCL"),
+        ("qatar", "Qatar"),
         ("cripto", "Cripto"),
         ("tarjeta", "Tarjeta"),
     ]
 
     def _fmt_var(val: Optional[float]) -> str:
         if val is None:
-            return "—"
-        arrow = "🔻" if val < 0 else "🔺" if val > 0 else "⏺️"
-        display = f"{arrow} {abs(val):.2f}%"
-        return f"{display:>10}"
+            return f"{'—':>12}"
+        if val > 0:
+            icon = "🟢"
+            num = f"+{val:.2f}%"
+        elif val < 0:
+            icon = "🔴"
+            num = f"{val:.2f}%"
+        else:
+            icon = "⚪"
+            num = "0.00%"
+        return f"{(icon + ' ' + num):>12}"
 
-    compra_lines = [header, "<b>📥 Compra</b>", "<pre>Tipo         Compra        Var. día</pre>"]
-    venta_lines = ["<b>📤 Venta</b>", "<pre>Tipo         Venta         Var. día</pre>"]
+    compra_lines = [
+        header,
+        "<b>📥 Compra</b>",
+        "<pre>Tipo         Compra        Var. día</pre>",
+    ]
+    venta_lines = [
+        header,
+        "<b>📤 Venta</b>",
+        "<pre>Tipo         Venta         Var. día</pre>",
+    ]
     compra_rows: List[str] = []
     venta_rows: List[str] = []
 
@@ -2295,8 +2348,9 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
         row = d.get(k)
         if not row:
             continue
-        compra_val = row.get("compra")
-        venta_val = row.get("venta")
+        # Los valores de venta y compra vienen invertidos en la fuente, por eso se muestran cruzados
+        compra_val = row.get("venta")
+        venta_val = row.get("compra")
         var_val = row.get("variation")
 
         compra = fmt_money_ars(compra_val) if compra_val is not None else "—"
@@ -2573,6 +2627,79 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
 
+async def get_bandas_cambiarias(session: ClientSession) -> Optional[Dict[str, Any]]:
+    try:
+        async with session.get(BANDAS_CAMBIARIAS_URL, headers=REQ_HEADERS, timeout=ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                log.warning("Bandas cambiarias HTTP %s", resp.status)
+                return None
+            data = await resp.json()
+            if not isinstance(data, dict):
+                return None
+            return data
+    except Exception as exc:
+        log.warning("Error obteniendo bandas cambiarias: %s", exc)
+        return None
+
+def _fmt_band_val(row: Dict[str, Any], keys: List[str]) -> Optional[float]:
+    for k in keys:
+        val = row.get(k)
+        if isinstance(val, (int, float)):
+            return float(val)
+        try:
+            return float(val)
+        except Exception:
+            continue
+    return None
+
+def _fmt_band_pct(row: Dict[str, Any], keys: List[str]) -> Optional[float]:
+    for k in keys:
+        val = row.get(k)
+        try:
+            return float(val)
+        except Exception:
+            continue
+    return None
+
+def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
+    fecha_raw = data.get("fecha") or data.get("date")
+    fecha = parse_iso_ddmmyyyy(str(fecha_raw)) if fecha_raw else None
+
+    banda_sup = _fmt_band_val(data, ["banda_superior", "upper", "upperBand", "bandaSuperior"])
+    banda_inf = _fmt_band_val(data, ["banda_inferior", "lower", "lowerBand", "bandaInferior"])
+    pct_val = _fmt_band_pct(data, ["variacion_diaria", "variacion", "daily_change", "dailyChange"])
+
+    sup_txt = fmt_money_ars(banda_sup) if banda_sup is not None else "—"
+    inf_txt = fmt_money_ars(banda_inf) if banda_inf is not None else "—"
+    pct_txt = pct(pct_val, 2) if pct_val is not None else "—"
+
+    lines = [
+        "<b>📊 Bandas cambiarias</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else ""),
+        f"Banda superior: <b>{sup_txt}</b>",
+        f"Banda inferior: <b>{inf_txt}</b>",
+        f"Variación diaria: <b>{pct_txt}</b>",
+        "<i>Fuente: DolarAPI</i>",
+    ]
+    return "\n".join(lines)
+
+async def cmd_bandas_cambiarias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async with ClientSession() as session:
+        data = await get_bandas_cambiarias(session)
+    if not data:
+        await update.effective_message.reply_text(
+            "No pude obtener bandas cambiarias ahora.",
+            parse_mode=ParseMode.HTML,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+        return
+
+    msg = format_bandas_cambiarias(data)
+    await update.effective_message.reply_text(
+        msg,
+        parse_mode=ParseMode.HTML,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
 async def cmd_acciones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_menu_counter(context, "acciones", 2)
     kb_menu = InlineKeyboardMarkup([
@@ -2657,9 +2784,10 @@ async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def cmd_menu_economia(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_menu_counter(context, "economia", 5)
+    set_menu_counter(context, "economia", 6)
     kb_menu = InlineKeyboardMarkup([
         [InlineKeyboardButton("Tipos de Cambio", callback_data="ECO:DOLAR")],
+        [InlineKeyboardButton("Bandas cambiarias", callback_data="ECO:BANDAS")],
         [InlineKeyboardButton("Reservas", callback_data="ECO:RESERVAS")],
         [InlineKeyboardButton("Inflación", callback_data="ECO:INFLACION")],
         [InlineKeyboardButton("Riesgo País", callback_data="ECO:RIESGO")],
@@ -2671,6 +2799,7 @@ async def econ_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
     if data == "ECO:DOLAR":     await cmd_dolar(update, context)
+    if data == "ECO:BANDAS":    await cmd_bandas_cambiarias(update, context)
     if data == "ECO:RESERVAS":  await cmd_reservas(update, context)
     if data == "ECO:INFLACION": await cmd_inflacion(update, context)
     if data == "ECO:RIESGO":    await cmd_riesgo(update, context)
