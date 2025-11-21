@@ -2281,13 +2281,28 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
 
     def _fmt_var(val: Optional[float]) -> str:
         if val is None:
-            return "—"
-        arrow = "🔻" if val < 0 else "🔺" if val > 0 else "⏺️"
-        display = f"{arrow} {abs(val):.2f}%"
-        return f"{display:>10}"
+            return f"{'—':>12}"
+        if val > 0:
+            icon = "🟢"
+            num = f"+{val:.2f}%"
+        elif val < 0:
+            icon = "🔴"
+            num = f"{val:.2f}%"
+        else:
+            icon = "⚪"
+            num = "0.00%"
+        return f"{(icon + ' ' + num):>12}"
 
-    compra_lines = [header, "<b>📥 Compra</b>", "<pre>Tipo         Compra        Var. día</pre>"]
-    venta_lines = ["<b>📤 Venta</b>", "<pre>Tipo         Venta         Var. día</pre>"]
+    compra_lines = [
+        header,
+        "<b>📥 Compra</b>",
+        "<pre>Tipo         Compra        Var. día</pre>",
+    ]
+    venta_lines = [
+        header,
+        "<b>📤 Venta</b>",
+        "<pre>Tipo         Venta         Var. día</pre>",
+    ]
     compra_rows: List[str] = []
     venta_rows: List[str] = []
 
