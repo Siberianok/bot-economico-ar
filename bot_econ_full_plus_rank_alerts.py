@@ -543,6 +543,7 @@ ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 SUBS: Dict[int, Dict[str, Any]] = {}
 PF: Dict[int, Dict[str, Any]] = {}
 ALERT_USAGE: Dict[int, Dict[str, Dict[str, Any]]] = {}
+FX_HISTORY: Dict[str, Dict[str, Any]] = {}
 
 _REDIS_CLIENT: Optional[Any] = None
 _REDIS_CLIENT_INITIALIZED = False
@@ -680,7 +681,7 @@ def _save_state_to_redis(payload: Dict[str, Any]) -> bool:
 
 
 def load_state():
-    global ALERTS, SUBS, PF, ALERT_USAGE
+    global ALERTS, SUBS, PF, ALERT_USAGE, FX_HISTORY
     data: Optional[Dict[str, Any]] = None
     if USE_UPSTASH:
         data = _load_state_from_upstash()
@@ -699,6 +700,7 @@ def load_state():
         SUBS = {int(k): v for k, v in data.get("subs", {}).items()}
         PF = {int(k): v for k, v in data.get("pf", {}).items()}
         ALERT_USAGE = {int(k): v for k, v in data.get("alert_usage", {}).items()}
+        FX_HISTORY = data.get("fx_history", {}) if isinstance(data.get("fx_history", {}), dict) else {}
         log.info(
             "State loaded. alerts=%d subs=%d pf=%d",
             sum(len(v) for v in ALERTS.values()),
@@ -710,7 +712,7 @@ def load_state():
 
 
 def save_state():
-    payload = {"alerts": ALERTS, "subs": SUBS, "pf": PF, "alert_usage": ALERT_USAGE}
+    payload = {"alerts": ALERTS, "subs": SUBS, "pf": PF, "alert_usage": ALERT_USAGE, "fx_history": FX_HISTORY}
     if USE_UPSTASH:
         _save_state_to_upstash(payload)
         return
@@ -1049,24 +1051,103 @@ async def get_crypto_price(
 
 async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
     data: Dict[str, Dict[str, Any]] = {}
+
+    today = datetime.now(tz=TZ).date().isoformat()
+
+    def _safe_float(val: Any) -> Optional[float]:
+        try:
+            return float(val) if val is not None else None
+        except Exception:
+            return None
+
+    def _safe(block: Dict[str, Any]):
+        if not isinstance(block, dict):
+            return (None, None, None)
+        c = block.get("compra") or block.get("buy") or block.get("bid")
+        v = block.get("venta") or block.get("sell") or block.get("ask")
+        if v is None and "price" in block:
+            v = block.get("price")
+            if c is None:
+                c = v
+        try:
+            return (
+                float(c) if c is not None else None,
+                float(v) if v is not None else None,
+                None,
+            )
+        except Exception:
+            return (None, None, None)
+
+    def _compute_variation(name: str, actual: Optional[float], field: str) -> Optional[float]:
+        if actual is None:
+            return None
+        hist = FX_HISTORY.get(name)
+        if not isinstance(hist, dict):
+            return None
+
+        hist_date = hist.get("date")
+        hist_prev = _safe_float(hist.get(f"prev_{field}"))
+        hist_last = _safe_float(hist.get(field))
+
+        if hist_date == today:
+            prev_val = hist_prev if hist_prev is not None else hist_last
+        else:
+            prev_val = hist_last
+
+        if prev_val is None or prev_val == 0:
+            return None
+        try:
+            return ((actual / prev_val) - 1.0) * 100.0
+        except Exception:
+            return None
+
+    history_changed = False
+
+    def _update_history(name: str, compra: Optional[float], venta: Optional[float]):
+        nonlocal history_changed
+        prev_entry = FX_HISTORY.get(name)
+        prev_date = prev_entry.get("date") if isinstance(prev_entry, dict) else None
+        prev_compra = _safe_float(prev_entry.get("compra")) if isinstance(prev_entry, dict) else None
+        prev_prev_compra = _safe_float(prev_entry.get("prev_compra")) if isinstance(prev_entry, dict) else None
+        prev_venta = _safe_float(prev_entry.get("venta")) if isinstance(prev_entry, dict) else None
+        prev_prev_venta = _safe_float(prev_entry.get("prev_venta")) if isinstance(prev_entry, dict) else None
+
+        def _carry(prev_val: Optional[float], prev_prev_val: Optional[float]) -> Optional[float]:
+            if prev_date == today:
+                return prev_prev_val if prev_prev_val is not None else prev_val
+            return prev_val
+
+        carry_prev_compra = _carry(prev_compra, prev_prev_compra)
+        carry_prev_venta = _carry(prev_venta, prev_prev_venta)
+
+        new_entry = {
+            "date": today,
+            "compra": compra,
+            "venta": venta,
+            "prev_compra": carry_prev_compra,
+            "prev_venta": carry_prev_venta,
+        }
+        if prev_entry != new_entry:
+            FX_HISTORY[name] = new_entry
+            history_changed = True
+
     cj = await fetch_json(session, CRYPTOYA_DOLAR_URL)
     if cj:
-        def _safe(block: Dict[str, Any]):
-            if not isinstance(block, dict): return (None, None)
-            c, v = block.get("compra") or block.get("buy"), block.get("venta") or block.get("sell")
-            try: return (float(c) if c is not None else None, float(v) if v is not None else None)
-            except Exception: return (None, None)
-        for k in ["oficial","mayorista","blue","mep","ccl","cripto","tarjeta"]:
-            c,v = _safe(cj.get(k,{}))
+        for k in ["oficial", "mayorista", "blue", "mep", "ccl", "cripto", "tarjeta"]:
+            c, v, _ = _safe(cj.get(k, {}))
             if c is not None or v is not None:
                 data[k] = {"compra": c, "venta": v, "fuente": "CriptoYa"}
+                _update_history(k, c, v)
 
     async def dolarapi(path: str):
         j = await fetch_json(session, f"{DOLARAPI_BASE}{path}")
-        if not j: return (None, None, None)
-        c,v,fecha = j.get("compra"), j.get("venta"), j.get("fechaActualizacion") or j.get("fecha")
-        try: return (float(c) if c is not None else None, float(v) if v is not None else None, fecha)
-        except Exception: return (None, None, fecha)
+        if not j:
+            return (None, None, None)
+        c, v, fecha = j.get("compra"), j.get("venta"), j.get("fechaActualizacion") or j.get("fecha")
+        try:
+            return (float(c) if c is not None else None, float(v) if v is not None else None, fecha)
+        except Exception:
+            return (None, None, fecha)
 
     mapping = {
         "oficial": "/dolares/oficial",
@@ -1078,10 +1159,25 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
         "cripto": "/ambito/dolares/cripto",
     }
     for k, path in mapping.items():
-        if k not in data or (data[k].get("compra") is None and data[k].get("venta") is None):
-            c,v,fecha = await dolarapi(path)
+        needs_fallback = (
+            k not in data
+            or (data[k].get("compra") is None and data[k].get("venta") is None)
+            or not data[k].get("fecha")
+        )
+        if needs_fallback:
+            c, v, fecha = await dolarapi(path)
             if c is not None or v is not None:
                 data[k] = {"compra": c, "venta": v, "fuente": "DolarAPI", "fecha": fecha}
+                _update_history(k, c, v)
+            elif k in data and fecha:
+                data[k]["fecha"] = fecha
+        if k in data:
+            data[k]["var_compra"] = _compute_variation(k, data[k].get("compra"), "compra")
+            data[k]["var_venta"] = _compute_variation(k, data[k].get("venta"), "venta")
+
+    if history_changed:
+        save_state()
+
     return data
 
 async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
@@ -1932,21 +2028,35 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
         f = row.get("fecha")
         if f: fecha = parse_iso_ddmmyyyy(f)
     header = "<b>💵 Dólares</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
-    lines = [header, "<pre>Tipo         Compra        Venta</pre>"]
-    rows = []
     order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
+    def _fmt_var(val: Optional[float]) -> str:
+        if val is None:
+            return "—"
+        arrow = "🟢⬇️" if val < 0 else "🔴⬆️" if val > 0 else "⏺️"
+        return f"{arrow} {abs(val):.2f}%"
+
+    compra_lines = ["<b>📥 Compra</b>", "<pre>Tipo         Compra        Var. día</pre>"]
+    venta_lines = ["<b>📤 Venta</b>", "<pre>Tipo         Venta         Var. día</pre>"]
+    compra_rows: List[str] = []
+    venta_rows: List[str] = []
+
     for k, label in order:
         row = d.get(k)
-        if not row: continue
-        compra_val = row.get("compra"); venta_val = row.get("venta")
-        # La tabla se muestra desde la perspectiva del usuario que compraría dólares
-        # al precio "venta" de la casa y vendería al precio "compra".
-        compra = fmt_money_ars(venta_val) if venta_val is not None else "—"
-        venta = fmt_money_ars(compra_val) if compra_val is not None else "—"
-        l = f"{label:<12}{compra:>12} {venta:>12}"
-        rows.append(f"<pre>{l}</pre>")
-    rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
-    return "\n".join([lines[0], lines[1]] + rows)
+        if not row:
+            continue
+        compra_val = row.get("compra")
+        venta_val = row.get("venta")
+        compra = fmt_money_ars(compra_val) if compra_val is not None else "—"
+        venta = fmt_money_ars(venta_val) if venta_val is not None else "—"
+
+        var_compra = _fmt_var(row.get("var_compra"))
+        var_venta = _fmt_var(row.get("var_venta"))
+
+        compra_rows.append(f"<pre>{label:<12}{compra:>12} {var_compra:>13}</pre>")
+        venta_rows.append(f"<pre>{label:<12}{venta:>12} {var_venta:>13}</pre>")
+
+    footer = "<i>Fuentes: CriptoYa + DolarAPI</i>"
+    return "\n".join([header] + compra_lines + compra_rows + [""] + venta_lines + venta_rows + [footer])
 
 def format_top3_table(title: str, fecha: Optional[str], rows_syms: List[str], retmap: Dict[str, Dict[str, Optional[float]]]) -> str:
     head = f"<b>{title}</b>" + (f" <i>Últ. Dato: {fecha}</i>" if fecha else "")
