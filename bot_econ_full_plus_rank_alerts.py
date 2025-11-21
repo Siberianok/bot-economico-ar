@@ -543,7 +543,8 @@ ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 SUBS: Dict[int, Dict[str, Any]] = {}
 PF: Dict[int, Dict[str, Any]] = {}
 ALERT_USAGE: Dict[int, Dict[str, Dict[str, Any]]] = {}
-FX_HISTORY: Dict[str, Dict[str, Any]] = {}
+NEWS_HISTORY: List[Tuple[str, float]] = []
+NEWS_CACHE: Dict[str, Any] = {"date": "", "items": []}
 
 _REDIS_CLIENT: Optional[Any] = None
 _REDIS_CLIENT_INITIALIZED = False
@@ -681,7 +682,7 @@ def _save_state_to_redis(payload: Dict[str, Any]) -> bool:
 
 
 def load_state():
-    global ALERTS, SUBS, PF, ALERT_USAGE, FX_HISTORY
+    global ALERTS, SUBS, PF, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE
     data: Optional[Dict[str, Any]] = None
     if USE_UPSTASH:
         data = _load_state_from_upstash()
@@ -700,7 +701,25 @@ def load_state():
         SUBS = {int(k): v for k, v in data.get("subs", {}).items()}
         PF = {int(k): v for k, v in data.get("pf", {}).items()}
         ALERT_USAGE = {int(k): v for k, v in data.get("alert_usage", {}).items()}
-        FX_HISTORY = data.get("fx_history", {}) if isinstance(data.get("fx_history", {}), dict) else {}
+        raw_history = data.get("news_history", [])
+        if isinstance(raw_history, list):
+            NEWS_HISTORY = []
+            for item in raw_history:
+                if not isinstance(item, (list, tuple)) or len(item) != 2:
+                    continue
+                stem, ts = item[0], item[1]
+                try:
+                    stem_str = str(stem)
+                    ts_val = float(ts)
+                except Exception:
+                    continue
+                NEWS_HISTORY.append((stem_str, ts_val))
+        cache_date = data.get("news_cache_date")
+        cache_items = data.get("news_cache_items")
+        if isinstance(cache_items, list) and isinstance(cache_date, str):
+            NEWS_CACHE = {"date": cache_date, "items": cache_items}
+        else:
+            NEWS_CACHE = {"date": "", "items": []}
         log.info(
             "State loaded. alerts=%d subs=%d pf=%d",
             sum(len(v) for v in ALERTS.values()),
@@ -710,9 +729,24 @@ def load_state():
     else:
         log.info("No previous state found.")
 
+def _prune_news_history(now: Optional[float] = None, window_hours: int = 72) -> None:
+    global NEWS_HISTORY
+    ts_now = now if now is not None else time()
+    cutoff = ts_now - (window_hours * 3600)
+    NEWS_HISTORY = [(stem, ts) for stem, ts in NEWS_HISTORY if ts >= cutoff]
+
 
 def save_state():
-    payload = {"alerts": ALERTS, "subs": SUBS, "pf": PF, "alert_usage": ALERT_USAGE, "fx_history": FX_HISTORY}
+    _prune_news_history()
+    payload = {
+        "alerts": ALERTS,
+        "subs": SUBS,
+        "pf": PF,
+        "alert_usage": ALERT_USAGE,
+        "news_history": NEWS_HISTORY,
+        "news_cache_date": NEWS_CACHE.get("date", ""),
+        "news_cache_items": NEWS_CACHE.get("items", []),
+    }
     if USE_UPSTASH:
         _save_state_to_upstash(payload)
         return
@@ -1051,14 +1085,25 @@ async def get_crypto_price(
 
 async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
     data: Dict[str, Dict[str, Any]] = {}
-
-    today = datetime.now(tz=TZ).date().isoformat()
+    variations: Dict[str, float] = {}
 
     def _safe_float(val: Any) -> Optional[float]:
         try:
             return float(val) if val is not None else None
         except Exception:
             return None
+
+    def _pick_variation(block: Any) -> Optional[float]:
+        if isinstance(block, dict):
+            if "variation" in block:
+                v = _safe_float(block.get("variation"))
+                if v is not None:
+                    return v
+            for key in ["24hs", "ccb", "usdt", "usdc", "al30", "gd30", "bpo27", "letras", "ci"]:
+                v = _pick_variation(block.get(key))
+                if v is not None:
+                    return v
+        return None
 
     def _safe(block: Dict[str, Any]):
         if not isinstance(block, dict):
@@ -1069,75 +1114,24 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
             v = block.get("price")
             if c is None:
                 c = v
+        var = _pick_variation(block)
         try:
             return (
                 float(c) if c is not None else None,
                 float(v) if v is not None else None,
-                None,
+                float(var) if var is not None else None,
             )
         except Exception:
-            return (None, None, None)
-
-    def _compute_variation(name: str, actual: Optional[float], field: str) -> Optional[float]:
-        if actual is None:
-            return None
-        hist = FX_HISTORY.get(name)
-        if not isinstance(hist, dict):
-            return None
-
-        hist_date = hist.get("date")
-        hist_prev = _safe_float(hist.get(f"prev_{field}"))
-        hist_last = _safe_float(hist.get(field))
-
-        if hist_date == today:
-            prev_val = hist_prev if hist_prev is not None else hist_last
-        else:
-            prev_val = hist_last
-
-        if prev_val is None or prev_val == 0:
-            return None
-        try:
-            return ((actual / prev_val) - 1.0) * 100.0
-        except Exception:
-            return None
-
-    history_changed = False
-
-    def _update_history(name: str, compra: Optional[float], venta: Optional[float]):
-        nonlocal history_changed
-        prev_entry = FX_HISTORY.get(name)
-        prev_date = prev_entry.get("date") if isinstance(prev_entry, dict) else None
-        prev_compra = _safe_float(prev_entry.get("compra")) if isinstance(prev_entry, dict) else None
-        prev_prev_compra = _safe_float(prev_entry.get("prev_compra")) if isinstance(prev_entry, dict) else None
-        prev_venta = _safe_float(prev_entry.get("venta")) if isinstance(prev_entry, dict) else None
-        prev_prev_venta = _safe_float(prev_entry.get("prev_venta")) if isinstance(prev_entry, dict) else None
-
-        def _carry(prev_val: Optional[float], prev_prev_val: Optional[float]) -> Optional[float]:
-            if prev_date == today:
-                return prev_prev_val if prev_prev_val is not None else prev_val
-            return prev_val
-
-        carry_prev_compra = _carry(prev_compra, prev_prev_compra)
-        carry_prev_venta = _carry(prev_venta, prev_prev_venta)
-
-        new_entry = {
-            "date": today,
-            "compra": compra,
-            "venta": venta,
-            "prev_compra": carry_prev_compra,
-            "prev_venta": carry_prev_venta,
-        }
-        if prev_entry != new_entry:
-            FX_HISTORY[name] = new_entry
-            history_changed = True
+            return (None, None, var if isinstance(var, float) else None)
 
     cj = await fetch_json(session, CRYPTOYA_DOLAR_URL)
     if cj:
         for k in ["oficial", "mayorista", "blue", "mep", "ccl", "cripto", "tarjeta"]:
-            c, v, _ = _safe(cj.get(k, {}))
+            c, v, var = _safe(cj.get(k, {}))
             if c is not None or v is not None:
                 data[k] = {"compra": c, "venta": v, "fuente": "CriptoYa"}
-                _update_history(k, c, v)
+            if var is not None:
+                variations[k] = var
 
     async def dolarapi(path: str):
         j = await fetch_json(session, f"{DOLARAPI_BASE}{path}")
@@ -1168,16 +1162,10 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
             c, v, fecha = await dolarapi(path)
             if c is not None or v is not None:
                 data[k] = {"compra": c, "venta": v, "fuente": "DolarAPI", "fecha": fecha}
-                _update_history(k, c, v)
             elif k in data and fecha:
                 data[k]["fecha"] = fecha
-        if k in data:
-            data[k]["var_compra"] = _compute_variation(k, data[k].get("compra"), "compra")
-            data[k]["var_venta"] = _compute_variation(k, data[k].get("venta"), "venta")
-
-    if history_changed:
-        save_state()
-
+        if k in data and k in variations:
+            data[k]["variation"] = variations[k]
     return data
 
 async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
@@ -1664,6 +1652,26 @@ def _news_dedup_key(title: str, max_words: int = 9) -> str:
     return " ".join(parts)
 
 
+def _dedup_news_items(items: List[Tuple[str, str]], limit: Optional[int] = None) -> List[Tuple[str, str]]:
+    seen_titles: Set[str] = set()
+    seen_stems: Set[str] = set()
+    seen_links: Set[str] = set()
+    deduped: List[Tuple[str, str]] = []
+    for title, link in items:
+        norm_title = _normalize_news_title(title)
+        stem_key = _news_dedup_key(title)
+        clean_link = _canonical_news_link(link)
+        if norm_title in seen_titles or stem_key in seen_stems or clean_link in seen_links:
+            continue
+        seen_titles.add(norm_title)
+        seen_stems.add(stem_key)
+        seen_links.add(clean_link)
+        deduped.append((title, link))
+        if limit is not None and len(deduped) >= limit:
+            break
+    return deduped
+
+
 def _is_dollar_related(title: str, desc: Optional[str]) -> bool:
     parts = [_normalize_topic_text(title)]
     if desc:
@@ -1684,11 +1692,19 @@ def domain_of(url: str) -> str:
     except Exception: return ""
 
 def _score_title(title: str) -> int:
+    """Puntaje determinista que prioriza términos macro y de mercados locales."""
     t = title.lower(); score = 0
+    # Peso fuerte para macro local
     for kw in KEYWORDS:
+        if kw in t: score += 5
+    # Dinámica de dólar e inflación
+    for kw in ("dólar","dolar","inflación","ipc","brecha","ccl","mep"):
         if kw in t: score += 3
-    for kw in ("sube","baja","récord","acelera","cae","acuerdo","medida","ley","resolución","reperfil","brecha","dólar","inflación"):
+    # Medidas, leyes y shocks
+    for kw in ("sube","baja","récord","acelera","cae","acuerdo","medida","ley","resolución","reperfil","anuncio","emergencia"):
         if kw in t: score += 1
+    # Títulos más largos suelen ser más descriptivos
+    score += min(len(t) // 12, 3)
     return score
 
 
@@ -1711,6 +1727,27 @@ def _canonical_news_link(link: str) -> str:
     except Exception:
         return link
 
+def _is_probably_article_url(link: str) -> bool:
+    try:
+        parsed = urlparse(link)
+    except Exception:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    path = (parsed.path or "").strip()
+    if not path or path == "/":
+        return False
+    parts = [p for p in path.strip("/").split("/") if p]
+    if not parts:
+        return False
+    tail = parts[-1].lower()
+    if tail in {"economia", "finanzas", "finanzas-mercados", "finanzas-y-mercados"}:
+        return False
+    if len(parts) == 1 and len(tail) < 10:
+        return False
+    has_signal = ("-" in tail) or any(ch.isdigit() for ch in tail) or len(tail) >= 10
+    return has_signal or len(parts) >= 2
+
 def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
     out: List[Tuple[str, str, Optional[str]]] = []
     try:
@@ -1725,7 +1762,7 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
         desc = None
         if d_el is not None and d_el.text:
             desc = d_el.text.strip()
-        if t and l and l.startswith("http"):
+        if t and l and l.startswith("http") and _is_probably_article_url(l):
             out.append((t, l, desc))
     for entry in root.findall(".//{*}entry"):
         t_el = entry.find(".//{*}title")
@@ -1738,12 +1775,12 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
         desc = None
         if summary_el is not None and summary_el.text:
             desc = summary_el.text.strip()
-        if t and l and l.startswith("http"):
+        if t and l and l.startswith("http") and _is_probably_article_url(l):
             out.append((t, l, desc))
     if not out:
         for m in re.finditer(r"<title>(.*?)</title>.*?<link>(https?://[^<]+)</link>", xml, flags=re.S|re.I):
             t = re.sub(r"<.*?>", "", m.group(1)).strip(); l = m.group(2).strip()
-            if t and l:
+            if t and l and _is_probably_article_url(l):
                 out.append((t, l, None))
     return out
 
@@ -1835,6 +1872,19 @@ def _mentions_argentina(title: str, desc: Optional[str]) -> bool:
 
 
 async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tuple[str, str]]:
+    global NEWS_HISTORY, NEWS_CACHE
+    now_ts = time()
+    _prune_news_history(now_ts)
+    today = datetime.utcfromtimestamp(now_ts).date().isoformat()
+    target_limit = max(limit, 5)
+    if NEWS_CACHE.get("date") == today and NEWS_CACHE.get("items"):
+        cached_items = _dedup_news_items(NEWS_CACHE.get("items", []), limit=target_limit)
+        if len(cached_items) != len(NEWS_CACHE.get("items", [])):
+            NEWS_CACHE["items"] = cached_items
+            save_state()
+        return cached_items[:limit]
+    history_stems: Set[str] = {stem for stem, _ in NEWS_HISTORY}
+
     raw_entries: List[Tuple[str, str, Optional[str]]] = []
     for url in RSS_FEEDS:
         xml = await fetch_text(session, url, headers={"Accept":"application/rss+xml, application/atom+xml, */*"})
@@ -1852,6 +1902,8 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     for title, link, desc in raw_entries:
         if not link.startswith("http"):
             continue
+        if not _is_probably_article_url(link):
+            continue
         if _is_dollar_related(title, desc):
             continue
         if not _is_economic_relevant(title, desc):
@@ -1859,7 +1911,12 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         norm_title = _normalize_news_title(title)
         stem_key = _news_dedup_key(title)
         clean_link = _canonical_news_link(link)
-        if norm_title in seen_titles or stem_key in seen_stems or clean_link in seen_links:
+        if (
+            norm_title in seen_titles
+            or stem_key in seen_stems
+            or clean_link in seen_links
+            or stem_key in history_stems
+        ):
             continue
         seen_titles.add(norm_title)
         seen_stems.add(stem_key)
@@ -1867,11 +1924,16 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         entries_meta[link] = (title, desc)
 
     if not entries_meta:
-        return [
+        fallback = [
             ("Mercados: sin novedades relevantes", "https://www.ambito.com/"),
             ("Actividad: esperando datos de inflación", "https://www.cronista.com/"),
             ("Consumo: expectativa por ventas minoristas", "https://www.perfil.com/"),
-        ][:limit]
+            ("Créditos: panorama de tasas y costos", "https://www.infobae.com/"),
+            ("Comercio exterior: dinámica de importaciones", "https://www.pagina12.com.ar/"),
+        ]
+        NEWS_CACHE = {"date": today, "items": fallback[:target_limit]}
+        save_state()
+        return NEWS_CACHE["items"][:limit]
 
     scored: List[Dict[str, Any]] = []
     for link, (title, desc) in entries_meta.items():
@@ -1897,6 +1959,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             1 if item["is_national"] else 0,
             1 if item["mentions"] else 0,
             item["score"],
+            item["title"].lower(),
         ),
         reverse=True,
     )
@@ -1947,7 +2010,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     async def attempt_pick(topic_cap: Optional[int], *, enforce_domain: bool = True, domain_cap: Optional[int] = None) -> None:
         nonlocal picked, used_domains, topic_counts
         for entry in scored:
-            if len(picked) >= limit:
+            if len(picked) >= target_limit:
                 break
             title = entry["title"]
             link = entry["link"]
@@ -1968,17 +2031,24 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             topic_counts[topic] = topic_counts.get(topic, 0) + 1
             used_domains.add(dom)
             _register_pick(title, link, dom)
+            NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
 
     await attempt_pick(topic_cap=1, enforce_domain=True)
-    if len(picked) < limit:
+    if len(picked) < target_limit:
         await attempt_pick(topic_cap=2, enforce_domain=True)
-    if len(picked) < limit:
+    if len(picked) < target_limit:
         await attempt_pick(topic_cap=None, enforce_domain=True)
-    if len(picked) < limit:
+    if len(picked) < target_limit:
+        await attempt_pick(topic_cap=None, enforce_domain=False, domain_cap=1)
+    if len(picked) < target_limit:
         await attempt_pick(topic_cap=None, enforce_domain=False, domain_cap=2)
-    if len(picked) < limit:
-        for entry in scored:
-            if len(picked) >= limit:
+    if len(picked) < target_limit:
+        scored_sorted = sorted(
+            scored,
+            key=lambda item: (domain_counts.get(item["domain"], 0), -item["score"]),
+        )
+        for entry in scored_sorted:
+            if len(picked) >= target_limit:
                 break
             title = entry["title"]
             link = entry["link"]
@@ -1987,7 +2057,11 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
                 continue
             picked.append((title, _paywall_friendly_link(link)))
             _register_pick(title, link, dom)
-    return picked[:limit]
+            NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
+    deduped_final = _dedup_news_items(picked, target_limit)
+    NEWS_CACHE = {"date": today, "items": deduped_final[:target_limit]}
+    save_state()
+    return NEWS_CACHE["items"][:limit]
 
 def _short_title(text: str, limit: int = 32) -> str:
     if len(text) <= limit:
@@ -2028,6 +2102,8 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
         f = row.get("fecha")
         if f: fecha = parse_iso_ddmmyyyy(f)
     header = "<b>💵 Dólares</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
+    lines = [header, "<pre>Tipo         Compra        Venta    Var. día</pre>"]
+    rows = []
     order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
     def _fmt_var(val: Optional[float]) -> str:
         if val is None:
@@ -2042,21 +2118,22 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
 
     for k, label in order:
         row = d.get(k)
-        if not row:
-            continue
-        compra_val = row.get("compra")
-        venta_val = row.get("venta")
-        compra = fmt_money_ars(compra_val) if compra_val is not None else "—"
-        venta = fmt_money_ars(venta_val) if venta_val is not None else "—"
-
-        var_compra = _fmt_var(row.get("var_compra"))
-        var_venta = _fmt_var(row.get("var_venta"))
-
-        compra_rows.append(f"<pre>{label:<12}{compra:>12} {var_compra:>13}</pre>")
-        venta_rows.append(f"<pre>{label:<12}{venta:>12} {var_venta:>13}</pre>")
-
-    footer = "<i>Fuentes: CriptoYa + DolarAPI</i>"
-    return "\n".join([header] + compra_lines + compra_rows + [""] + venta_lines + venta_rows + [footer])
+        if not row: continue
+        compra_val = row.get("compra"); venta_val = row.get("venta")
+        var_val = row.get("variation")
+        # La tabla se muestra desde la perspectiva del usuario que compraría dólares
+        # al precio "venta" de la casa y vendería al precio "compra".
+        compra = fmt_money_ars(venta_val) if venta_val is not None else "—"
+        venta = fmt_money_ars(compra_val) if compra_val is not None else "—"
+        if var_val is None:
+            var_txt = "—"
+        else:
+            arrow = "🟢⬇️" if var_val < 0 else "🔴⬆️" if var_val > 0 else "⏺️"
+            var_txt = f"{arrow} {abs(var_val):.2f}%"
+        l = f"{label:<12}{compra:>12} {venta:>12} {var_txt:>10}"
+        rows.append(f"<pre>{l}</pre>")
+    rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
+    return "\n".join([lines[0], lines[1]] + rows)
 
 def format_top3_table(title: str, fecha: Optional[str], rows_syms: List[str], retmap: Dict[str, Dict[str, Optional[float]]]) -> str:
     head = f"<b>{title}</b>" + (f" <i>Últ. Dato: {fecha}</i>" if fecha else "")
