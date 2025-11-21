@@ -66,6 +66,8 @@ ARG_DATOS_BASES = [
     "https://argentinadatos.com/v1/finanzas/indices",
 ]
 
+CRIPTOYA_RIESGO_URL = "https://criptoya.com/charts/riesgo-pais"
+
 LAMACRO_RESERVAS_URL = "https://www.lamacro.ar/variables/1"
 
 YF_URLS = [
@@ -1177,53 +1179,148 @@ async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Option
     except: return None
 
 async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str]]]:
-    data = await _fetch_rava_profile(session, "riesgo pais")
-    if not data:
-        return None
-
     val: Optional[float] = None
     fecha: Optional[str] = None
 
-    quotes = data.get("cotizaciones") if isinstance(data, dict) else None
-    if isinstance(quotes, list) and quotes:
-        row = quotes[0] if isinstance(quotes[0], dict) else None
-        if isinstance(row, dict):
-            raw_val = row.get("ultimo")
-            if raw_val is None:
-                raw_val = row.get("cierre")
+    for base in ARG_DATOS_BASES:
+        for suf in ("/riesgo-pais/ultimo/", "/riesgo-pais/ultimo", "/riesgo-pais/"):
+            j = await fetch_json(session, base + suf)
+            if not j:
+                continue
+            if isinstance(j, list):
+                last = j[-1] if j and isinstance(j[-1], dict) else None
+            elif isinstance(j, dict):
+                last = j
+            else:
+                last = None
+            if not isinstance(last, dict):
+                continue
+            raw_val = last.get("valor")
             try:
-                val = float(raw_val) if raw_val is not None else None
+                if raw_val is not None:
+                    val = float(raw_val)
             except (TypeError, ValueError):
                 val = None
-            fecha_raw = row.get("fecha")
-            hora_raw = row.get("hora")
-            if fecha_raw:
-                if hora_raw:
-                    fecha = f"{fecha_raw} {hora_raw}"
-                else:
-                    fecha = str(fecha_raw)
+            fecha = str(last.get("fecha")) if last.get("fecha") else fecha
+            if val is not None:
+                break
+        if val is not None:
+            break
 
     if val is None:
-        history = data.get("coti_hist") if isinstance(data, dict) else None
-        if isinstance(history, list) and history:
-            last = history[-1] if isinstance(history[-1], dict) else None
-            if isinstance(last, dict):
-                raw_val = last.get("ultimo")
+        data = await _fetch_rava_profile(session, "riesgo pais")
+        if not data:
+            return None
+
+        quotes = data.get("cotizaciones") if isinstance(data, dict) else None
+        if isinstance(quotes, list) and quotes:
+            row = quotes[0] if isinstance(quotes[0], dict) else None
+            if isinstance(row, dict):
+                raw_val = row.get("ultimo")
                 if raw_val is None:
-                    raw_val = last.get("cierre")
+                    raw_val = row.get("cierre")
                 try:
                     val = float(raw_val) if raw_val is not None else None
                 except (TypeError, ValueError):
                     val = None
-                ts = last.get("timestamp")
-                if ts:
+                fecha_raw = row.get("fecha")
+                hora_raw = row.get("hora")
+                if fecha_raw:
+                    if hora_raw:
+                        fecha = f"{fecha_raw} {hora_raw}"
+                    else:
+                        fecha = str(fecha_raw)
+
+        if val is None:
+            history = data.get("coti_hist") if isinstance(data, dict) else None
+            if isinstance(history, list) and history:
+                last = history[-1] if isinstance(history[-1], dict) else None
+                if isinstance(last, dict):
+                    raw_val = last.get("ultimo")
+                    if raw_val is None:
+                        raw_val = last.get("cierre")
                     try:
-                        dt = datetime.fromtimestamp(float(ts), tz=TZ)
-                        fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
-                    except Exception:
-                        fecha = fecha or last.get("fecha")
-                elif last.get("fecha") and not fecha:
-                    fecha = str(last.get("fecha"))
+                        val = float(raw_val) if raw_val is not None else None
+                    except (TypeError, ValueError):
+                        val = None
+                    ts = last.get("timestamp")
+                    if ts:
+                        try:
+                            dt = datetime.fromtimestamp(float(ts), tz=TZ)
+                            fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            fecha = fecha or last.get("fecha")
+                    elif last.get("fecha") and not fecha:
+                        fecha = str(last.get("fecha"))
+
+    if val is None:
+        html = await fetch_text(session, CRIPTOYA_RIESGO_URL)
+        if html:
+            cd_match = re.search(r"chart-data=\"(.*?)\"", html)
+            endpoint: Optional[str] = None
+            if cd_match:
+                try:
+                    data_str = _html.unescape(cd_match.group(1))
+                    data_obj = json.loads(data_str)
+                    series = data_obj.get("series") if isinstance(data_obj, dict) else None
+                    if isinstance(series, list) and series and isinstance(series[0], dict):
+                        endpoint = series[0].get("endpoint")
+                except Exception:
+                    endpoint = None
+
+            if endpoint:
+                for api_url in (
+                    f"https://criptoya.com/api/charts{endpoint}?interval=D&limit=1",
+                    f"https://criptoya.com/api/charts{endpoint}",
+                    f"https://criptoya.com/charts{endpoint}",
+                ):
+                    j = await fetch_json(session, api_url)
+                    if isinstance(j, dict):
+                        for k in ("close", "value", "ultimo", "cierre", "price"):
+                            raw_val = j.get(k)
+                            if raw_val is not None:
+                                try:
+                                    val = float(raw_val)
+                                    break
+                                except (TypeError, ValueError):
+                                    val = None
+                        ts = j.get("timestamp") or j.get("time")
+                        if ts and not fecha:
+                            try:
+                                fecha = datetime.fromtimestamp(float(ts), tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
+                            except Exception:
+                                pass
+                    elif isinstance(j, list) and j:
+                        last = j[-1]
+                        if isinstance(last, dict):
+                            raw_val = last.get("close") or last.get("value") or last.get("ultimo") or last.get("cierre") or last.get("price")
+                            try:
+                                val = float(raw_val) if raw_val is not None else None
+                            except (TypeError, ValueError):
+                                val = None
+                            ts = last.get("timestamp") or last.get("time")
+                            if ts and not fecha:
+                                try:
+                                    fecha = datetime.fromtimestamp(float(ts), tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
+                                except Exception:
+                                    pass
+                    if val is not None:
+                        break
+
+            if val is None:
+                for pat in (
+                    r"\bRiesgo\s+Pa[ií]s\b.*?(\d{3,5})",
+                    r"\bEMBI\b.*?(\d{3,5})",
+                    r"\b(?:riesgo|embi)[^\d]{0,15}(\d{3,5})",
+                ):
+                    m = re.search(pat, html, flags=re.I | re.S)
+                    if m:
+                        try:
+                            val = float(m.group(1))
+                            fecha = None
+                            break
+                        except Exception:
+                            continue
 
     if val is None:
         return None
