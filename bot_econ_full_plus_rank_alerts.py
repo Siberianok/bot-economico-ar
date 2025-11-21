@@ -10,7 +10,7 @@ from time import time
 from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable
+from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable, Iterable
 from urllib.parse import urlparse, quote
 
 # ====== matplotlib opcional (no rompe si no está instalado) ======
@@ -1684,6 +1684,19 @@ RSS_FEEDS = [
     "https://news.google.com/rss/search?q=finanzas+argentinas+OR+mercados+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
     "https://news.google.com/rss/search?q=empresas+argentina+OR+negocios+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
     "https://news.google.com/rss/search?q=inflaci%C3%B3n+argentina+OR+bcra+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=bancos+argentinos+OR+creditos+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=exportaciones+importaciones+argentina+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
+]
+
+# Fuentes extendidas (más sitios nacionales y ventana de 48h) que se consultan
+# de manera incremental cuando faltan notas relevantes en las fuentes
+# principales.
+RSS_FEEDS_EXTENDED = [
+    "https://news.google.com/rss/search?q=site:cronista.com+OR+site:ambito.com+economia+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=site:infobae.com/economia+OR+site:iprofesional.com/economia+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=mercados+argentinos+OR+merval+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=inflacion+argentina+OR+actividad+economica+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=deuda+argentina+OR+bonos+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
 ]
 NATIONAL_NEWS_DOMAINS: Set[str] = {
     "ambito.com",
@@ -1983,6 +1996,13 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     _prune_news_history(now_ts)
     today = datetime.utcfromtimestamp(now_ts).date().isoformat()
     target_limit = max(limit, 5)
+    fallback_generic = [
+        ("Mercados: sin novedades relevantes", "https://www.cronista.com/finanzas-mercados/"),
+        ("Actividad: esperando datos de inflación", "https://www.baenegocios.com/economia/"),
+        ("Consumo: expectativa por ventas minoristas", "https://www.perfil.com/economia"),
+        ("Créditos: panorama de tasas y costos", "https://www.infobae.com/economia/"),
+        ("Comercio exterior: dinámica de importaciones", "https://www.pagina12.com.ar/seccion/economia"),
+    ]
     if NEWS_CACHE.get("date") == today and NEWS_CACHE.get("items"):
         cached_items = _dedup_news_items(NEWS_CACHE.get("items", []), limit=target_limit)
         # Si el cache solo tiene portadas/genéricos, volvemos a buscar noticias reales
@@ -1994,44 +2014,58 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             return cached_items[:limit]
         NEWS_CACHE.clear()
     history_stems: Set[str] = {stem for stem, _ in NEWS_HISTORY}
-
     raw_entries: List[Tuple[str, str, Optional[str]]] = []
-    for url in RSS_FEEDS:
-        xml = await fetch_text(session, url, headers={"Accept":"application/rss+xml, application/atom+xml, */*"})
-        if not xml:
-            continue
-        try:
-            raw_entries.extend(_parse_feed_entries(xml))
-        except Exception as e:
-            log.warning("RSS parse %s: %s", url, e)
+
+    async def _collect_feed_entries(feed_urls: Iterable[str]) -> List[Tuple[str, str, Optional[str]]]:
+        collected: List[Tuple[str, str, Optional[str]]] = []
+        for url in feed_urls:
+            xml = await fetch_text(session, url, headers={"Accept": "application/rss+xml, application/atom+xml, */*"})
+            if not xml:
+                continue
+            try:
+                collected.extend(_parse_feed_entries(xml))
+            except Exception as e:
+                log.warning("RSS parse %s: %s", url, e)
+        return collected
+
+    raw_entries.extend(await _collect_feed_entries(RSS_FEEDS))
 
     entries_meta: Dict[str, Tuple[str, Optional[str]]] = {}
     seen_titles: Set[str] = set()
     seen_stems: Set[str] = set()
     seen_links: Set[str] = set()
-    for title, link, desc in raw_entries:
-        if not link.startswith("http"):
-            continue
-        if not _is_probably_article_url(link):
-            continue
-        if _is_dollar_related(title, desc):
-            continue
-        if not _is_economic_relevant(title, desc):
-            continue
-        norm_title = _normalize_news_title(title)
-        stem_key = _news_dedup_key(title)
-        clean_link = _canonical_news_link(link)
-        if (
-            norm_title in seen_titles
-            or stem_key in seen_stems
-            or clean_link in seen_links
-            or stem_key in history_stems
-        ):
-            continue
-        seen_titles.add(norm_title)
-        seen_stems.add(stem_key)
-        seen_links.add(clean_link)
-        entries_meta[link] = (title, desc)
+
+    def _ingest_entries(entries: Iterable[Tuple[str, str, Optional[str]]]) -> None:
+        for title, link, desc in entries:
+            if not link.startswith("http"):
+                continue
+            if not _is_probably_article_url(link):
+                continue
+            if _is_dollar_related(title, desc):
+                continue
+            if not _is_economic_relevant(title, desc):
+                continue
+            norm_title = _normalize_news_title(title)
+            stem_key = _news_dedup_key(title)
+            clean_link = _canonical_news_link(link)
+            if (
+                norm_title in seen_titles
+                or stem_key in seen_stems
+                or clean_link in seen_links
+                or stem_key in history_stems
+            ):
+                continue
+            seen_titles.add(norm_title)
+            seen_stems.add(stem_key)
+            seen_links.add(clean_link)
+            entries_meta[link] = (title, desc)
+
+    _ingest_entries(raw_entries)
+
+    if len(entries_meta) < target_limit:
+        extended_entries = await _collect_feed_entries(RSS_FEEDS_EXTENDED)
+        raw_entries.extend(extended_entries)
+        _ingest_entries(extended_entries)
 
     if not entries_meta:
         if NEWS_CACHE.get("items"):
@@ -2041,14 +2075,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             NEWS_CACHE = {"date": today, "items": deduped_raw[:target_limit]}
             save_state()
             return NEWS_CACHE["items"][:limit]
-        fallback = [
-            ("Mercados: sin novedades relevantes", "https://www.cronista.com/finanzas-mercados/"),
-            ("Actividad: esperando datos de inflación", "https://www.baenegocios.com/economia/"),
-            ("Consumo: expectativa por ventas minoristas", "https://www.perfil.com/economia"),
-            ("Créditos: panorama de tasas y costos", "https://www.infobae.com/economia/"),
-            ("Comercio exterior: dinámica de importaciones", "https://www.pagina12.com.ar/seccion/economia"),
-        ]
-        NEWS_CACHE = {"date": today, "items": fallback[:target_limit]}
+        NEWS_CACHE = {"date": today, "items": fallback_generic[:target_limit]}
         save_state()
         return NEWS_CACHE["items"][:limit]
 
@@ -2223,7 +2250,31 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             _register_pick(title, link, dom)
             NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
 
+    if len(picked) < target_limit:
+        # Último intento: relajar límites de dominio y tema con las fuentes ya
+        # procesadas, evitando paywalls cuando sea posible.
+        for entry in scored:
+            if len(picked) >= target_limit:
+                break
+            title = entry["title"]
+            link = entry["link"]
+            dom = entry["domain"]
+            if _already_picked(title, link):
+                continue
+            if await is_paywalled(link, dom):
+                continue
+            picked.append((title, _paywall_friendly_link(link)))
+            _register_pick(title, link, dom)
+            NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
+
     deduped_final = _dedup_news_items(picked, target_limit)
+    if len(deduped_final) < target_limit:
+        for title, link in fallback_generic:
+            if len(deduped_final) >= target_limit:
+                break
+            if (title, link) not in deduped_final:
+                deduped_final.append((title, link))
+
     NEWS_CACHE = {"date": today, "items": deduped_final[:target_limit]}
     save_state()
     return NEWS_CACHE["items"][:limit]
