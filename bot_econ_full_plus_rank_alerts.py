@@ -2384,7 +2384,7 @@ def _format_news_item(title: str, link: str) -> str:
 
 
 def _build_news_layout(news: List[Tuple[str, str]]) -> Tuple[str, Optional[InlineKeyboardMarkup], List[str]]:
-    header = "<b>📰 Noticias</b>"
+    header = "<b>📰 Noticias</b>\n<i>Fuente: Google News (medios económicos AR)</i>"
     if not news:
         return header, None, []
 
@@ -2470,8 +2470,9 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
         compra_rows.append(f"<pre>{label:<12}{compra:>12} {var_txt}</pre>")
         venta_rows.append(f"<pre>{label:<12}{venta:>12} {var_txt}</pre>")
 
-    compra_rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
-    venta_rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
+    fuente_txt = "<i>Fuentes: CriptoYa (prioridad) + DolarAPI (complemento)</i>"
+    compra_rows.append(fuente_txt)
+    venta_rows.append(fuente_txt)
 
     compra_msg = "\n".join(compra_lines + compra_rows)
     venta_msg = "\n".join(venta_lines + venta_rows)
@@ -2867,7 +2868,7 @@ async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         val, fecha = res
         txt = (f"<b>🏦 Reservas BCRA</b>{f' <i>Últ. Act.: {fecha}</i>' if fecha else ''}\n"
-               f"<b>{fmt_number(val,0)} MUS$</b>\n<i>Fuente: LaMacro</i>")
+               f"<b>{fmt_number(val,0)} MUS$</b>\n<i>Fuente: LaMacro (lamacro.ar)</i>")
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2877,7 +2878,7 @@ async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = "No pude obtener inflación ahora."
     else:
         val, fecha = tup; val_str = str(round(val,1)).replace(".", ",")
-        txt = f"<b>📉 Inflación Mensual</b>{f' <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>\n<i>Fuente: ArgentinaDatos</i>"
+        txt = f"<b>📉 Inflación Mensual</b>{f' <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>\n<i>Fuente: ArgentinaDatos (api.argentinadatos.com)</i>"
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
