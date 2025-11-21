@@ -1138,8 +1138,11 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
             if var is not None:
                 variations[k] = var
 
-    async def dolarapi(path: str):
-        j = await fetch_json(session, f"{DOLARAPI_BASE}{path}")
+    async def dolarapi(path: str, date: Optional[str] = None):
+        url = f"{DOLARAPI_BASE}{path}"
+        if date:
+            url = f"{url}?fecha={date}"
+        j = await fetch_json(session, url)
         if not j:
             return (None, None, None)
         c, v, fecha = j.get("compra"), j.get("venta"), j.get("fechaActualizacion") or j.get("fecha")
@@ -1171,6 +1174,46 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
                 data[k]["fecha"] = fecha
         if k in data and k in variations:
             data[k]["variation"] = variations[k]
+
+    prev_dates = [
+        (datetime.now(TZ).date() - timedelta(days=delta)).isoformat()
+        for delta in range(1, 4)
+    ]
+
+    def _current_val(row: Dict[str, Any]) -> Optional[float]:
+        venta = row.get("venta")
+        compra = row.get("compra")
+        try:
+            if venta is not None:
+                return float(venta)
+            if compra is not None:
+                return float(compra)
+        except Exception:
+            return None
+        return None
+
+    async def _backfill_variation(key: str, path: str):
+        row = data.get(key)
+        if not row or row.get("variation") is not None:
+            return
+
+        cur_val = _current_val(row)
+        if cur_val is None:
+            return
+
+        for date_str in prev_dates:
+            prev_c, prev_v, _ = await dolarapi(path, date_str)
+            prev_val = prev_v if prev_v is not None else prev_c
+            if prev_val is None or prev_val == 0:
+                continue
+            try:
+                row["variation"] = ((cur_val - prev_val) / prev_val) * 100.0
+                return
+            except Exception:
+                continue
+
+    for k, path in mapping.items():
+        await _backfill_variation(k, path)
 
     oficial = data.get("oficial") or {}
     tarjeta = data.get("tarjeta") or {}
@@ -2469,13 +2512,13 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
         if val is None:
             return f"{'—':>12}"
         if val > 0:
-            icon = "🟢"
+            icon = "▲"
             num = f"+{val:.2f}%"
         elif val < 0:
-            icon = "🔴"
+            icon = "▼"
             num = f"{val:.2f}%"
         else:
-            icon = "⚪"
+            icon = "▬"
             num = "0.00%"
         return f"{(icon + ' ' + num):>12}"
 
