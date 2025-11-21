@@ -1076,24 +1076,63 @@ async def get_crypto_price(
 
 async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
     data: Dict[str, Dict[str, Any]] = {}
+    variations: Dict[str, float] = {}
+
+    def _safe_float(val: Any) -> Optional[float]:
+        try:
+            return float(val) if val is not None else None
+        except Exception:
+            return None
+
+    def _pick_variation(block: Any) -> Optional[float]:
+        if isinstance(block, dict):
+            if "variation" in block:
+                v = _safe_float(block.get("variation"))
+                if v is not None:
+                    return v
+            for key in ["24hs", "ccb", "usdt", "usdc", "al30", "gd30", "bpo27", "letras", "ci"]:
+                v = _pick_variation(block.get(key))
+                if v is not None:
+                    return v
+        return None
+
+    def _safe(block: Dict[str, Any]):
+        if not isinstance(block, dict):
+            return (None, None, None)
+        c = block.get("compra") or block.get("buy") or block.get("bid")
+        v = block.get("venta") or block.get("sell") or block.get("ask")
+        if v is None and "price" in block:
+            v = block.get("price")
+            if c is None:
+                c = v
+        var = _pick_variation(block)
+        try:
+            return (
+                float(c) if c is not None else None,
+                float(v) if v is not None else None,
+                float(var) if var is not None else None,
+            )
+        except Exception:
+            return (None, None, var if isinstance(var, float) else None)
+
     cj = await fetch_json(session, CRYPTOYA_DOLAR_URL)
     if cj:
-        def _safe(block: Dict[str, Any]):
-            if not isinstance(block, dict): return (None, None)
-            c, v = block.get("compra") or block.get("buy"), block.get("venta") or block.get("sell")
-            try: return (float(c) if c is not None else None, float(v) if v is not None else None)
-            except Exception: return (None, None)
-        for k in ["oficial","mayorista","blue","mep","ccl","cripto","tarjeta"]:
-            c,v = _safe(cj.get(k,{}))
+        for k in ["oficial", "mayorista", "blue", "mep", "ccl", "cripto", "tarjeta"]:
+            c, v, var = _safe(cj.get(k, {}))
             if c is not None or v is not None:
                 data[k] = {"compra": c, "venta": v, "fuente": "CriptoYa"}
+            if var is not None:
+                variations[k] = var
 
     async def dolarapi(path: str):
         j = await fetch_json(session, f"{DOLARAPI_BASE}{path}")
-        if not j: return (None, None, None)
-        c,v,fecha = j.get("compra"), j.get("venta"), j.get("fechaActualizacion") or j.get("fecha")
-        try: return (float(c) if c is not None else None, float(v) if v is not None else None, fecha)
-        except Exception: return (None, None, fecha)
+        if not j:
+            return (None, None, None)
+        c, v, fecha = j.get("compra"), j.get("venta"), j.get("fechaActualizacion") or j.get("fecha")
+        try:
+            return (float(c) if c is not None else None, float(v) if v is not None else None, fecha)
+        except Exception:
+            return (None, None, fecha)
 
     mapping = {
         "oficial": "/dolares/oficial",
@@ -1105,10 +1144,19 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
         "cripto": "/ambito/dolares/cripto",
     }
     for k, path in mapping.items():
-        if k not in data or (data[k].get("compra") is None and data[k].get("venta") is None):
-            c,v,fecha = await dolarapi(path)
+        needs_fallback = (
+            k not in data
+            or (data[k].get("compra") is None and data[k].get("venta") is None)
+            or not data[k].get("fecha")
+        )
+        if needs_fallback:
+            c, v, fecha = await dolarapi(path)
             if c is not None or v is not None:
                 data[k] = {"compra": c, "venta": v, "fuente": "DolarAPI", "fecha": fecha}
+            elif k in data and fecha:
+                data[k]["fecha"] = fecha
+        if k in data and k in variations:
+            data[k]["variation"] = variations[k]
     return data
 
 async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
@@ -1978,18 +2026,24 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
         f = row.get("fecha")
         if f: fecha = parse_iso_ddmmyyyy(f)
     header = "<b>💵 Dólares</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
-    lines = [header, "<pre>Tipo         Compra        Venta</pre>"]
+    lines = [header, "<pre>Tipo         Compra        Venta    Var. día</pre>"]
     rows = []
     order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
     for k, label in order:
         row = d.get(k)
         if not row: continue
         compra_val = row.get("compra"); venta_val = row.get("venta")
+        var_val = row.get("variation")
         # La tabla se muestra desde la perspectiva del usuario que compraría dólares
         # al precio "venta" de la casa y vendería al precio "compra".
         compra = fmt_money_ars(venta_val) if venta_val is not None else "—"
         venta = fmt_money_ars(compra_val) if compra_val is not None else "—"
-        l = f"{label:<12}{compra:>12} {venta:>12}"
+        if var_val is None:
+            var_txt = "—"
+        else:
+            arrow = "🟢⬇️" if var_val < 0 else "🔴⬆️" if var_val > 0 else "⏺️"
+            var_txt = f"{arrow} {abs(var_val):.2f}%"
+        l = f"{label:<12}{compra:>12} {venta:>12} {var_txt:>10}"
         rows.append(f"<pre>{l}</pre>")
     rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
     return "\n".join([lines[0], lines[1]] + rows)
