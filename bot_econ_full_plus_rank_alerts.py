@@ -2361,8 +2361,9 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
         row = d.get(k)
         if not row:
             continue
-        compra_val = row.get("compra")
-        venta_val = row.get("venta")
+        # Los valores de venta y compra vienen invertidos en la fuente, por eso se muestran cruzados
+        compra_val = row.get("venta")
+        venta_val = row.get("compra")
         var_val = row.get("variation")
 
         compra = fmt_money_ars(compra_val) if compra_val is not None else "—"
