@@ -5,6 +5,7 @@ import os, asyncio, logging, re, html as _html, json, math, io, signal, csv, uni
 import copy
 import urllib.request
 import urllib.error
+import urllib.parse
 from time import time
 from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime
@@ -1678,18 +1679,11 @@ async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
 
 from xml.etree import ElementTree as ET
 RSS_FEEDS = [
-    "https://www.ambito.com/contenidos/economia.xml",
-    "https://www.iprofesional.com/rss",
-    "https://www.infobae.com/economia/rss",
-    "https://www.perfil.com/rss/economia.xml",
-    "https://www.baenegocios.com/rss/economia.xml",
-    "https://www.telam.com.ar/rss2/economia.xml",
-    "https://www.cronista.com/files/rss/economia.xml",
-    "https://www.cronista.com/files/rss/finanzas-mercados.xml",
-    "https://eleconomista.com.ar/rss/economia.xml",
-    "https://www.clarin.com/rss/economia/",
-    "https://www.lanacion.com.ar/economia/rss/",
-    "https://www.pagina12.com.ar/rss/secciones/economia/notas",
+    # Google News queries acotadas a Argentina y a las últimas 24hs.
+    "https://news.google.com/rss/search?q=econom%C3%ADa+argentina+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=finanzas+argentinas+OR+mercados+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=empresas+argentina+OR+negocios+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=inflaci%C3%B3n+argentina+OR+bcra+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
 ]
 NATIONAL_NEWS_DOMAINS: Set[str] = {
     "ambito.com",
@@ -1824,6 +1818,18 @@ def _canonical_news_link(link: str) -> str:
     except Exception:
         return link
 
+def _normalize_feed_link(link: str) -> str:
+    try:
+        parsed = urlparse(link)
+    except Exception:
+        return link
+    if parsed.netloc.endswith("news.google.com"):
+        qs = parsed.query or ""
+        qparams = dict((k, v[0]) for k, v in urllib.parse.parse_qs(qs).items() if v)
+        if "url" in qparams and qparams["url"].startswith("http"):
+            return qparams["url"]
+    return link
+
 def _is_probably_article_url(link: str) -> bool:
     try:
         parsed = urlparse(link)
@@ -1856,6 +1862,7 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
         d_el = item.find("description")
         t = (t_el.text or "").strip() if (t_el is not None and t_el.text) else None
         l = (l_el.text or "").strip() if (l_el is not None and l_el.text) else None
+        l = _normalize_feed_link(l) if l else None
         desc = None
         if d_el is not None and d_el.text:
             desc = d_el.text.strip()
@@ -1867,6 +1874,7 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
         summary_el = entry.find(".//{*}summary")
         t = (t_el.text or "").strip() if (t_el is not None and t_el.text) else None
         l = link_el.get("href").strip() if (link_el is not None and link_el.get("href")) else None
+        l = _normalize_feed_link(l) if l else None
         if (not l) and entry.find(".//{*}id") is not None:
             l = (entry.find(".//{*}id").text or "").strip()
         desc = None
@@ -2021,12 +2029,19 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         entries_meta[link] = (title, desc)
 
     if not entries_meta:
+        if NEWS_CACHE.get("items"):
+            return NEWS_CACHE.get("items", [])[:limit]
+        if raw_entries:
+            deduped_raw = _dedup_news_items([(t, l) for t, l, _ in raw_entries], limit=target_limit)
+            NEWS_CACHE = {"date": today, "items": deduped_raw[:target_limit]}
+            save_state()
+            return NEWS_CACHE["items"][:limit]
         fallback = [
-            ("Mercados: sin novedades relevantes", "https://www.ambito.com/"),
-            ("Actividad: esperando datos de inflación", "https://www.cronista.com/"),
-            ("Consumo: expectativa por ventas minoristas", "https://www.perfil.com/"),
-            ("Créditos: panorama de tasas y costos", "https://www.infobae.com/"),
-            ("Comercio exterior: dinámica de importaciones", "https://www.pagina12.com.ar/"),
+            ("Mercados: sin novedades relevantes", "https://www.cronista.com/finanzas-mercados/"),
+            ("Actividad: esperando datos de inflación", "https://www.baenegocios.com/economia/"),
+            ("Consumo: expectativa por ventas minoristas", "https://www.perfil.com/economia"),
+            ("Créditos: panorama de tasas y costos", "https://www.infobae.com/economia/"),
+            ("Comercio exterior: dinámica de importaciones", "https://www.pagina12.com.ar/seccion/economia"),
         ]
         NEWS_CACHE = {"date": today, "items": fallback[:target_limit]}
         save_state()
