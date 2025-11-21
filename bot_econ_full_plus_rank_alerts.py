@@ -2445,22 +2445,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     kb_rows = [
         [
-            InlineKeyboardButton("💵 Dólar y Reservas", callback_data="ECO:DOLAR"),
+            InlineKeyboardButton("💵 Tipos de cambio", callback_data="ECO:DOLAR"),
+            InlineKeyboardButton("🏦 Reservas", callback_data="ECO:RESERVAS"),
+        ],
+        [
             InlineKeyboardButton("📰 Noticias", callback_data="ECO:NOTICIAS"),
-        ],
-        [
             InlineKeyboardButton("📈 Acciones Top 3", callback_data="ACC:TOP3"),
+        ],
+        [
             InlineKeyboardButton("🏁 Acciones Proyección", callback_data="ACC:TOP5"),
-        ],
-        [
             InlineKeyboardButton("🌎 Cedears Top 3", callback_data="CED:TOP3"),
-            InlineKeyboardButton("🌐 Cedears Proyección", callback_data="CED:TOP5"),
         ],
         [
+            InlineKeyboardButton("🌐 Cedears Proyección", callback_data="CED:TOP5"),
             InlineKeyboardButton("🔔 Mis alertas", callback_data="AL:LIST"),
-            InlineKeyboardButton("🧾 Resumen diario", callback_data="ST:SUBS"),
         ],
-        [InlineKeyboardButton("💼 Portafolio", callback_data="PF:MENU")],
+        [
+            InlineKeyboardButton("🧾 Resumen diario", callback_data="ST:SUBS"),
+            InlineKeyboardButton("💼 Portafolio", callback_data="PF:MENU"),
+        ],
     ]
 
     await update.effective_message.reply_text(
