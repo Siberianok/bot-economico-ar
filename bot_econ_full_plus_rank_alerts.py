@@ -1291,6 +1291,7 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                 except (TypeError, ValueError):
                     variation = variation
             if val is not None:
+                fuente = "ArgentinaDatos"
                 break
 
     if val is None:
@@ -1316,6 +1317,7 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                         fecha = f"{fecha_raw} {hora_raw}"
                     else:
                         fecha = str(fecha_raw)
+                fuente = "Rava"
 
         if val is None:
             history = data.get("coti_hist") if isinstance(data, dict) else None
@@ -1338,6 +1340,7 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                             fecha = fecha or last.get("fecha")
                     elif last.get("fecha") and not fecha:
                         fecha = str(last.get("fecha"))
+                    fuente = "Rava"
 
     if val is None:
         html = await fetch_text(session, CRIPTOYA_RIESGO_URL)
@@ -1376,6 +1379,7 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                                 fecha = datetime.fromtimestamp(float(ts), tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
                             except Exception:
                                 pass
+                        fuente = "CriptoYa"
                     elif isinstance(j, list) and j:
                         last = j[-1]
                         if isinstance(last, dict):
@@ -1390,6 +1394,7 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                                     fecha = datetime.fromtimestamp(float(ts), tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
                                 except Exception:
                                     pass
+                            fuente = "CriptoYa"
                     if val is not None:
                         break
 
