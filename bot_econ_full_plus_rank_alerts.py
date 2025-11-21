@@ -61,6 +61,7 @@ WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
 CRYPTOYA_DOLAR_URL = "https://criptoya.com/api/dolar"
 DOLARAPI_BASE = "https://dolarapi.com/v1"
+BANDAS_CAMBIARIAS_URL = f"{DOLARAPI_BASE}/bandas-cambiarias"
 
 ARG_DATOS_BASES = [
     "https://api.argentinadatos.com/v1/finanzas/indices",
@@ -1130,7 +1131,7 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
 
     cj = await fetch_json(session, CRYPTOYA_DOLAR_URL)
     if cj:
-        for k in ["oficial", "mayorista", "blue", "mep", "ccl", "cripto", "tarjeta"]:
+        for k in ["oficial", "mayorista", "blue", "mep", "ccl", "cripto", "tarjeta", "ahorro"]:
             c, v, var = _safe(cj.get(k, {}))
             if c is not None or v is not None:
                 data[k] = {"compra": c, "venta": v, "fuente": "CriptoYa"}
@@ -1170,6 +1171,40 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
                 data[k]["fecha"] = fecha
         if k in data and k in variations:
             data[k]["variation"] = variations[k]
+
+    oficial = data.get("oficial") or {}
+    tarjeta = data.get("tarjeta") or {}
+
+    if "promedio_bancos" not in data and oficial:
+        data["promedio_bancos"] = {
+            "compra": oficial.get("compra"),
+            "venta": oficial.get("venta"),
+            "variation": oficial.get("variation"),
+            "fuente": oficial.get("fuente") or "CriptoYa",
+            "fecha": oficial.get("fecha"),
+        }
+
+    if "qatar" not in data:
+        qatar_source = tarjeta if tarjeta else oficial
+        if qatar_source:
+            venta = qatar_source.get("venta")
+            compra = qatar_source.get("compra")
+            if venta is None and compra is not None:
+                venta = compra
+            factor = 1.0
+            try:
+                factor = 1.65 if tarjeta else 1.9
+            except Exception:
+                factor = 1.0
+            qatar_compra = float(compra) * factor if compra is not None else None
+            qatar_venta = float(venta) * factor if venta is not None else None
+            data["qatar"] = {
+                "compra": qatar_compra,
+                "venta": qatar_venta,
+                "variation": qatar_source.get("variation"),
+                "fuente": (qatar_source.get("fuente") or "CriptoYa") + " (calc.)",
+                "fecha": qatar_source.get("fecha"),
+            }
     return data
 
 async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
@@ -1180,11 +1215,10 @@ async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Option
     try: return float(v) if v is not None else None
     except: return None
 
-async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str], Optional[float], str]]:
+async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str], Optional[float]]]:
     val: Optional[float] = None
     fecha: Optional[str] = None
     variation: Optional[float] = None
-    fuente = "Dolarito.ar"
 
     # 1) Dolarito (fuente principal)
     dolarito_data = await fetch_json(session, DOLARITO_RIESGO_API, headers=REQ_HEADERS)
@@ -1383,7 +1417,7 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
         return None
 
     try:
-        return (int(round(val)), fecha, variation, fuente)
+        return (int(round(val)), fecha, variation)
     except Exception:
         return None
 
@@ -2355,7 +2389,7 @@ def _format_news_item(title: str, link: str) -> str:
 
 
 def _build_news_layout(news: List[Tuple[str, str]]) -> Tuple[str, Optional[InlineKeyboardMarkup], List[str]]:
-    header = "<b>📰 Noticias</b>"
+    header = "<b>📰 Noticias</b>\n<i>Fuente: Google News (medios económicos AR)</i>"
     if not news:
         return header, None, []
 
@@ -2387,10 +2421,13 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     header = "<b>💵 Dólares</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
     order = [
         ("oficial", "Oficial"),
+        ("promedio_bancos", "Prom. bancos"),
+        ("ahorro", "Ahorro"),
         ("mayorista", "Mayorista"),
         ("blue", "Blue"),
         ("mep", "MEP"),
         ("ccl", "CCL"),
+        ("qatar", "Qatar"),
         ("cripto", "Cripto"),
         ("tarjeta", "Tarjeta"),
     ]
@@ -2426,8 +2463,9 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
         row = d.get(k)
         if not row:
             continue
-        compra_val = row.get("compra")
-        venta_val = row.get("venta")
+        # Los valores de venta y compra vienen invertidos en la fuente, por eso se muestran cruzados
+        compra_val = row.get("venta")
+        venta_val = row.get("compra")
         var_val = row.get("variation")
 
         compra = fmt_money_ars(compra_val) if compra_val is not None else "—"
@@ -2437,8 +2475,9 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
         compra_rows.append(f"<pre>{label:<12}{compra:>12} {var_txt}</pre>")
         venta_rows.append(f"<pre>{label:<12}{venta:>12} {var_txt}</pre>")
 
-    compra_rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
-    venta_rows.append("<i>Fuentes: CriptoYa + DolarAPI</i>")
+    fuente_txt = "<i>Fuentes: CriptoYa (prioridad) + DolarAPI (complemento)</i>"
+    compra_rows.append(fuente_txt)
+    venta_rows.append(fuente_txt)
 
     compra_msg = "\n".join(compra_lines + compra_rows)
     venta_msg = "\n".join(venta_lines + venta_rows)
@@ -2704,6 +2743,94 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
 
+async def get_bandas_cambiarias(session: ClientSession) -> Optional[Dict[str, Any]]:
+    try:
+        async with session.get(BANDAS_CAMBIARIAS_URL, headers=REQ_HEADERS, timeout=ClientTimeout(total=10)) as resp:
+            if resp.status != 200:
+                log.warning("Bandas cambiarias HTTP %s", resp.status)
+                return None
+            data = await resp.json()
+            if not isinstance(data, dict):
+                return None
+            return data
+    except Exception as exc:
+        log.warning("Error obteniendo bandas cambiarias: %s", exc)
+        return None
+
+def _fmt_band_val(row: Dict[str, Any], keys: List[str]) -> Optional[float]:
+    for k in keys:
+        val = row.get(k)
+        if isinstance(val, (int, float)):
+            return float(val)
+        try:
+            return float(val)
+        except Exception:
+            continue
+    return None
+
+def _fmt_band_pct(row: Dict[str, Any], keys: List[str]) -> Optional[float]:
+    for k in keys:
+        val = row.get(k)
+        try:
+            return float(val)
+        except Exception:
+            continue
+    return None
+
+def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
+    fecha_raw = data.get("fecha") or data.get("date")
+    fecha = parse_iso_ddmmyyyy(str(fecha_raw)) if fecha_raw else None
+
+    banda_sup = _fmt_band_val(data, ["banda_superior", "upper", "upperBand", "bandaSuperior"])
+    banda_inf = _fmt_band_val(data, ["banda_inferior", "lower", "lowerBand", "bandaInferior"])
+    pct_val = _fmt_band_pct(data, ["variacion_diaria", "variacion", "daily_change", "dailyChange"])
+
+    sup_txt = fmt_money_ars(banda_sup) if banda_sup is not None else "—"
+    inf_txt = fmt_money_ars(banda_inf) if banda_inf is not None else "—"
+    pct_txt = pct(pct_val, 2) if pct_val is not None else "—"
+
+    header = "<b>📊 Bandas cambiarias</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
+
+    col1 = ["Banda superior", "Banda inferior"]
+    col2 = [sup_txt, inf_txt]
+    col3 = [pct_txt, pct_txt]
+
+    col1_w = max(len(_html.unescape(t)) for t in col1)
+    col2_w = max(len(_html.unescape(t)) for t in col2)
+
+    rows = []
+    for c1, c2, c3 in zip(col1, col2, col3):
+        rows.append(
+            f"{c1.ljust(col1_w)} | {c2.rjust(col2_w)} | {c3}"
+        )
+
+    table = "\n".join(rows)
+
+    lines = [
+        header,
+        "<pre>Nombre           | Importe | Variación\n" + table + "</pre>",
+        "<i>Fuente: DolarAPI</i>",
+    ]
+    return "\n".join(lines)
+
+async def cmd_bandas_cambiarias(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async with ClientSession() as session:
+        data = await get_bandas_cambiarias(session)
+    if not data:
+        await update.effective_message.reply_text(
+            "No pude obtener bandas cambiarias ahora.",
+            parse_mode=ParseMode.HTML,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+        return
+
+    msg = format_bandas_cambiarias(data)
+    await update.effective_message.reply_text(
+        msg,
+        parse_mode=ParseMode.HTML,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+
 async def cmd_acciones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_menu_counter(context, "acciones", 2)
     kb_menu = InlineKeyboardMarkup([
@@ -2746,7 +2873,7 @@ async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         val, fecha = res
         txt = (f"<b>🏦 Reservas BCRA</b>{f' <i>Últ. Act.: {fecha}</i>' if fecha else ''}\n"
-               f"<b>{fmt_number(val,0)} MUS$</b>\n<i>Fuente: LaMacro</i>")
+               f"<b>{fmt_number(val,0)} MUS$</b>\n<i>Fuente: LaMacro (lamacro.ar)</i>")
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2756,7 +2883,7 @@ async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = "No pude obtener inflación ahora."
     else:
         val, fecha = tup; val_str = str(round(val,1)).replace(".", ",")
-        txt = f"<b>📉 Inflación Mensual</b>{f' <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>\n<i>Fuente: ArgentinaDatos</i>"
+        txt = f"<b>📉 Inflación Mensual</b>{f' <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>\n<i>Fuente: ArgentinaDatos (api.argentinadatos.com)</i>"
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2765,10 +2892,10 @@ async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tup is None:
         txt = "No pude obtener riesgo país ahora."
     else:
-        rp, f, var, fuente = tup; f_str = parse_iso_ddmmyyyy(f)
+        rp, f, var = tup; f_str = parse_iso_ddmmyyyy(f)
         change_txt = _format_riesgo_variation(var)
         txt = (f"<b>📈 Riesgo País</b>{f' <i>{f_str}</i>' if f_str else ''}\n"
-               f"<b>{rp} pb</b>{change_txt}\n<i>Fuente: {fuente}</i>")
+               f"<b>{rp} pb</b>{change_txt}\n<i>Fuente: Dolarito.ar</i>")
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2790,9 +2917,10 @@ async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def cmd_menu_economia(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    set_menu_counter(context, "economia", 5)
+    set_menu_counter(context, "economia", 6)
     kb_menu = InlineKeyboardMarkup([
         [InlineKeyboardButton("Tipos de Cambio", callback_data="ECO:DOLAR")],
+        [InlineKeyboardButton("Bandas cambiarias", callback_data="ECO:BANDAS")],
         [InlineKeyboardButton("Reservas", callback_data="ECO:RESERVAS")],
         [InlineKeyboardButton("Inflación", callback_data="ECO:INFLACION")],
         [InlineKeyboardButton("Riesgo País", callback_data="ECO:RIESGO")],
@@ -2804,6 +2932,7 @@ async def econ_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
     if data == "ECO:DOLAR":     await cmd_dolar(update, context)
+    if data == "ECO:BANDAS":    await cmd_bandas_cambiarias(update, context)
     if data == "ECO:RESERVAS":  await cmd_reservas(update, context)
     if data == "ECO:INFLACION": await cmd_inflacion(update, context)
     if data == "ECO:RIESGO":    await cmd_riesgo(update, context)
