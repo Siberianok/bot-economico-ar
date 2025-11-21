@@ -10,7 +10,7 @@ from time import time
 from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable
+from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable, Iterable
 from urllib.parse import urlparse, quote
 
 # ====== matplotlib opcional (no rompe si no está instalado) ======
@@ -68,6 +68,7 @@ ARG_DATOS_BASES = [
     "https://argentinadatos.com/v1/finanzas/indices",
 ]
 
+DOLARITO_RIESGO_API = "https://api.dolarito.ar/api/frontend/indices/riesgoPais"
 CRIPTOYA_RIESGO_URL = "https://criptoya.com/charts/riesgo-pais"
 
 LAMACRO_RESERVAS_URL = "https://www.lamacro.ar/variables/1"
@@ -1214,34 +1215,83 @@ async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Option
     try: return float(v) if v is not None else None
     except: return None
 
-async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str]]]:
+async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str], Optional[float]]]:
     val: Optional[float] = None
     fecha: Optional[str] = None
+    variation: Optional[float] = None
 
-    for base in ARG_DATOS_BASES:
-        for suf in ("/riesgo-pais/ultimo/", "/riesgo-pais/ultimo", "/riesgo-pais/"):
-            j = await fetch_json(session, base + suf)
-            if not j:
-                continue
-            if isinstance(j, list):
-                last = j[-1] if j and isinstance(j[-1], dict) else None
-            elif isinstance(j, dict):
-                last = j
-            else:
-                last = None
-            if not isinstance(last, dict):
-                continue
-            raw_val = last.get("valor")
+    # 1) Dolarito (fuente principal)
+    dolarito_data = await fetch_json(session, DOLARITO_RIESGO_API, headers=REQ_HEADERS)
+    if isinstance(dolarito_data, dict):
+        # Intentamos cubrir distintos posibles nombres de campos
+        val_candidates = (
+            dolarito_data.get("valor"),
+            dolarito_data.get("value"),
+            dolarito_data.get("ultimo"),
+            dolarito_data.get("last"),
+        )
+        for raw_val in val_candidates:
             try:
+                if raw_val is not None:
+                    val = float(raw_val)
+                    break
+            except (TypeError, ValueError):
+                continue
+
+        if "fecha" in dolarito_data and dolarito_data.get("fecha"):
+            fecha = str(dolarito_data.get("fecha"))
+        elif "updatedAt" in dolarito_data and dolarito_data.get("updatedAt"):
+            fecha = str(dolarito_data.get("updatedAt"))
+
+        prev_val = None
+        for key in ("valorAnterior", "previous", "prev", "anterior"):
+            try:
+                if dolarito_data.get(key) is not None:
+                    prev_val = float(dolarito_data[key])
+                    break
+            except (TypeError, ValueError):
+                continue
+        if prev_val and val not in (None, 0):
+            try:
+                variation = ((val - prev_val) / prev_val) * 100.0
+            except Exception:
+                variation = None
+
+    # 2) ArgentinaDatos
+    if val is None or variation is None:
+        for base in ARG_DATOS_BASES:
+            history: List[Dict[str, Any]] = []
+            for suf in ("/riesgo-pais/", "/riesgo-pais/ultimo/", "/riesgo-pais/ultimo"):
+                j = await fetch_json(session, base + suf)
+                if not j:
+                    continue
+                if isinstance(j, list):
+                    history = [row for row in j if isinstance(row, dict)]
+                elif isinstance(j, dict):
+                    history = [j]
+                if history:
+                    break
+            if not history:
+                continue
+
+            last = history[-1]
+            prev = history[-2] if len(history) > 1 else None
+            try:
+                raw_val = last.get("valor")
                 if raw_val is not None:
                     val = float(raw_val)
             except (TypeError, ValueError):
                 val = None
             fecha = str(last.get("fecha")) if last.get("fecha") else fecha
+            if prev:
+                try:
+                    prev_val = float(prev.get("valor")) if prev.get("valor") is not None else None
+                    if prev_val not in (None, 0) and val is not None:
+                        variation = ((val - prev_val) / prev_val) * 100.0
+                except (TypeError, ValueError):
+                    variation = variation
             if val is not None:
                 break
-        if val is not None:
-            break
 
     if val is None:
         data = await _fetch_rava_profile(session, "riesgo pais")
@@ -1362,9 +1412,18 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
         return None
 
     try:
-        return (int(round(val)), fecha)
+        return (int(round(val)), fecha, variation)
     except Exception:
         return None
+
+
+def _format_riesgo_variation(var: Optional[float]) -> str:
+    if not isinstance(var, (int, float)):
+        return ""
+    arrow = "🔻" if var < 0 else "🔺" if var > 0 else "➡️"
+    color = "#0abf53" if var < 0 else "#d7263d" if var > 0 else "#888"
+    sign = "" if var < 0 else "+" if var > 0 else ""
+    return f" <span style='color:{color}'>{arrow} {sign}{var:.2f}%</span>"
 
 async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
     for suf in ("/inflacion", "/inflacion/mensual/ultimo", "/inflacion/mensual"):
@@ -1719,6 +1778,19 @@ RSS_FEEDS = [
     "https://news.google.com/rss/search?q=finanzas+argentinas+OR+mercados+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
     "https://news.google.com/rss/search?q=empresas+argentina+OR+negocios+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
     "https://news.google.com/rss/search?q=inflaci%C3%B3n+argentina+OR+bcra+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=bancos+argentinos+OR+creditos+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=exportaciones+importaciones+argentina+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
+]
+
+# Fuentes extendidas (más sitios nacionales y ventana de 48h) que se consultan
+# de manera incremental cuando faltan notas relevantes en las fuentes
+# principales.
+RSS_FEEDS_EXTENDED = [
+    "https://news.google.com/rss/search?q=site:cronista.com+OR+site:ambito.com+economia+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=site:infobae.com/economia+OR+site:iprofesional.com/economia+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=mercados+argentinos+OR+merval+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=inflacion+argentina+OR+actividad+economica+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://news.google.com/rss/search?q=deuda+argentina+OR+bonos+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
 ]
 NATIONAL_NEWS_DOMAINS: Set[str] = {
     "ambito.com",
@@ -2018,6 +2090,13 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     _prune_news_history(now_ts)
     today = datetime.utcfromtimestamp(now_ts).date().isoformat()
     target_limit = max(limit, 5)
+    fallback_generic = [
+        ("Mercados: sin novedades relevantes", "https://www.cronista.com/finanzas-mercados/"),
+        ("Actividad: esperando datos de inflación", "https://www.baenegocios.com/economia/"),
+        ("Consumo: expectativa por ventas minoristas", "https://www.perfil.com/economia"),
+        ("Créditos: panorama de tasas y costos", "https://www.infobae.com/economia/"),
+        ("Comercio exterior: dinámica de importaciones", "https://www.pagina12.com.ar/seccion/economia"),
+    ]
     if NEWS_CACHE.get("date") == today and NEWS_CACHE.get("items"):
         cached_items = _dedup_news_items(NEWS_CACHE.get("items", []), limit=target_limit)
         # Si el cache solo tiene portadas/genéricos, volvemos a buscar noticias reales
@@ -2029,44 +2108,58 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             return cached_items[:limit]
         NEWS_CACHE.clear()
     history_stems: Set[str] = {stem for stem, _ in NEWS_HISTORY}
-
     raw_entries: List[Tuple[str, str, Optional[str]]] = []
-    for url in RSS_FEEDS:
-        xml = await fetch_text(session, url, headers={"Accept":"application/rss+xml, application/atom+xml, */*"})
-        if not xml:
-            continue
-        try:
-            raw_entries.extend(_parse_feed_entries(xml))
-        except Exception as e:
-            log.warning("RSS parse %s: %s", url, e)
+
+    async def _collect_feed_entries(feed_urls: Iterable[str]) -> List[Tuple[str, str, Optional[str]]]:
+        collected: List[Tuple[str, str, Optional[str]]] = []
+        for url in feed_urls:
+            xml = await fetch_text(session, url, headers={"Accept": "application/rss+xml, application/atom+xml, */*"})
+            if not xml:
+                continue
+            try:
+                collected.extend(_parse_feed_entries(xml))
+            except Exception as e:
+                log.warning("RSS parse %s: %s", url, e)
+        return collected
+
+    raw_entries.extend(await _collect_feed_entries(RSS_FEEDS))
 
     entries_meta: Dict[str, Tuple[str, Optional[str]]] = {}
     seen_titles: Set[str] = set()
     seen_stems: Set[str] = set()
     seen_links: Set[str] = set()
-    for title, link, desc in raw_entries:
-        if not link.startswith("http"):
-            continue
-        if not _is_probably_article_url(link):
-            continue
-        if _is_dollar_related(title, desc):
-            continue
-        if not _is_economic_relevant(title, desc):
-            continue
-        norm_title = _normalize_news_title(title)
-        stem_key = _news_dedup_key(title)
-        clean_link = _canonical_news_link(link)
-        if (
-            norm_title in seen_titles
-            or stem_key in seen_stems
-            or clean_link in seen_links
-            or stem_key in history_stems
-        ):
-            continue
-        seen_titles.add(norm_title)
-        seen_stems.add(stem_key)
-        seen_links.add(clean_link)
-        entries_meta[link] = (title, desc)
+
+    def _ingest_entries(entries: Iterable[Tuple[str, str, Optional[str]]]) -> None:
+        for title, link, desc in entries:
+            if not link.startswith("http"):
+                continue
+            if not _is_probably_article_url(link):
+                continue
+            if _is_dollar_related(title, desc):
+                continue
+            if not _is_economic_relevant(title, desc):
+                continue
+            norm_title = _normalize_news_title(title)
+            stem_key = _news_dedup_key(title)
+            clean_link = _canonical_news_link(link)
+            if (
+                norm_title in seen_titles
+                or stem_key in seen_stems
+                or clean_link in seen_links
+                or stem_key in history_stems
+            ):
+                continue
+            seen_titles.add(norm_title)
+            seen_stems.add(stem_key)
+            seen_links.add(clean_link)
+            entries_meta[link] = (title, desc)
+
+    _ingest_entries(raw_entries)
+
+    if len(entries_meta) < target_limit:
+        extended_entries = await _collect_feed_entries(RSS_FEEDS_EXTENDED)
+        raw_entries.extend(extended_entries)
+        _ingest_entries(extended_entries)
 
     if not entries_meta:
         if NEWS_CACHE.get("items"):
@@ -2076,14 +2169,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             NEWS_CACHE = {"date": today, "items": deduped_raw[:target_limit]}
             save_state()
             return NEWS_CACHE["items"][:limit]
-        fallback = [
-            ("Mercados: sin novedades relevantes", "https://www.cronista.com/finanzas-mercados/"),
-            ("Actividad: esperando datos de inflación", "https://www.baenegocios.com/economia/"),
-            ("Consumo: expectativa por ventas minoristas", "https://www.perfil.com/economia"),
-            ("Créditos: panorama de tasas y costos", "https://www.infobae.com/economia/"),
-            ("Comercio exterior: dinámica de importaciones", "https://www.pagina12.com.ar/seccion/economia"),
-        ]
-        NEWS_CACHE = {"date": today, "items": fallback[:target_limit]}
+        NEWS_CACHE = {"date": today, "items": fallback_generic[:target_limit]}
         save_state()
         return NEWS_CACHE["items"][:limit]
 
@@ -2258,7 +2344,31 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             _register_pick(title, link, dom)
             NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
 
+    if len(picked) < target_limit:
+        # Último intento: relajar límites de dominio y tema con las fuentes ya
+        # procesadas, evitando paywalls cuando sea posible.
+        for entry in scored:
+            if len(picked) >= target_limit:
+                break
+            title = entry["title"]
+            link = entry["link"]
+            dom = entry["domain"]
+            if _already_picked(title, link):
+                continue
+            if await is_paywalled(link, dom):
+                continue
+            picked.append((title, _paywall_friendly_link(link)))
+            _register_pick(title, link, dom)
+            NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
+
     deduped_final = _dedup_news_items(picked, target_limit)
+    if len(deduped_final) < target_limit:
+        for title, link in fallback_generic:
+            if len(deduped_final) >= target_limit:
+                break
+            if (title, link) not in deduped_final:
+                deduped_final.append((title, link))
+
     NEWS_CACHE = {"date": today, "items": deduped_final[:target_limit]}
     save_state()
     return NEWS_CACHE["items"][:limit]
@@ -2319,20 +2429,17 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
 
     def _fmt_var(val: Optional[float]) -> str:
         if val is None:
-            return f"{'—':>14}"
+            return f"{'—':>12}"
         if val > 0:
-            arrow = "↑"
-            color = "#c0392b"  # rojo
+            icon = "🟢"
+            num = f"+{val:.2f}%"
         elif val < 0:
-            arrow = "↓"
-            color = "#2ecc71"  # verde
+            icon = "🔴"
+            num = f"{val:.2f}%"
         else:
-            arrow = "→"
-            color = "#95a5a6"  # gris neutro
-
-        num = f"{abs(val):.2f}%"
-        icon = f"<span style=\"color:{color}\">{arrow}</span>"
-        return f"{(icon + ' ' + num):>14}"
+            icon = "⚪"
+            num = "0.00%"
+        return f"{(icon + ' ' + num):>12}"
 
     compra_lines = [
         header,
@@ -2677,12 +2784,27 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
     inf_txt = fmt_money_ars(banda_inf) if banda_inf is not None else "—"
     pct_txt = pct(pct_val, 2) if pct_val is not None else "—"
 
+    header = "<b>📊 Bandas cambiarias</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
+
+    col1 = ["Banda superior", "Banda inferior"]
+    col2 = [sup_txt, inf_txt]
+    col3 = [pct_txt, pct_txt]
+
+    col1_w = max(len(_html.unescape(t)) for t in col1)
+    col2_w = max(len(_html.unescape(t)) for t in col2)
+
+    rows = []
+    for c1, c2, c3 in zip(col1, col2, col3):
+        rows.append(
+            f"{c1.ljust(col1_w)} | {c2.rjust(col2_w)} | {c3}"
+        )
+
+    table = "\n".join(rows)
+
     lines = [
-        "<b>📊 Bandas cambiarias</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else ""),
-        f"Banda superior: <b>{sup_txt}</b>",
-        f"Banda inferior: <b>{inf_txt}</b>",
-        f"Variación diaria: <b>{pct_txt}</b>",
-        "<i>Fuente: DolarAPI (bandas-cambiarias)</i>",
+        header,
+        "<pre>Nombre           | Importe | Variación\n" + table + "</pre>",
+        "<i>Fuente: DolarAPI</i>",
     ]
     return "\n".join(lines)
 
@@ -2765,8 +2887,10 @@ async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tup is None:
         txt = "No pude obtener riesgo país ahora."
     else:
-        rp, f = tup; f_str = parse_iso_ddmmyyyy(f)
-        txt = f"<b>📈 Riesgo País</b>{f' <i>{f_str}</i>' if f_str else ''}\n<b>{rp} pb</b>\n<i>Fuente: ArgentinaDatos (api.argentinadatos.com)</i>"
+        rp, f, var = tup; f_str = parse_iso_ddmmyyyy(f)
+        change_txt = _format_riesgo_variation(var)
+        txt = (f"<b>📈 Riesgo País</b>{f' <i>{f_str}</i>' if f_str else ''}\n"
+               f"<b>{rp} pb</b>{change_txt}\n<i>Fuente: Dolarito.ar</i>")
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6348,7 +6472,11 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if fx:
         partes.append(format_dolar_message(fx))
     if rp:
-        partes.append(f"<b>📈 Riesgo País</b> {rp[0]} pb" + (f" <i>({parse_iso_ddmmyyyy(rp[1])})</i>" if rp[1] else ""))
+        change_txt = _format_riesgo_variation(rp[2])
+        partes.append(
+            f"<b>📈 Riesgo País</b> {rp[0]} pb{change_txt}"
+            + (f" <i>({parse_iso_ddmmyyyy(rp[1])})</i>" if rp[1] else "")
+        )
     if infl:
         partes.append(f"<b>📉 Inflación Mensual</b> {str(round(infl[0],1)).replace('.',',')}%" + (f" <i>({infl[1]})</i>" if infl[1] else ""))
     if rv:
