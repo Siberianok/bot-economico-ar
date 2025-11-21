@@ -2063,7 +2063,7 @@ def _paywall_friendly_link(url: str) -> str:
     return url
 
 
-def _mentions_argentina(title: str, desc: Optional[str]) -> bool:
+def _mentions_argentina(title: str, desc: Optional[str], domain: Optional[str] = None) -> bool:
     parts = [title or ""]
     if desc:
         parts.append(desc)
@@ -2076,17 +2076,21 @@ def _mentions_argentina(title: str, desc: Optional[str]) -> bool:
         "argentino",
         "argentinos",
         "argentinas",
-        "argent",
-        "buenos aires",
-        "bs as",
-        "caba",
-        "rosario",
-        "cordoba",
-        "mendoza",
-        "neuquen",
-        "patagonia",
+        "pais",
+        "país",
+        "nacional",
+        "nacion",
+        "nación",
     ]
-    return any(k in low for k in keywords)
+    has_keyword = any(k in low for k in keywords)
+
+    if domain:
+        norm_dom = domain[4:] if domain.startswith("www.") else domain
+        if norm_dom in NATIONAL_NEWS_DOMAINS:
+            return True
+        return has_keyword
+
+    return has_keyword
 
 
 async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tuple[str, str]]:
@@ -2182,7 +2186,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     for link, (title, desc) in entries_meta.items():
         dom = domain_of(link)
         norm_dom = dom[4:] if dom.startswith("www.") else dom
-        mentions_ar = _mentions_argentina(title, desc)
+        mentions_ar = _mentions_argentina(title, desc, norm_dom)
         is_national = norm_dom in NATIONAL_NEWS_DOMAINS
         if not is_national and not mentions_ar:
             continue
@@ -2323,7 +2327,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
                     "score": _score_title(title),
                     "domain": norm_dom,
                     "is_national": norm_dom in NATIONAL_NEWS_DOMAINS,
-                    "mentions": _mentions_argentina(title, desc),
+                    "mentions": _mentions_argentina(title, desc, norm_dom),
                 }
             )
 
