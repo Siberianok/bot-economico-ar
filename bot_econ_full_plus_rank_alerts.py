@@ -1856,8 +1856,9 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
     try:
         root = ET.fromstring(xml)
     except Exception:
-        return out
-    for item in root.findall(".//item"):
+        # Si el XML está mal formado, seguimos con el fallback regex
+        root = None
+    for item in root.findall(".//item") if root is not None else []:
         t_el = item.find("title"); l_el = item.find("link")
         d_el = item.find("description")
         t = (t_el.text or "").strip() if (t_el is not None and t_el.text) else None
@@ -1868,7 +1869,7 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
             desc = d_el.text.strip()
         if t and l and l.startswith("http") and _is_probably_article_url(l):
             out.append((t, l, desc))
-    for entry in root.findall(".//{*}entry"):
+    for entry in root.findall(".//{*}entry") if root is not None else []:
         t_el = entry.find(".//{*}title")
         link_el = entry.find(".//{*}link[@rel='alternate']") or entry.find(".//{*}link")
         summary_el = entry.find(".//{*}summary")
@@ -1984,10 +1985,14 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     target_limit = max(limit, 5)
     if NEWS_CACHE.get("date") == today and NEWS_CACHE.get("items"):
         cached_items = _dedup_news_items(NEWS_CACHE.get("items", []), limit=target_limit)
-        if len(cached_items) != len(NEWS_CACHE.get("items", [])):
-            NEWS_CACHE["items"] = cached_items
-            save_state()
-        return cached_items[:limit]
+        # Si el cache solo tiene portadas/genéricos, volvemos a buscar noticias reales
+        cache_has_articles = any(_is_probably_article_url(l) for _, l in cached_items)
+        if cache_has_articles:
+            if len(cached_items) != len(NEWS_CACHE.get("items", [])):
+                NEWS_CACHE["items"] = cached_items
+                save_state()
+            return cached_items[:limit]
+        NEWS_CACHE.clear()
     history_stems: Set[str] = {stem for stem, _ in NEWS_HISTORY}
 
     raw_entries: List[Tuple[str, str, Optional[str]]] = []
