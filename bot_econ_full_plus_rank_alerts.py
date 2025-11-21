@@ -66,6 +66,8 @@ ARG_DATOS_BASES = [
     "https://argentinadatos.com/v1/finanzas/indices",
 ]
 
+CRIPTOYA_RIESGO_URL = "https://criptoya.com/charts/riesgo-pais"
+
 LAMACRO_RESERVAS_URL = "https://www.lamacro.ar/variables/1"
 
 YF_URLS = [
@@ -1177,53 +1179,148 @@ async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Option
     except: return None
 
 async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str]]]:
-    data = await _fetch_rava_profile(session, "riesgo pais")
-    if not data:
-        return None
-
     val: Optional[float] = None
     fecha: Optional[str] = None
 
-    quotes = data.get("cotizaciones") if isinstance(data, dict) else None
-    if isinstance(quotes, list) and quotes:
-        row = quotes[0] if isinstance(quotes[0], dict) else None
-        if isinstance(row, dict):
-            raw_val = row.get("ultimo")
-            if raw_val is None:
-                raw_val = row.get("cierre")
+    for base in ARG_DATOS_BASES:
+        for suf in ("/riesgo-pais/ultimo/", "/riesgo-pais/ultimo", "/riesgo-pais/"):
+            j = await fetch_json(session, base + suf)
+            if not j:
+                continue
+            if isinstance(j, list):
+                last = j[-1] if j and isinstance(j[-1], dict) else None
+            elif isinstance(j, dict):
+                last = j
+            else:
+                last = None
+            if not isinstance(last, dict):
+                continue
+            raw_val = last.get("valor")
             try:
-                val = float(raw_val) if raw_val is not None else None
+                if raw_val is not None:
+                    val = float(raw_val)
             except (TypeError, ValueError):
                 val = None
-            fecha_raw = row.get("fecha")
-            hora_raw = row.get("hora")
-            if fecha_raw:
-                if hora_raw:
-                    fecha = f"{fecha_raw} {hora_raw}"
-                else:
-                    fecha = str(fecha_raw)
+            fecha = str(last.get("fecha")) if last.get("fecha") else fecha
+            if val is not None:
+                break
+        if val is not None:
+            break
 
     if val is None:
-        history = data.get("coti_hist") if isinstance(data, dict) else None
-        if isinstance(history, list) and history:
-            last = history[-1] if isinstance(history[-1], dict) else None
-            if isinstance(last, dict):
-                raw_val = last.get("ultimo")
+        data = await _fetch_rava_profile(session, "riesgo pais")
+        if not data:
+            return None
+
+        quotes = data.get("cotizaciones") if isinstance(data, dict) else None
+        if isinstance(quotes, list) and quotes:
+            row = quotes[0] if isinstance(quotes[0], dict) else None
+            if isinstance(row, dict):
+                raw_val = row.get("ultimo")
                 if raw_val is None:
-                    raw_val = last.get("cierre")
+                    raw_val = row.get("cierre")
                 try:
                     val = float(raw_val) if raw_val is not None else None
                 except (TypeError, ValueError):
                     val = None
-                ts = last.get("timestamp")
-                if ts:
+                fecha_raw = row.get("fecha")
+                hora_raw = row.get("hora")
+                if fecha_raw:
+                    if hora_raw:
+                        fecha = f"{fecha_raw} {hora_raw}"
+                    else:
+                        fecha = str(fecha_raw)
+
+        if val is None:
+            history = data.get("coti_hist") if isinstance(data, dict) else None
+            if isinstance(history, list) and history:
+                last = history[-1] if isinstance(history[-1], dict) else None
+                if isinstance(last, dict):
+                    raw_val = last.get("ultimo")
+                    if raw_val is None:
+                        raw_val = last.get("cierre")
                     try:
-                        dt = datetime.fromtimestamp(float(ts), tz=TZ)
-                        fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
-                    except Exception:
-                        fecha = fecha or last.get("fecha")
-                elif last.get("fecha") and not fecha:
-                    fecha = str(last.get("fecha"))
+                        val = float(raw_val) if raw_val is not None else None
+                    except (TypeError, ValueError):
+                        val = None
+                    ts = last.get("timestamp")
+                    if ts:
+                        try:
+                            dt = datetime.fromtimestamp(float(ts), tz=TZ)
+                            fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            fecha = fecha or last.get("fecha")
+                    elif last.get("fecha") and not fecha:
+                        fecha = str(last.get("fecha"))
+
+    if val is None:
+        html = await fetch_text(session, CRIPTOYA_RIESGO_URL)
+        if html:
+            cd_match = re.search(r"chart-data=\"(.*?)\"", html)
+            endpoint: Optional[str] = None
+            if cd_match:
+                try:
+                    data_str = _html.unescape(cd_match.group(1))
+                    data_obj = json.loads(data_str)
+                    series = data_obj.get("series") if isinstance(data_obj, dict) else None
+                    if isinstance(series, list) and series and isinstance(series[0], dict):
+                        endpoint = series[0].get("endpoint")
+                except Exception:
+                    endpoint = None
+
+            if endpoint:
+                for api_url in (
+                    f"https://criptoya.com/api/charts{endpoint}?interval=D&limit=1",
+                    f"https://criptoya.com/api/charts{endpoint}",
+                    f"https://criptoya.com/charts{endpoint}",
+                ):
+                    j = await fetch_json(session, api_url)
+                    if isinstance(j, dict):
+                        for k in ("close", "value", "ultimo", "cierre", "price"):
+                            raw_val = j.get(k)
+                            if raw_val is not None:
+                                try:
+                                    val = float(raw_val)
+                                    break
+                                except (TypeError, ValueError):
+                                    val = None
+                        ts = j.get("timestamp") or j.get("time")
+                        if ts and not fecha:
+                            try:
+                                fecha = datetime.fromtimestamp(float(ts), tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
+                            except Exception:
+                                pass
+                    elif isinstance(j, list) and j:
+                        last = j[-1]
+                        if isinstance(last, dict):
+                            raw_val = last.get("close") or last.get("value") or last.get("ultimo") or last.get("cierre") or last.get("price")
+                            try:
+                                val = float(raw_val) if raw_val is not None else None
+                            except (TypeError, ValueError):
+                                val = None
+                            ts = last.get("timestamp") or last.get("time")
+                            if ts and not fecha:
+                                try:
+                                    fecha = datetime.fromtimestamp(float(ts), tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
+                                except Exception:
+                                    pass
+                    if val is not None:
+                        break
+
+            if val is None:
+                for pat in (
+                    r"\bRiesgo\s+Pa[ií]s\b.*?(\d{3,5})",
+                    r"\bEMBI\b.*?(\d{3,5})",
+                    r"\b(?:riesgo|embi)[^\d]{0,15}(\d{3,5})",
+                ):
+                    m = re.search(pat, html, flags=re.I | re.S)
+                    if m:
+                        try:
+                            val = float(m.group(1))
+                            fecha = None
+                            break
+                        except Exception:
+                            continue
 
     if val is None:
         return None
@@ -1727,28 +1824,6 @@ def _canonical_news_link(link: str) -> str:
     except Exception:
         return link
 
-ARTICLE_SECTION_STOPWORDS: Set[str] = {
-    "index",
-    "index.html",
-    "index.htm",
-    "home",
-    "inicio",
-    "economia",
-    "economy",
-    "finanzas",
-    "finanzas-mercados",
-    "finanzas-y-mercados",
-    "economia-y-politica",
-    "economia-y-negocios",
-    "economia-y-finanzas",
-    "ultimas",
-    "ultimas-noticias",
-    "lo-ultimo",
-    "noticias",
-    "news",
-}
-
-
 def _is_probably_article_url(link: str) -> bool:
     try:
         parsed = urlparse(link)
@@ -1762,34 +1837,13 @@ def _is_probably_article_url(link: str) -> bool:
     parts = [p for p in path.strip("/").split("/") if p]
     if not parts:
         return False
-    tail_lower = parts[-1].lower()
-    if tail_lower in ARTICLE_SECTION_STOPWORDS:
+    tail = parts[-1].lower()
+    if tail in {"economia", "finanzas", "finanzas-mercados", "finanzas-y-mercados"}:
         return False
-    if any(p.lower() in ARTICLE_SECTION_STOPWORDS for p in parts):
-        # El enlace apunta a una sección/listado, no a una nota
+    if len(parts) == 1 and len(tail) < 10:
         return False
-    # Requiere un segmento con forma de slug de nota (guiones y/o fecha)
-    def _looks_like_slug(segment: str) -> bool:
-        seg = segment.lower()
-        if seg in ARTICLE_SECTION_STOPWORDS:
-            return False
-        if re.match(r"\d{4}[-/]?\d{2}[-/]?\d{2}", seg):
-            return True
-        if len(seg) >= 10 and "-" in seg and re.search(r"[a-z]", seg) and re.search(r"[a-z0-9]-[a-z0-9]", seg):
-            return True
-        if len(seg) >= 8 and any(ch.isdigit() for ch in seg) and re.search(r"[a-z]", seg):
-            return True
-        if re.match(r"[a-z0-9]+-[a-z0-9]+", seg) and len(seg) >= 8:
-            return True
-        return False
-
-    slug_segment = next((seg for seg in reversed(parts) if _looks_like_slug(seg)), None)
-    if not slug_segment:
-        return False
-    # Evita portadas con rutas cortas o sin identificador claro
-    if len("".join(parts)) < 12:
-        return False
-    return True
+    has_signal = ("-" in tail) or any(ch.isdigit() for ch in tail) or len(tail) >= 10
+    return has_signal or len(parts) >= 2
 
 def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
     out: List[Tuple[str, str, Optional[str]]] = []
@@ -1967,9 +2021,16 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         entries_meta[link] = (title, desc)
 
     if not entries_meta:
-        NEWS_CACHE = {"date": today, "items": []}
+        fallback = [
+            ("Mercados: sin novedades relevantes", "https://www.ambito.com/"),
+            ("Actividad: esperando datos de inflación", "https://www.cronista.com/"),
+            ("Consumo: expectativa por ventas minoristas", "https://www.perfil.com/"),
+            ("Créditos: panorama de tasas y costos", "https://www.infobae.com/"),
+            ("Comercio exterior: dinámica de importaciones", "https://www.pagina12.com.ar/"),
+        ]
+        NEWS_CACHE = {"date": today, "items": fallback[:target_limit]}
         save_state()
-        return []
+        return NEWS_CACHE["items"][:limit]
 
     scored: List[Dict[str, Any]] = []
     for link, (title, desc) in entries_meta.items():
@@ -2132,15 +2193,27 @@ def _label_short(sym: str) -> str:
     if sym.endswith(".BA"): return f"{NAME_ABBR.get(sym, sym)} ({sym[:-3]})"
     return label_with_currency(sym)
 
-def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
+def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     fecha = None
     for row in d.values():
         f = row.get("fecha")
-        if f: fecha = parse_iso_ddmmyyyy(f)
+        if f:
+            fecha = parse_iso_ddmmyyyy(f)
     header = "<b>💵 Dólares</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
     lines = [header, "<pre>Tipo         Compra        Venta    Var. día</pre>"]
     rows = []
     order = [("oficial","Oficial"),("mayorista","Mayorista"),("blue","Blue"),("mep","MEP"),("ccl","CCL"),("cripto","Cripto"),("tarjeta","Tarjeta")]
+    def _fmt_var(val: Optional[float]) -> str:
+        if val is None:
+            return "—"
+        arrow = "🟢⬇️" if val < 0 else "🔴⬆️" if val > 0 else "⏺️"
+        return f"{arrow} {abs(val):.2f}%"
+
+    compra_lines = ["<b>📥 Compra</b>", "<pre>Tipo         Compra        Var. día</pre>"]
+    venta_lines = ["<b>📤 Venta</b>", "<pre>Tipo         Venta         Var. día</pre>"]
+    compra_rows: List[str] = []
+    venta_rows: List[str] = []
+
     for k, label in order:
         row = d.get(k)
         if not row: continue
@@ -2400,8 +2473,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         data = await get_dolares(session)
-    msg = format_dolar_message(data) if data else "No pude obtener cotizaciones ahora."
-    await update.effective_message.reply_text(msg, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    if not data:
+        await update.effective_message.reply_text(
+            "No pude obtener cotizaciones ahora.",
+            parse_mode=ParseMode.HTML,
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
+        )
+        return
+
+    compra_msg, venta_msg = format_dolar_panels(data)
+    await update.effective_message.reply_text(
+        compra_msg,
+        parse_mode=ParseMode.HTML,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
+    await update.effective_message.reply_text(
+        venta_msg,
+        parse_mode=ParseMode.HTML,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+    )
 
 async def cmd_acciones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_menu_counter(context, "acciones", 2)
