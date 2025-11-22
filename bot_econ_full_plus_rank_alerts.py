@@ -1176,11 +1176,6 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
         if k in data and k in variations:
             data[k]["variation"] = variations[k]
 
-    prev_dates = [
-        (datetime.now(TZ).date() - timedelta(days=delta)).isoformat()
-        for delta in range(1, 4)
-    ]
-
     def _current_val(row: Dict[str, Any]) -> Optional[float]:
         venta = row.get("venta")
         compra = row.get("compra")
@@ -1209,6 +1204,7 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
                 continue
             try:
                 row["variation"] = ((cur_val - prev_val) / prev_val) * 100.0
+                row["prev_fecha"] = date_str
                 return
             except Exception:
                 continue
