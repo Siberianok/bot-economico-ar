@@ -1193,9 +1193,9 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
             return None
         return None
 
-    async def _backfill_variation(key: str, path: str):
+    async def _update_variation(key: str, path: str):
         row = data.get(key)
-        if not row or row.get("variation") is not None:
+        if not row:
             return
 
         cur_val = _current_val(row)
@@ -1214,41 +1214,13 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
                 continue
 
     for k, path in mapping.items():
-        await _backfill_variation(k, path)
+        await _update_variation(k, path)
 
     oficial = data.get("oficial") or {}
     tarjeta = data.get("tarjeta") or {}
 
-    if "promedio_bancos" not in data and oficial:
-        data["promedio_bancos"] = {
-            "compra": oficial.get("compra"),
-            "venta": oficial.get("venta"),
-            "variation": oficial.get("variation"),
-            "fuente": oficial.get("fuente") or "CriptoYa",
-            "fecha": oficial.get("fecha"),
-        }
-
-    if "qatar" not in data:
-        qatar_source = tarjeta if tarjeta else oficial
-        if qatar_source:
-            venta = qatar_source.get("venta")
-            compra = qatar_source.get("compra")
-            if venta is None and compra is not None:
-                venta = compra
-            factor = 1.0
-            try:
-                factor = 1.65 if tarjeta else 1.9
-            except Exception:
-                factor = 1.0
-            qatar_compra = float(compra) * factor if compra is not None else None
-            qatar_venta = float(venta) * factor if venta is not None else None
-            data["qatar"] = {
-                "compra": qatar_compra,
-                "venta": qatar_venta,
-                "variation": qatar_source.get("variation"),
-                "fuente": (qatar_source.get("fuente") or "CriptoYa") + " (calc.)",
-                "fecha": qatar_source.get("fecha"),
-            }
+    # Tipos de cambio especiales (promedio bancos, Qatar) ya no se calculan
+    # aquí para simplificar el panel principal.
     return data
 
 async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
@@ -1264,71 +1236,7 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
     fecha: Optional[str] = None
     variation: Optional[float] = None
 
-    # 1) Dolarito (fuente principal)
-    dolarito_data = await fetch_json(session, DOLARITO_RIESGO_API, headers=REQ_HEADERS)
-    if isinstance(dolarito_data, dict):
-        def _get_from_paths(paths: Iterable[Tuple[str, ...]]) -> Any:
-            for path in paths:
-                current: Any = dolarito_data
-                for key in path:
-                    if isinstance(current, dict) and key in current:
-                        current = current.get(key)
-                    else:
-                        current = None
-                        break
-                if current is not None:
-                    return current
-            return None
-
-        def _safe_number(raw: Any) -> Optional[float]:
-            try:
-                num = float(raw)
-                return num if math.isfinite(num) and num > 0 else None
-            except (TypeError, ValueError):
-                return None
-
-        val_raw = _get_from_paths(
-            (
-                ("valor",),
-                ("value",),
-                ("ultimo",),
-                ("last",),
-                ("data", "valor"),
-                ("data", "value"),
-                ("data", "ultimo"),
-                ("data", "last"),
-            )
-        )
-        parsed_val = _safe_number(val_raw)
-        if parsed_val is not None:
-            val = parsed_val
-
-        fecha_raw = _get_from_paths((("fecha",), ("updatedAt",), ("data", "fecha"), ("data", "updatedAt")))
-        if fecha_raw:
-            fecha = str(fecha_raw)
-
-        prev_val = _safe_number(
-            _get_from_paths(
-                (
-                    ("valorAnterior",),
-                    ("previous",),
-                    ("prev",),
-                    ("anterior",),
-                    ("data", "valorAnterior"),
-                    ("data", "previous"),
-                    ("data", "prev"),
-                    ("data", "anterior"),
-                )
-            )
-        )
-
-        if prev_val not in (None, 0) and val is not None:
-            try:
-                variation = ((val - prev_val) / prev_val) * 100.0
-            except Exception:
-                variation = None
-
-    # 2) ArgentinaDatos
+    # 1) ArgentinaDatos (fuente principal)
     if val is None or variation is None:
         for base in ARG_DATOS_BASES:
             history: List[Dict[str, Any]] = []
@@ -1362,13 +1270,13 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                 except (TypeError, ValueError):
                     variation = variation
             if val is not None and variation is not None:
-                fuente = "ArgentinaDatos"
                 break
 
-    if val is None:
+    # 2) Rava
+    if val is None or variation is None:
         data = await _fetch_rava_profile(session, "riesgo pais")
         if not data:
-            return None
+            data = {}
 
         quotes = data.get("cotizaciones") if isinstance(data, dict) else None
         if isinstance(quotes, list) and quotes:
@@ -1378,9 +1286,9 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                 if raw_val is None:
                     raw_val = row.get("cierre")
                 try:
-                    val = float(raw_val) if raw_val is not None else None
+                    val = float(raw_val) if raw_val is not None else val
                 except (TypeError, ValueError):
-                    val = None
+                    val = val
                 fecha_raw = row.get("fecha")
                 hora_raw = row.get("hora")
                 if fecha_raw:
@@ -1388,31 +1296,36 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                         fecha = f"{fecha_raw} {hora_raw}"
                     else:
                         fecha = str(fecha_raw)
-                fuente = "Rava"
 
-        if val is None:
-            history = data.get("coti_hist") if isinstance(data, dict) else None
-            if isinstance(history, list) and history:
-                last = history[-1] if isinstance(history[-1], dict) else None
-                if isinstance(last, dict):
-                    raw_val = last.get("ultimo")
-                    if raw_val is None:
-                        raw_val = last.get("cierre")
+        history = data.get("coti_hist") if isinstance(data, dict) else None
+        if isinstance(history, list) and history:
+            last = history[-1] if isinstance(history[-1], dict) else None
+            prev = history[-2] if len(history) > 1 and isinstance(history[-2], dict) else None
+            if isinstance(last, dict):
+                raw_val = last.get("ultimo") or last.get("cierre")
+                try:
+                    val = float(raw_val) if raw_val is not None else val
+                except (TypeError, ValueError):
+                    val = val
+                ts = last.get("timestamp")
+                if ts and not fecha:
                     try:
-                        val = float(raw_val) if raw_val is not None else None
-                    except (TypeError, ValueError):
-                        val = None
-                    ts = last.get("timestamp")
-                    if ts:
-                        try:
-                            dt = datetime.fromtimestamp(float(ts), tz=TZ)
-                            fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
-                        except Exception:
-                            fecha = fecha or last.get("fecha")
-                    elif last.get("fecha") and not fecha:
-                        fecha = str(last.get("fecha"))
-                    fuente = "Rava"
+                        dt = datetime.fromtimestamp(float(ts), tz=TZ)
+                        fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        fecha = fecha or last.get("fecha")
+                elif last.get("fecha") and not fecha:
+                    fecha = str(last.get("fecha"))
+            if isinstance(prev, dict) and val is not None and variation is None:
+                prev_raw = prev.get("ultimo") or prev.get("cierre")
+                try:
+                    prev_val = float(prev_raw) if prev_raw is not None else None
+                    if prev_val not in (None, 0):
+                        variation = ((val - prev_val) / prev_val) * 100.0
+                except (TypeError, ValueError):
+                    variation = variation
 
+    # 3) CriptoYa
     if val is None:
         html = await fetch_text(session, CRIPTOYA_RIESGO_URL)
         if html:
@@ -1483,6 +1396,71 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                             break
                         except Exception:
                             continue
+
+    # 4) Dolarito (última prioridad)
+    if val is None:
+        dolarito_data = await fetch_json(session, DOLARITO_RIESGO_API, headers=REQ_HEADERS)
+        if isinstance(dolarito_data, dict):
+            def _get_from_paths(paths: Iterable[Tuple[str, ...]]) -> Any:
+                for path in paths:
+                    current: Any = dolarito_data
+                    for key in path:
+                        if isinstance(current, dict) and key in current:
+                            current = current.get(key)
+                        else:
+                            current = None
+                            break
+                    if current is not None:
+                        return current
+                return None
+
+            def _safe_number(raw: Any) -> Optional[float]:
+                try:
+                    num = float(raw)
+                    return num if math.isfinite(num) and num > 0 else None
+                except (TypeError, ValueError):
+                    return None
+
+            val_raw = _get_from_paths(
+                (
+                    ("valor",),
+                    ("value",),
+                    ("ultimo",),
+                    ("last",),
+                    ("data", "valor"),
+                    ("data", "value"),
+                    ("data", "ultimo"),
+                    ("data", "last"),
+                )
+            )
+            parsed_val = _safe_number(val_raw)
+            if parsed_val is not None:
+                val = parsed_val
+
+            fecha_raw = _get_from_paths((("fecha",), ("updatedAt",), ("data", "fecha"), ("data", "updatedAt")))
+            if fecha_raw:
+                fecha = str(fecha_raw)
+
+            prev_val = _safe_number(
+                _get_from_paths(
+                    (
+                        ("valorAnterior",),
+                        ("previous",),
+                        ("prev",),
+                        ("anterior",),
+                        ("data", "valorAnterior"),
+                        ("data", "previous"),
+                        ("data", "prev"),
+                        ("data", "anterior"),
+                    )
+                )
+            )
+
+            if prev_val not in (None, 0) and val is not None:
+                try:
+                    variation = ((val - prev_val) / prev_val) * 100.0
+                except Exception:
+                    variation = None
 
     if val is None:
         return None
@@ -1917,21 +1895,12 @@ NEWS_CATEGORY_KEYWORDS = [
             "compañia",
             "corporacion",
             "corporación",
-            "compañias",
-            "compani",
             "fusion",
             "adquisicion",
             "adquisición",
             "startup",
             "negocio",
             "sector",
-            "inversion",
-            "inversión",
-            "inversiones",
-            "plantas",
-            "fabricante",
-            "productora",
-            "alianza",
         ],
     ),
     (
@@ -1948,9 +1917,6 @@ NEWS_CATEGORY_KEYWORDS = [
             "mercado",
             "bolsa",
             "bancos",
-            "fondos",
-            "liquidez",
-            "fci",
         ],
     ),
     (
@@ -1968,13 +1934,6 @@ NEWS_CATEGORY_KEYWORDS = [
             "deficit",
             "recaudacion",
             "industria",
-            "ipc",
-            "salario real",
-            "brecha",
-            "export",
-            "import",
-            "agro",
-            "campo",
         ],
     ),
     (
@@ -1991,15 +1950,6 @@ NEWS_CATEGORY_KEYWORDS = [
             "educación",
             "seguridad social",
             "jubil",
-            "manifestacion",
-            "manifestación",
-            "piquete",
-            "marcha",
-            "desempleo",
-            "desocupacion",
-            "asalariado",
-            "remuneracion",
-            "remuneración",
         ],
     ),
     (
@@ -2016,13 +1966,6 @@ NEWS_CATEGORY_KEYWORDS = [
             "elecciones",
             "decreto",
             "ley",
-            "dnu",
-            "oficialismo",
-            "oposicion",
-            "oposición",
-            "casa rosada",
-            "corte suprema",
-            "judicial",
         ],
     ),
 ]
@@ -2088,11 +2031,6 @@ def _news_category_for(title: str, desc: Optional[str] = None) -> str:
     for cat, keywords in NEWS_CATEGORY_KEYWORDS:
         if any(kw in joined for kw in keywords):
             return cat
-    topic = _topic_for_title(title + " " + (desc or ""))
-    if topic in {"deuda", "cambio", "reservas"}:
-        return "financiero"
-    if topic in {"inflacion", "actividad", "fiscal", "comercio", "energia"}:
-        return "economico"
     return "economico"
 
 def domain_of(url: str) -> str:
@@ -2424,12 +2362,6 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     picked_stems: Set[str] = set()
     picked_links: Set[str] = set()
     filled_categories: Set[str] = set()
-    candidate_by_category: Dict[str, List[Dict[str, Any]]] = {cat: [] for cat in NEWS_CATEGORIES_ORDER}
-    for entry in scored:
-        cat = entry.get("category", "economico")
-        if cat not in candidate_by_category:
-            candidate_by_category[cat] = []
-        candidate_by_category[cat].append(entry)
 
     def _already_picked(title: str, link: str) -> bool:
         norm_title = _normalize_news_title(title)
@@ -2465,8 +2397,10 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         paywall_cache[link] = result
         return result
 
-    async def pick_from_entries(entries: Iterable[Dict[str, Any]], *, domain_cap: Optional[int], allow_paywall: bool, category: Optional[str] = None, allow_repeat_category: bool = False) -> Optional[str]:
-        for entry in entries:
+    async def pick_category(category: str, *, domain_cap: Optional[int], allow_paywall: bool) -> bool:
+        for entry in scored:
+            if entry["category"] != category:
+                continue
             if len(picked) >= target_limit:
                 break
             title = entry["title"]
@@ -2475,7 +2409,25 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             cat = category or entry.get("category")
             if _already_picked(title, link):
                 continue
-            if not allow_repeat_category and cat and cat in filled_categories:
+            if domain_cap is not None and domain_counts.get(dom, 0) >= domain_cap:
+                continue
+            if not allow_paywall and await is_paywalled(link, dom):
+                continue
+            picked.append((title, _paywall_friendly_link(link)))
+            _register_pick(title, link, dom)
+            NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
+            filled_categories.add(category)
+            return True
+        return False
+
+    async def pick_remaining(*, domain_cap: Optional[int], allow_paywall: bool) -> None:
+        for entry in scored:
+            if len(picked) >= target_limit:
+                break
+            title = entry["title"]
+            link = entry["link"]
+            dom = entry["domain"]
+            if _already_picked(title, link):
                 continue
             if domain_cap is not None and domain_counts.get(dom, 0) >= domain_cap:
                 continue
@@ -2484,21 +2436,6 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             picked.append((title, _paywall_friendly_link(link)))
             _register_pick(title, link, dom)
             NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
-            if cat:
-                filled_categories.add(cat)
-            return cat
-        return None
-
-    async def pick_remaining(*, domain_cap: Optional[int], allow_paywall: bool, allow_repeat_category: bool = False) -> None:
-        for entry in scored:
-            if len(picked) >= target_limit:
-                break
-            await pick_from_entries(
-                [entry],
-                domain_cap=domain_cap,
-                allow_paywall=allow_paywall,
-                allow_repeat_category=allow_repeat_category,
-            )
 
     for domain_cap in [1, 2, None]:
         for allow_paywall in [False, True]:
@@ -2507,12 +2444,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
                     break
                 if category in filled_categories:
                     continue
-                await pick_from_entries(
-                    candidate_by_category.get(category, []),
-                    domain_cap=domain_cap,
-                    allow_paywall=allow_paywall,
-                    category=category,
-                )
+                await pick_category(category, domain_cap=domain_cap, allow_paywall=allow_paywall)
             if len(filled_categories) == len(NEWS_CATEGORIES_ORDER) or len(picked) >= target_limit:
                 break
         if len(filled_categories) == len(NEWS_CATEGORIES_ORDER) or len(picked) >= target_limit:
@@ -2521,33 +2453,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     if len(picked) < target_limit:
         for domain_cap in [1, 2, None]:
             for allow_paywall in [False, True]:
-                # Intentar completar categorías faltantes antes de permitir repeticiones
-                for category in NEWS_CATEGORIES_ORDER:
-                    if len(picked) >= target_limit:
-                        break
-                    if category in filled_categories:
-                        continue
-                    await pick_from_entries(
-                        candidate_by_category.get(category, []),
-                        domain_cap=domain_cap,
-                        allow_paywall=allow_paywall,
-                        category=category,
-                    )
-                if len(picked) >= target_limit:
-                    break
                 await pick_remaining(domain_cap=domain_cap, allow_paywall=allow_paywall)
-                if len(picked) >= target_limit:
-                    break
-            if len(picked) >= target_limit:
-                break
-    if len(picked) < target_limit:
-        for domain_cap in [1, 2, None]:
-            for allow_paywall in [False, True]:
-                await pick_remaining(
-                    domain_cap=domain_cap,
-                    allow_paywall=allow_paywall,
-                    allow_repeat_category=True,
-                )
                 if len(picked) >= target_limit:
                     break
             if len(picked) >= target_limit:
@@ -2642,7 +2548,7 @@ def _format_news_item(title: str, link: str) -> str:
 
 
 def _build_news_layout(news: List[Tuple[str, str]]) -> Tuple[str, Optional[InlineKeyboardMarkup], List[str]]:
-    header = "<b>📰 Noticias</b>\n<i>Fuente: Google News (medios económicos AR)</i>"
+    header = "<b>📰 Noticias</b>"
     if not news:
         return header, None, []
 
@@ -2674,13 +2580,10 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     header = "<b>💵 Dólares</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
     order = [
         ("oficial", "Oficial"),
-        ("promedio_bancos", "Prom. bancos"),
-        ("ahorro", "Ahorro"),
         ("mayorista", "Mayorista"),
         ("blue", "Blue"),
         ("mep", "MEP"),
         ("ccl", "CCL"),
-        ("qatar", "Qatar"),
         ("cripto", "Cripto"),
         ("tarjeta", "Tarjeta"),
     ]
@@ -2688,16 +2591,9 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     def _fmt_var(val: Optional[float]) -> str:
         if val is None:
             return f"{'—':>12}"
-        if val > 0:
-            icon = "▲"
-            num = f"+{val:.2f}%"
-        elif val < 0:
-            icon = "▼"
-            num = f"{val:.2f}%"
-        else:
-            icon = "▬"
-            num = "0.00%"
-        return f"{(icon + ' ' + num):>12}"
+        icon = "🔴" if val > 0 else "🟢" if val < 0 else "⚪"
+        num = f"{val:+.2f}%"
+        return f"{icon} {num:>8}"
 
     compra_lines = [
         header,
@@ -2727,10 +2623,6 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
 
         compra_rows.append(f"<pre>{label:<12}{compra:>12} {var_txt}</pre>")
         venta_rows.append(f"<pre>{label:<12}{venta:>12} {var_txt}</pre>")
-
-    fuente_txt = "<i>Fuentes: CriptoYa (prioridad) + DolarAPI (complemento)</i>"
-    compra_rows.append(fuente_txt)
-    venta_rows.append(fuente_txt)
 
     compra_msg = "\n".join(compra_lines + compra_rows)
     venta_msg = "\n".join(venta_lines + venta_rows)
@@ -3112,12 +3004,9 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
 
     table = "\n".join(rows)
 
-    fuente = data.get("fuente") or "DolarAPI"
-
     lines = [
         header,
         "<pre>Nombre           | Importe | Variación\n" + table + "</pre>",
-        f"<i>Fuente: {fuente}</i>",
     ]
     return "\n".join(lines)
 
@@ -3181,7 +3070,7 @@ async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         val, fecha = res
         txt = (f"<b>🏦 Reservas BCRA</b>{f' <i>Últ. Act.: {fecha}</i>' if fecha else ''}\n"
-               f"<b>{fmt_number(val,0)} MUS$</b>\n<i>Fuente: LaMacro (lamacro.ar)</i>")
+               f"<b>{fmt_number(val,0)} MUS$</b>")
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3191,7 +3080,7 @@ async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = "No pude obtener inflación ahora."
     else:
         val, fecha = tup; val_str = str(round(val,1)).replace(".", ",")
-        txt = f"<b>📉 Inflación Mensual</b>{f' <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>\n<i>Fuente: ArgentinaDatos (api.argentinadatos.com)</i>"
+        txt = f"<b>📉 Inflación Mensual</b>{f' <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>"
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3203,7 +3092,7 @@ async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rp, f, var = tup; f_str = parse_iso_ddmmyyyy(f)
         change_txt = _format_riesgo_variation(var)
         txt = (f"<b>📈 Riesgo País</b>{f' <i>{f_str}</i>' if f_str else ''}\n"
-               f"<b>{rp} pb</b>{change_txt}\n<i>Fuente: Dolarito.ar</i>")
+               f"<b>{rp} pb</b>{change_txt}")
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
