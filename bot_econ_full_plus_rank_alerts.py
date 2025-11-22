@@ -1161,6 +1161,10 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
         "tarjeta": "/dolares/tarjeta",
         "cripto": "/ambito/dolares/cripto",
     }
+
+    today = datetime.now(TZ).date()
+    prev_dates = [(today - timedelta(days=delta)).isoformat() for delta in range(1, 6)]
+
     for k, path in mapping.items():
         needs_fallback = (
             k not in data
@@ -6751,6 +6755,7 @@ def setup_health_routes(application: Application) -> None:
 
 BOT_COMMANDS = [
     BotCommand("economia","Menú de economía"),
+    BotCommand("dolar","Tipos de cambio"),
     BotCommand("acciones","Menú acciones"),
     BotCommand("cedears","Menú cedears"),
     BotCommand("alertas_menu","Configurar alertas"),
