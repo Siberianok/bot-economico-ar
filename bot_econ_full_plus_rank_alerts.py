@@ -1261,11 +1261,11 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                     val = float(raw_val)
             except (TypeError, ValueError):
                 val = val if val is not None else None
-            fecha = str(last.get("fecha")) if last.get("fecha") else fecha
-            if prev:
+            fecha = str(last.get("fecha")) if last.get("fecha") and not fecha else fecha
+            if prev and variation is None and val is not None:
                 try:
                     prev_val = float(prev.get("valor")) if prev.get("valor") is not None else None
-                    if prev_val not in (None, 0) and val is not None and variation is None:
+                    if prev_val not in (None, 0):
                         variation = ((val - prev_val) / prev_val) * 100.0
                 except (TypeError, ValueError):
                     variation = variation
@@ -1363,7 +1363,6 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                                 fecha = datetime.fromtimestamp(float(ts), tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
                             except Exception:
                                 pass
-                        fuente = "CriptoYa"
                     elif isinstance(j, list) and j:
                         last = j[-1]
                         if isinstance(last, dict):
@@ -1378,7 +1377,6 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                                     fecha = datetime.fromtimestamp(float(ts), tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
                                 except Exception:
                                     pass
-                            fuente = "CriptoYa"
                     if val is not None:
                         break
 
