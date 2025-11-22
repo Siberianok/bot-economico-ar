@@ -1858,6 +1858,7 @@ NEWS_CATEGORY_KEYWORDS = [
         [
             "empresa",
             "empresario",
+            "empresas",
             "compania",
             "compañia",
             "corporacion",
@@ -1868,6 +1869,16 @@ NEWS_CATEGORY_KEYWORDS = [
             "startup",
             "negocio",
             "sector",
+            "inversion",
+            "inversión",
+            "pyme",
+            "pymes",
+            "proveedor",
+            "proveedores",
+            "cliente",
+            "empleados",
+            "facturacion",
+            "facturación",
         ],
     ),
     (
@@ -1883,7 +1894,18 @@ NEWS_CATEGORY_KEYWORDS = [
             "riesgo país",
             "mercado",
             "bolsa",
+            "banco",
             "bancos",
+            "fintech",
+            "tarjeta",
+            "tarjetas",
+            "cedear",
+            "cedears",
+            "etf",
+            "plazo fijo",
+            "plazos fijos",
+            "prestamo",
+            "prestamos",
         ],
     ),
     (
@@ -1891,6 +1913,8 @@ NEWS_CATEGORY_KEYWORDS = [
         [
             "pbi",
             "actividad",
+            "actividad economica",
+            "actividad económica",
             "inflacion",
             "inflación",
             "consumo",
@@ -1901,6 +1925,17 @@ NEWS_CATEGORY_KEYWORDS = [
             "deficit",
             "recaudacion",
             "industria",
+            "crecimiento",
+            "recuperacion",
+            "recesion",
+            "salario",
+            "salarios",
+            "empleo",
+            "paritaria",
+            "paritarias",
+            "macro",
+            "impuesto",
+            "impuestos",
         ],
     ),
     (
@@ -1917,6 +1952,9 @@ NEWS_CATEGORY_KEYWORDS = [
             "educación",
             "seguridad social",
             "jubil",
+            "conflicto",
+            "despido",
+            "despidos",
         ],
     ),
     (
@@ -1933,6 +1971,12 @@ NEWS_CATEGORY_KEYWORDS = [
             "elecciones",
             "decreto",
             "ley",
+            "casa rosada",
+            "oficialismo",
+            "oposicion",
+            "oposición",
+            "gobernador",
+            "intendencia",
         ],
     ),
 ]
@@ -1941,7 +1985,9 @@ NEWS_CATEGORIES_ORDER = ["empresarial", "financiero", "economico", "social", "po
 
 def _normalize_topic_text(text: str) -> str:
     normalized = unicodedata.normalize("NFD", text.lower())
-    return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    cleaned = "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+    cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned)
+    return " ".join(cleaned.split())
 
 
 def _normalize_news_title(title: str) -> str:
@@ -1994,11 +2040,15 @@ def _topic_for_title(title: str) -> str:
 
 
 def _news_category_for(title: str, desc: Optional[str] = None) -> str:
-    joined = " ".join([_normalize_topic_text(title), _normalize_topic_text(desc or "")])
+    joined_parts = [
+        _normalize_topic_text(title),
+        _normalize_topic_text(desc or ""),
+    ]
+    joined = " ".join([part for part in joined_parts if part])
     for cat, keywords in NEWS_CATEGORY_KEYWORDS:
         if any(kw in joined for kw in keywords):
             return cat
-    return "economico"
+    return "otros"
 
 def domain_of(url: str) -> str:
     try: return urlparse(url).netloc.lower()
@@ -2228,6 +2278,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         NEWS_CACHE.clear()
     history_stems: Set[str] = {stem for stem, _ in NEWS_HISTORY}
     raw_entries: List[Tuple[str, str, Optional[str]]] = []
+    extended_used = False
 
     async def _collect_feed_entries(feed_urls: Iterable[str]) -> List[Tuple[str, str, Optional[str]]]:
         collected: List[Tuple[str, str, Optional[str]]] = []
@@ -2277,8 +2328,10 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
 
     if len(entries_meta) < target_limit:
         extended_entries = await _collect_feed_entries(RSS_FEEDS_EXTENDED)
-        raw_entries.extend(extended_entries)
-        _ingest_entries(extended_entries)
+        if extended_entries:
+            extended_used = True
+            raw_entries.extend(extended_entries)
+            _ingest_entries(extended_entries)
 
     if not entries_meta:
         if NEWS_CACHE.get("items"):
@@ -2292,35 +2345,39 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         save_state()
         return NEWS_CACHE["items"][:limit]
 
-    scored: List[Dict[str, Any]] = []
-    for link, (title, desc) in entries_meta.items():
-        dom = domain_of(link)
-        norm_dom = dom[4:] if dom.startswith("www.") else dom
-        mentions_ar = _mentions_argentina(title, desc, norm_dom)
-        is_national = norm_dom in NATIONAL_NEWS_DOMAINS
-        if not is_national and not mentions_ar:
-            continue
-        scored.append(
-            {
-                "title": title,
-                "link": link,
-                "desc": desc,
-                "score": _score_title(title),
-                "domain": norm_dom,
-                "is_national": is_national,
-                "mentions": mentions_ar,
-                "category": _news_category_for(title, desc),
-            }
+    def _build_scored_entries() -> List[Dict[str, Any]]:
+        scored_local: List[Dict[str, Any]] = []
+        for link, (title, desc) in entries_meta.items():
+            dom = domain_of(link)
+            norm_dom = dom[4:] if dom.startswith("www.") else dom
+            mentions_ar = _mentions_argentina(title, desc, norm_dom)
+            is_national = norm_dom in NATIONAL_NEWS_DOMAINS
+            if not is_national and not mentions_ar:
+                continue
+            scored_local.append(
+                {
+                    "title": title,
+                    "link": link,
+                    "desc": desc,
+                    "score": _score_title(title),
+                    "domain": norm_dom,
+                    "is_national": is_national,
+                    "mentions": mentions_ar,
+                    "category": _news_category_for(title, desc),
+                }
+            )
+        scored_local.sort(
+            key=lambda item: (
+                1 if item["is_national"] else 0,
+                1 if item["mentions"] else 0,
+                item["score"],
+                item["title"].lower(),
+            ),
+            reverse=True,
         )
-    scored.sort(
-        key=lambda item: (
-            1 if item["is_national"] else 0,
-            1 if item["mentions"] else 0,
-            item["score"],
-            item["title"].lower(),
-        ),
-        reverse=True,
-    )
+        return scored_local
+
+    scored = _build_scored_entries()
 
     picked: List[Tuple[str,str]] = []
     domain_counts: Dict[str, int] = {}
@@ -2329,6 +2386,16 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     picked_stems: Set[str] = set()
     picked_links: Set[str] = set()
     filled_categories: Set[str] = set()
+
+    def _available_categories(scored_entries: List[Dict[str, Any]]) -> Set[str]:
+        return {
+            entry["category"]
+            for entry in scored_entries
+            if entry.get("category") in NEWS_CATEGORIES_ORDER
+        }
+
+    def _missing_categories() -> List[str]:
+        return [cat for cat in NEWS_CATEGORIES_ORDER if cat not in filled_categories]
 
     def _already_picked(title: str, link: str) -> bool:
         norm_title = _normalize_news_title(title)
@@ -2404,18 +2471,55 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             _register_pick(title, link, dom)
             NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
 
-    for domain_cap in [1, 2, None]:
-        for allow_paywall in [False, True]:
-            for category in NEWS_CATEGORIES_ORDER:
-                if len(picked) >= target_limit:
+    async def fill_categories(scored_entries: List[Dict[str, Any]]) -> bool:
+        picked_any = False
+        for domain_cap in [1, 2, None]:
+            for allow_paywall in [False, True]:
+                for category in NEWS_CATEGORIES_ORDER:
+                    if len(picked) >= target_limit:
+                        break
+                    if category in filled_categories:
+                        continue
+                    if await pick_category(
+                        category,
+                        domain_cap=domain_cap,
+                        allow_paywall=allow_paywall,
+                    ):
+                        picked_any = True
+                if len(filled_categories) == len(NEWS_CATEGORIES_ORDER) or len(picked) >= target_limit:
                     break
-                if category in filled_categories:
-                    continue
-                await pick_category(category, domain_cap=domain_cap, allow_paywall=allow_paywall)
             if len(filled_categories) == len(NEWS_CATEGORIES_ORDER) or len(picked) >= target_limit:
                 break
-        if len(filled_categories) == len(NEWS_CATEGORIES_ORDER) or len(picked) >= target_limit:
+        return picked_any
+
+    await fill_categories(scored)
+
+    while _missing_categories() and not extended_used:
+        missing = _missing_categories()
+        extended_entries = await _collect_feed_entries(RSS_FEEDS_EXTENDED)
+        extended_used = True
+        if extended_entries:
+            log.info(
+                "Noticias: extendiendo fuentes para cubrir %s (nuevos=%d)",
+                missing,
+                len(extended_entries),
+            )
+            raw_entries.extend(extended_entries)
+            _ingest_entries(extended_entries)
+            scored = _build_scored_entries()
+            await fill_categories(scored)
+        else:
             break
+
+    missing_after_extension = _missing_categories()
+    if missing_after_extension:
+        log.info(
+            "Noticias: categorías sin cubrir %s (candidatas=%s, picks=%d, total=%d)",
+            missing_after_extension,
+            sorted(_available_categories(scored)),
+            len(picked),
+            len(scored),
+        )
 
     if len(picked) < target_limit:
         for domain_cap in [1, 2, None]:
