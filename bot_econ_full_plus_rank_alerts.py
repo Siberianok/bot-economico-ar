@@ -1176,11 +1176,6 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
         if k in data and k in variations:
             data[k]["variation"] = variations[k]
 
-    prev_dates = [
-        (datetime.now(TZ).date() - timedelta(days=delta)).isoformat()
-        for delta in range(1, 4)
-    ]
-
     def _current_val(row: Dict[str, Any]) -> Optional[float]:
         venta = row.get("venta")
         compra = row.get("compra")
@@ -1193,9 +1188,15 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
             return None
         return None
 
-    async def _backfill_variation(key: str, path: str):
+    today = datetime.now(TZ).date()
+    prev_dates = [
+        (today - timedelta(days=delta)).isoformat()
+        for delta in range(1, 8)
+    ]
+
+    async def _update_variation(key: str, path: str):
         row = data.get(key)
-        if not row or row.get("variation") is not None:
+        if not row:
             return
 
         cur_val = _current_val(row)
@@ -1209,46 +1210,19 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
                 continue
             try:
                 row["variation"] = ((cur_val - prev_val) / prev_val) * 100.0
+                row["prev_fecha"] = date_str
                 return
             except Exception:
                 continue
 
     for k, path in mapping.items():
-        await _backfill_variation(k, path)
+        await _update_variation(k, path)
 
     oficial = data.get("oficial") or {}
     tarjeta = data.get("tarjeta") or {}
 
-    if "promedio_bancos" not in data and oficial:
-        data["promedio_bancos"] = {
-            "compra": oficial.get("compra"),
-            "venta": oficial.get("venta"),
-            "variation": oficial.get("variation"),
-            "fuente": oficial.get("fuente") or "CriptoYa",
-            "fecha": oficial.get("fecha"),
-        }
-
-    if "qatar" not in data:
-        qatar_source = tarjeta if tarjeta else oficial
-        if qatar_source:
-            venta = qatar_source.get("venta")
-            compra = qatar_source.get("compra")
-            if venta is None and compra is not None:
-                venta = compra
-            factor = 1.0
-            try:
-                factor = 1.65 if tarjeta else 1.9
-            except Exception:
-                factor = 1.0
-            qatar_compra = float(compra) * factor if compra is not None else None
-            qatar_venta = float(venta) * factor if venta is not None else None
-            data["qatar"] = {
-                "compra": qatar_compra,
-                "venta": qatar_venta,
-                "variation": qatar_source.get("variation"),
-                "fuente": (qatar_source.get("fuente") or "CriptoYa") + " (calc.)",
-                "fecha": qatar_source.get("fecha"),
-            }
+    # Tipos de cambio especiales (promedio bancos, Qatar) ya no se calculan
+    # aquí para simplificar el panel principal.
     return data
 
 async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
@@ -2498,13 +2472,10 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     header = "<b>💵 Dólares</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
     order = [
         ("oficial", "Oficial"),
-        ("promedio_bancos", "Prom. bancos"),
-        ("ahorro", "Ahorro"),
         ("mayorista", "Mayorista"),
         ("blue", "Blue"),
         ("mep", "MEP"),
         ("ccl", "CCL"),
-        ("qatar", "Qatar"),
         ("cripto", "Cripto"),
         ("tarjeta", "Tarjeta"),
     ]
@@ -2512,16 +2483,9 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     def _fmt_var(val: Optional[float]) -> str:
         if val is None:
             return f"{'—':>12}"
-        if val > 0:
-            icon = "▲"
-            num = f"+{val:.2f}%"
-        elif val < 0:
-            icon = "▼"
-            num = f"{val:.2f}%"
-        else:
-            icon = "▬"
-            num = "0.00%"
-        return f"{(icon + ' ' + num):>12}"
+        icon = "🔴" if val > 0 else "🟢" if val < 0 else "⚪"
+        num = f"{val:+.2f}%"
+        return f"{icon} {num:>8}"
 
     compra_lines = [
         header,
