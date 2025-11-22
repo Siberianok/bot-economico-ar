@@ -1236,71 +1236,7 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
     fecha: Optional[str] = None
     variation: Optional[float] = None
 
-    # 1) Dolarito (fuente principal)
-    dolarito_data = await fetch_json(session, DOLARITO_RIESGO_API, headers=REQ_HEADERS)
-    if isinstance(dolarito_data, dict):
-        def _get_from_paths(paths: Iterable[Tuple[str, ...]]) -> Any:
-            for path in paths:
-                current: Any = dolarito_data
-                for key in path:
-                    if isinstance(current, dict) and key in current:
-                        current = current.get(key)
-                    else:
-                        current = None
-                        break
-                if current is not None:
-                    return current
-            return None
-
-        def _safe_number(raw: Any) -> Optional[float]:
-            try:
-                num = float(raw)
-                return num if math.isfinite(num) and num > 0 else None
-            except (TypeError, ValueError):
-                return None
-
-        val_raw = _get_from_paths(
-            (
-                ("valor",),
-                ("value",),
-                ("ultimo",),
-                ("last",),
-                ("data", "valor"),
-                ("data", "value"),
-                ("data", "ultimo"),
-                ("data", "last"),
-            )
-        )
-        parsed_val = _safe_number(val_raw)
-        if parsed_val is not None:
-            val = parsed_val
-
-        fecha_raw = _get_from_paths((("fecha",), ("updatedAt",), ("data", "fecha"), ("data", "updatedAt")))
-        if fecha_raw:
-            fecha = str(fecha_raw)
-
-        prev_val = _safe_number(
-            _get_from_paths(
-                (
-                    ("valorAnterior",),
-                    ("previous",),
-                    ("prev",),
-                    ("anterior",),
-                    ("data", "valorAnterior"),
-                    ("data", "previous"),
-                    ("data", "prev"),
-                    ("data", "anterior"),
-                )
-            )
-        )
-
-        if prev_val not in (None, 0) and val is not None:
-            try:
-                variation = ((val - prev_val) / prev_val) * 100.0
-            except Exception:
-                variation = None
-
-    # 2) ArgentinaDatos
+    # 1) ArgentinaDatos (fuente principal)
     if val is None or variation is None:
         for base in ARG_DATOS_BASES:
             history: List[Dict[str, Any]] = []
@@ -1334,13 +1270,13 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                 except (TypeError, ValueError):
                     variation = variation
             if val is not None and variation is not None:
-                fuente = "ArgentinaDatos"
                 break
 
-    if val is None:
+    # 2) Rava
+    if val is None or variation is None:
         data = await _fetch_rava_profile(session, "riesgo pais")
         if not data:
-            return None
+            data = {}
 
         quotes = data.get("cotizaciones") if isinstance(data, dict) else None
         if isinstance(quotes, list) and quotes:
@@ -1350,9 +1286,9 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                 if raw_val is None:
                     raw_val = row.get("cierre")
                 try:
-                    val = float(raw_val) if raw_val is not None else None
+                    val = float(raw_val) if raw_val is not None else val
                 except (TypeError, ValueError):
-                    val = None
+                    val = val
                 fecha_raw = row.get("fecha")
                 hora_raw = row.get("hora")
                 if fecha_raw:
@@ -1360,31 +1296,36 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                         fecha = f"{fecha_raw} {hora_raw}"
                     else:
                         fecha = str(fecha_raw)
-                fuente = "Rava"
 
-        if val is None:
-            history = data.get("coti_hist") if isinstance(data, dict) else None
-            if isinstance(history, list) and history:
-                last = history[-1] if isinstance(history[-1], dict) else None
-                if isinstance(last, dict):
-                    raw_val = last.get("ultimo")
-                    if raw_val is None:
-                        raw_val = last.get("cierre")
+        history = data.get("coti_hist") if isinstance(data, dict) else None
+        if isinstance(history, list) and history:
+            last = history[-1] if isinstance(history[-1], dict) else None
+            prev = history[-2] if len(history) > 1 and isinstance(history[-2], dict) else None
+            if isinstance(last, dict):
+                raw_val = last.get("ultimo") or last.get("cierre")
+                try:
+                    val = float(raw_val) if raw_val is not None else val
+                except (TypeError, ValueError):
+                    val = val
+                ts = last.get("timestamp")
+                if ts and not fecha:
                     try:
-                        val = float(raw_val) if raw_val is not None else None
-                    except (TypeError, ValueError):
-                        val = None
-                    ts = last.get("timestamp")
-                    if ts:
-                        try:
-                            dt = datetime.fromtimestamp(float(ts), tz=TZ)
-                            fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
-                        except Exception:
-                            fecha = fecha or last.get("fecha")
-                    elif last.get("fecha") and not fecha:
-                        fecha = str(last.get("fecha"))
-                    fuente = "Rava"
+                        dt = datetime.fromtimestamp(float(ts), tz=TZ)
+                        fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        fecha = fecha or last.get("fecha")
+                elif last.get("fecha") and not fecha:
+                    fecha = str(last.get("fecha"))
+            if isinstance(prev, dict) and val is not None and variation is None:
+                prev_raw = prev.get("ultimo") or prev.get("cierre")
+                try:
+                    prev_val = float(prev_raw) if prev_raw is not None else None
+                    if prev_val not in (None, 0):
+                        variation = ((val - prev_val) / prev_val) * 100.0
+                except (TypeError, ValueError):
+                    variation = variation
 
+    # 3) CriptoYa
     if val is None:
         html = await fetch_text(session, CRIPTOYA_RIESGO_URL)
         if html:
@@ -1455,6 +1396,71 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                             break
                         except Exception:
                             continue
+
+    # 4) Dolarito (última prioridad)
+    if val is None:
+        dolarito_data = await fetch_json(session, DOLARITO_RIESGO_API, headers=REQ_HEADERS)
+        if isinstance(dolarito_data, dict):
+            def _get_from_paths(paths: Iterable[Tuple[str, ...]]) -> Any:
+                for path in paths:
+                    current: Any = dolarito_data
+                    for key in path:
+                        if isinstance(current, dict) and key in current:
+                            current = current.get(key)
+                        else:
+                            current = None
+                            break
+                    if current is not None:
+                        return current
+                return None
+
+            def _safe_number(raw: Any) -> Optional[float]:
+                try:
+                    num = float(raw)
+                    return num if math.isfinite(num) and num > 0 else None
+                except (TypeError, ValueError):
+                    return None
+
+            val_raw = _get_from_paths(
+                (
+                    ("valor",),
+                    ("value",),
+                    ("ultimo",),
+                    ("last",),
+                    ("data", "valor"),
+                    ("data", "value"),
+                    ("data", "ultimo"),
+                    ("data", "last"),
+                )
+            )
+            parsed_val = _safe_number(val_raw)
+            if parsed_val is not None:
+                val = parsed_val
+
+            fecha_raw = _get_from_paths((("fecha",), ("updatedAt",), ("data", "fecha"), ("data", "updatedAt")))
+            if fecha_raw:
+                fecha = str(fecha_raw)
+
+            prev_val = _safe_number(
+                _get_from_paths(
+                    (
+                        ("valorAnterior",),
+                        ("previous",),
+                        ("prev",),
+                        ("anterior",),
+                        ("data", "valorAnterior"),
+                        ("data", "previous"),
+                        ("data", "prev"),
+                        ("data", "anterior"),
+                    )
+                )
+            )
+
+            if prev_val not in (None, 0) and val is not None:
+                try:
+                    variation = ((val - prev_val) / prev_val) * 100.0
+                except Exception:
+                    variation = None
 
     if val is None:
         return None
