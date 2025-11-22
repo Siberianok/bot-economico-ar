@@ -2872,9 +2872,11 @@ async def _parse_dolarito_bandas_html(html: str) -> Optional[Dict[str, Any]]:
         return None
 
     data: Dict[str, Any] = {
-        "banda_superior": bands.get("upper"),
-        "banda_inferior": bands.get("lower"),
+        "banda_superior": bands.get("upper") or bands.get("upperBand"),
+        "banda_inferior": bands.get("lower") or bands.get("lowerBand"),
         "variacion_diaria": (bands.get("dolarMayorista") or {}).get("variation"),
+        "variacion_superior": bands.get("upperVariation"),
+        "variacion_inferior": bands.get("lowerVariation"),
         "fecha": None,
         "fuente": "Dolarito.ar",
     }
@@ -2916,6 +2918,10 @@ async def get_bandas_cambiarias(session: ClientSession) -> Optional[Dict[str, An
             data = await resp.json()
             if not isinstance(data, dict):
                 return None
+            variations = data.get("variaciones") or data.get("variations")
+            if isinstance(variations, dict):
+                data.setdefault("variacion_superior", variations.get("upper") or variations.get("superior"))
+                data.setdefault("variacion_inferior", variations.get("lower") or variations.get("inferior"))
             data["fuente"] = "DolarAPI (respaldo)"
             return data
     except Exception as exc:
@@ -2948,17 +2954,45 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
 
     banda_sup = _fmt_band_val(data, ["banda_superior", "upper", "upperBand", "bandaSuperior"])
     banda_inf = _fmt_band_val(data, ["banda_inferior", "lower", "lowerBand", "bandaInferior"])
+    pct_sup = _fmt_band_pct(
+        data,
+        [
+            "variacion_superior",
+            "upperVariation",
+            "upper_variation",
+            "upperDailyVariation",
+            "variation_upper",
+            "upperVar",
+        ],
+    )
+    pct_inf = _fmt_band_pct(
+        data,
+        [
+            "variacion_inferior",
+            "lowerVariation",
+            "lower_variation",
+            "lowerDailyVariation",
+            "variation_lower",
+            "lowerVar",
+        ],
+    )
     pct_val = _fmt_band_pct(data, ["variacion_diaria", "variacion", "daily_change", "dailyChange"])
+
+    if pct_sup is None:
+        pct_sup = pct_val
+    if pct_inf is None:
+        pct_inf = pct_val
 
     sup_txt = fmt_money_ars(banda_sup) if banda_sup is not None else "—"
     inf_txt = fmt_money_ars(banda_inf) if banda_inf is not None else "—"
-    pct_txt = pct(pct_val, 2) if pct_val is not None else "—"
+    pct_sup_txt = pct(pct_sup, 2) if pct_sup is not None else "—"
+    pct_inf_txt = pct(pct_inf, 2) if pct_inf is not None else "—"
 
     header = "<b>📊 Bandas cambiarias</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
 
     col1 = ["Banda superior", "Banda inferior"]
     col2 = [sup_txt, inf_txt]
-    col3 = [pct_txt, pct_txt]
+    col3 = [pct_sup_txt, pct_inf_txt]
 
     col1_w = max(len(_html.unescape(t)) for t in col1)
     col2_w = max(len(_html.unescape(t)) for t in col2)
@@ -2976,6 +3010,7 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
     lines = [
         header,
         "<pre>Nombre           | Importe | Variación\n" + table + "</pre>",
+        f"<i>Fuente: {fuente}</i>",
     ]
     return "\n".join(lines)
 
