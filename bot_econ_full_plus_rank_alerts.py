@@ -2466,7 +2466,7 @@ def _format_news_item(title: str, link: str) -> str:
 
 
 def _build_news_layout(news: List[Tuple[str, str]]) -> Tuple[str, Optional[InlineKeyboardMarkup], List[str]]:
-    header = "<b>📰 Noticias</b>\n<i>Fuente: Google News (medios económicos AR)</i>"
+    header = "<b>📰 Noticias</b>"
     if not news:
         return header, None, []
 
@@ -2551,10 +2551,6 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
 
         compra_rows.append(f"<pre>{label:<12}{compra:>12} {var_txt}</pre>")
         venta_rows.append(f"<pre>{label:<12}{venta:>12} {var_txt}</pre>")
-
-    fuente_txt = "<i>Fuentes: CriptoYa (prioridad) + DolarAPI (complemento)</i>"
-    compra_rows.append(fuente_txt)
-    venta_rows.append(fuente_txt)
 
     compra_msg = "\n".join(compra_lines + compra_rows)
     venta_msg = "\n".join(venta_lines + venta_rows)
@@ -2936,12 +2932,9 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
 
     table = "\n".join(rows)
 
-    fuente = data.get("fuente") or "DolarAPI"
-
     lines = [
         header,
         "<pre>Nombre           | Importe | Variación\n" + table + "</pre>",
-        f"<i>Fuente: {fuente}</i>",
     ]
     return "\n".join(lines)
 
@@ -3005,7 +2998,7 @@ async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         val, fecha = res
         txt = (f"<b>🏦 Reservas BCRA</b>{f' <i>Últ. Act.: {fecha}</i>' if fecha else ''}\n"
-               f"<b>{fmt_number(val,0)} MUS$</b>\n<i>Fuente: LaMacro (lamacro.ar)</i>")
+               f"<b>{fmt_number(val,0)} MUS$</b>")
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3015,7 +3008,7 @@ async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = "No pude obtener inflación ahora."
     else:
         val, fecha = tup; val_str = str(round(val,1)).replace(".", ",")
-        txt = f"<b>📉 Inflación Mensual</b>{f' <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>\n<i>Fuente: ArgentinaDatos (api.argentinadatos.com)</i>"
+        txt = f"<b>📉 Inflación Mensual</b>{f' <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>"
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3027,7 +3020,7 @@ async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rp, f, var = tup; f_str = parse_iso_ddmmyyyy(f)
         change_txt = _format_riesgo_variation(var)
         txt = (f"<b>📈 Riesgo País</b>{f' <i>{f_str}</i>' if f_str else ''}\n"
-               f"<b>{rp} pb</b>{change_txt}\n<i>Fuente: Dolarito.ar</i>")
+               f"<b>{rp} pb</b>{change_txt}")
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
