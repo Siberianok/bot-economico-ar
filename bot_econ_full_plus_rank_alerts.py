@@ -1885,6 +1885,92 @@ NEWS_TOPICS = [
     ("energia", ["energia", "combustible", "nafta", "gas", "petroleo", "ypf", "electricidad"]),
 ]
 
+NEWS_CATEGORY_KEYWORDS = [
+    (
+        "empresarial",
+        [
+            "empresa",
+            "empresario",
+            "compania",
+            "compañia",
+            "corporacion",
+            "corporación",
+            "fusion",
+            "adquisicion",
+            "adquisición",
+            "startup",
+            "negocio",
+            "sector",
+        ],
+    ),
+    (
+        "financiero",
+        [
+            "bono",
+            "bonos",
+            "accion",
+            "acciones",
+            "merval",
+            "wall street",
+            "riesgo pais",
+            "riesgo país",
+            "mercado",
+            "bolsa",
+            "bancos",
+        ],
+    ),
+    (
+        "economico",
+        [
+            "pbi",
+            "actividad",
+            "inflacion",
+            "inflación",
+            "consumo",
+            "produccion",
+            "producción",
+            "superavit",
+            "déficit",
+            "deficit",
+            "recaudacion",
+            "industria",
+        ],
+    ),
+    (
+        "social",
+        [
+            "protesta",
+            "movilizacion",
+            "movilización",
+            "paro",
+            "sindicato",
+            "pobreza",
+            "salud",
+            "educacion",
+            "educación",
+            "seguridad social",
+            "jubil",
+        ],
+    ),
+    (
+        "politica",
+        [
+            "gobierno",
+            "presidente",
+            "ministro",
+            "congreso",
+            "senado",
+            "diputados",
+            "eleccion",
+            "elección",
+            "elecciones",
+            "decreto",
+            "ley",
+        ],
+    ),
+]
+NEWS_CATEGORIES_ORDER = ["empresarial", "financiero", "economico", "social", "politica"]
+
 
 def _normalize_topic_text(text: str) -> str:
     normalized = unicodedata.normalize("NFD", text.lower())
@@ -1938,6 +2024,14 @@ def _topic_for_title(title: str) -> str:
         if any(kw in norm for kw in keywords):
             return topic
     return "otros"
+
+
+def _news_category_for(title: str, desc: Optional[str] = None) -> str:
+    joined = " ".join([_normalize_topic_text(title), _normalize_topic_text(desc or "")])
+    for cat, keywords in NEWS_CATEGORY_KEYWORDS:
+        if any(kw in joined for kw in keywords):
+            return cat
+    return "economico"
 
 def domain_of(url: str) -> str:
     try: return urlparse(url).netloc.lower()
@@ -2248,6 +2342,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
                 "domain": norm_dom,
                 "is_national": is_national,
                 "mentions": mentions_ar,
+                "category": _news_category_for(title, desc),
             }
         )
     scored.sort(
@@ -2261,13 +2356,12 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
     )
 
     picked: List[Tuple[str,str]] = []
-    used_domains: Set[str] = set()
-    topic_counts: Dict[str, int] = {}
     domain_counts: Dict[str, int] = {}
     paywall_cache: Dict[str, bool] = {}
     picked_titles: Set[str] = set()
     picked_stems: Set[str] = set()
     picked_links: Set[str] = set()
+    filled_categories: Set[str] = set()
 
     def _already_picked(title: str, link: str) -> bool:
         norm_title = _normalize_news_title(title)
@@ -2303,8 +2397,29 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         paywall_cache[link] = result
         return result
 
-    async def attempt_pick(topic_cap: Optional[int], *, enforce_domain: bool = True, domain_cap: Optional[int] = None) -> None:
-        nonlocal picked, used_domains, topic_counts
+    async def pick_category(category: str, *, domain_cap: Optional[int], allow_paywall: bool) -> bool:
+        for entry in scored:
+            if entry["category"] != category:
+                continue
+            if len(picked) >= target_limit:
+                break
+            title = entry["title"]
+            link = entry["link"]
+            dom = entry["domain"]
+            if _already_picked(title, link):
+                continue
+            if domain_cap is not None and domain_counts.get(dom, 0) >= domain_cap:
+                continue
+            if not allow_paywall and await is_paywalled(link, dom):
+                continue
+            picked.append((title, _paywall_friendly_link(link)))
+            _register_pick(title, link, dom)
+            NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
+            filled_categories.add(category)
+            return True
+        return False
+
+    async def pick_remaining(*, domain_cap: Optional[int], allow_paywall: bool) -> None:
         for entry in scored:
             if len(picked) >= target_limit:
                 break
@@ -2313,47 +2428,35 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             dom = entry["domain"]
             if _already_picked(title, link):
                 continue
-            topic = _topic_for_title(title)
-            if topic_cap is not None and topic_counts.get(topic, 0) >= topic_cap:
-                continue
-            if enforce_domain and dom in used_domains:
-                continue
             if domain_cap is not None and domain_counts.get(dom, 0) >= domain_cap:
                 continue
-            if await is_paywalled(link, dom):
-                continue
-            friendly_link = _paywall_friendly_link(link)
-            picked.append((title, friendly_link))
-            topic_counts[topic] = topic_counts.get(topic, 0) + 1
-            used_domains.add(dom)
-            _register_pick(title, link, dom)
-            NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
-
-    await attempt_pick(topic_cap=1, enforce_domain=True)
-    if len(picked) < target_limit:
-        await attempt_pick(topic_cap=2, enforce_domain=True)
-    if len(picked) < target_limit:
-        await attempt_pick(topic_cap=None, enforce_domain=True)
-    if len(picked) < target_limit:
-        await attempt_pick(topic_cap=None, enforce_domain=False, domain_cap=1)
-    if len(picked) < target_limit:
-        await attempt_pick(topic_cap=None, enforce_domain=False, domain_cap=2)
-    if len(picked) < target_limit:
-        scored_sorted = sorted(
-            scored,
-            key=lambda item: (domain_counts.get(item["domain"], 0), -item["score"]),
-        )
-        for entry in scored_sorted:
-            if len(picked) >= target_limit:
-                break
-            title = entry["title"]
-            link = entry["link"]
-            dom = entry["domain"]
-            if _already_picked(title, link) or (domain_counts.get(dom, 0) >= 2):
+            if not allow_paywall and await is_paywalled(link, dom):
                 continue
             picked.append((title, _paywall_friendly_link(link)))
             _register_pick(title, link, dom)
             NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
+
+    for domain_cap in [1, 2, None]:
+        for allow_paywall in [False, True]:
+            for category in NEWS_CATEGORIES_ORDER:
+                if len(picked) >= target_limit:
+                    break
+                if category in filled_categories:
+                    continue
+                await pick_category(category, domain_cap=domain_cap, allow_paywall=allow_paywall)
+            if len(filled_categories) == len(NEWS_CATEGORIES_ORDER) or len(picked) >= target_limit:
+                break
+        if len(filled_categories) == len(NEWS_CATEGORIES_ORDER) or len(picked) >= target_limit:
+            break
+
+    if len(picked) < target_limit:
+        for domain_cap in [1, 2, None]:
+            for allow_paywall in [False, True]:
+                await pick_remaining(domain_cap=domain_cap, allow_paywall=allow_paywall)
+                if len(picked) >= target_limit:
+                    break
+            if len(picked) >= target_limit:
+                break
     if len(picked) < target_limit:
         fallback_scored: List[Dict[str, Any]] = []
         for title, link, desc in raw_entries:
