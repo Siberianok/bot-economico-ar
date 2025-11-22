@@ -1232,7 +1232,33 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
     fecha: Optional[str] = None
     variation: Optional[float] = None
 
-    # 1) ArgentinaDatos (fuente principal)
+    def _result_ready() -> bool:
+        return val is not None and fecha is not None and variation is not None
+
+    # 1) Rava (fuente principal)
+    data = await _fetch_rava_profile(session, "riesgo pais")
+    if isinstance(data, dict):
+        history = data.get("coti_hist")
+        points = _rava_history_points(history) if isinstance(history, list) else []
+        if points:
+            now_ts = datetime.now(tz=TZ).timestamp()
+            last_ts, last_val = points[-1]
+            _, prev_val = points[-2] if len(points) > 1 else (None, None)
+            if last_ts and now_ts - last_ts <= 3 * 24 * 3600:
+                val = float(last_val)
+                fecha = datetime.fromtimestamp(last_ts, tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
+                if prev_val not in (None, 0):
+                    variation = ((last_val - prev_val) / prev_val) * 100.0
+
+    if _result_ready():
+        try:
+            return (int(round(val)), fecha, variation)
+        except Exception:
+            return None
+    else:
+        val = fecha = variation = None
+
+    # 2) ArgentinaDatos (respaldo)
     if val is None or variation is None:
         for base in ARG_DATOS_BASES:
             history: List[Dict[str, Any]] = []
@@ -1267,59 +1293,6 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                     variation = variation
             if val is not None and variation is not None:
                 break
-
-    # 2) Rava
-    if val is None or variation is None:
-        data = await _fetch_rava_profile(session, "riesgo pais")
-        if not data:
-            data = {}
-
-        quotes = data.get("cotizaciones") if isinstance(data, dict) else None
-        if isinstance(quotes, list) and quotes:
-            row = quotes[0] if isinstance(quotes[0], dict) else None
-            if isinstance(row, dict):
-                raw_val = row.get("ultimo")
-                if raw_val is None:
-                    raw_val = row.get("cierre")
-                try:
-                    val = float(raw_val) if raw_val is not None else val
-                except (TypeError, ValueError):
-                    val = val
-                fecha_raw = row.get("fecha")
-                hora_raw = row.get("hora")
-                if fecha_raw:
-                    if hora_raw:
-                        fecha = f"{fecha_raw} {hora_raw}"
-                    else:
-                        fecha = str(fecha_raw)
-
-        history = data.get("coti_hist") if isinstance(data, dict) else None
-        if isinstance(history, list) and history:
-            last = history[-1] if isinstance(history[-1], dict) else None
-            prev = history[-2] if len(history) > 1 and isinstance(history[-2], dict) else None
-            if isinstance(last, dict):
-                raw_val = last.get("ultimo") or last.get("cierre")
-                try:
-                    val = float(raw_val) if raw_val is not None else val
-                except (TypeError, ValueError):
-                    val = val
-                ts = last.get("timestamp")
-                if ts and not fecha:
-                    try:
-                        dt = datetime.fromtimestamp(float(ts), tz=TZ)
-                        fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
-                    except Exception:
-                        fecha = fecha or last.get("fecha")
-                elif last.get("fecha") and not fecha:
-                    fecha = str(last.get("fecha"))
-            if isinstance(prev, dict) and val is not None and variation is None:
-                prev_raw = prev.get("ultimo") or prev.get("cierre")
-                try:
-                    prev_val = float(prev_raw) if prev_raw is not None else None
-                    if prev_val not in (None, 0):
-                        variation = ((val - prev_val) / prev_val) * 100.0
-                except (TypeError, ValueError):
-                    variation = variation
 
     # 3) CriptoYa
     if val is None:
