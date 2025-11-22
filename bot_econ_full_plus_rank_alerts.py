@@ -2406,6 +2406,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             title = entry["title"]
             link = entry["link"]
             dom = entry["domain"]
+            cat = category or entry.get("category")
             if _already_picked(title, link):
                 continue
             if domain_cap is not None and domain_counts.get(dom, 0) >= domain_cap:
