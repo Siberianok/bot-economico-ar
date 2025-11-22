@@ -2998,6 +2998,8 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
 
     table = "\n".join(rows)
 
+    fuente = data.get("fuente") or "DolarAPI"
+
     lines = [
         header,
         "<pre>Nombre           | Importe | Variación\n" + table + "</pre>",
