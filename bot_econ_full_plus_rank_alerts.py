@@ -3,15 +3,12 @@
 
 import os, asyncio, logging, re, html as _html, json, math, io, signal, csv, unicodedata
 import copy
-import urllib.request
-import urllib.error
-import urllib.parse
 from time import time
 from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable, Iterable
-from urllib.parse import urlparse, quote
+from urllib.parse import urlparse, quote, parse_qs
 
 # ====== matplotlib opcional (no rompe si no está instalado) ======
 HAS_MPL = False
@@ -25,7 +22,7 @@ except Exception:
     plt = None
     np = None
 
-from aiohttp import ClientSession, ClientTimeout, web
+from aiohttp import ClientError, ClientSession, ClientTimeout, web
 from telegram import (
     Update, LinkPreviewOptions, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton,
 )
@@ -592,36 +589,36 @@ def _get_redis_client():
         return None
 
 
-def _upstash_request(path: str, *, method: str = "GET", data: Optional[str] = None) -> Dict[str, Any]:
+async def _upstash_request(
+    path: str, *, method: str = "GET", data: Optional[str] = None, session: Optional[ClientSession] = None
+) -> Dict[str, Any]:
     if not USE_UPSTASH:
         raise RuntimeError("Upstash no configurado")
     url = f"{UPSTASH_URL.rstrip('/')}/{path.lstrip('/')}"
-    req = urllib.request.Request(url, method=method)
-    req.add_header("Authorization", f"Bearer {UPSTASH_TOKEN}")
-    if data is not None:
-        req.data = data.encode("utf-8")
-        req.add_header("Content-Type", "text/plain; charset=utf-8")
+    headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
+    payload = data.encode("utf-8") if data is not None else None
+    owns_session = session is None
+    if session is None:
+        session = ClientSession(timeout=ClientTimeout(total=10))
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            body = resp.read().decode("utf-8")
-    except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode("utf-8", errors="ignore")
-        except Exception:
-            pass
-        raise RuntimeError(f"Upstash HTTP {e.code}: {detail}") from e
-    except urllib.error.URLError as e:
+        async with session.request(method, url, data=payload, headers=headers) as resp:
+            body = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"Upstash HTTP {resp.status}: {body}")
+    except ClientError as e:
         raise RuntimeError(f"Upstash connection error: {e}") from e
+    finally:
+        if owns_session:
+            await session.close()
     try:
         return json.loads(body)
     except Exception as e:
         raise RuntimeError(f"Upstash invalid response: {body}") from e
 
 
-def _load_state_from_upstash() -> Optional[Dict[str, Any]]:
+async def _load_state_from_upstash() -> Optional[Dict[str, Any]]:
     try:
-        resp = _upstash_request(f"get/{UPSTASH_STATE_KEY}")
+        resp = await _upstash_request(f"get/{UPSTASH_STATE_KEY}")
     except Exception as e:
         log.warning("No pude leer estado de Upstash: %s", e)
         return None
@@ -635,17 +632,17 @@ def _load_state_from_upstash() -> Optional[Dict[str, Any]]:
         return None
 
 
-def _save_state_to_upstash(payload: Dict[str, Any]) -> None:
+async def _save_state_to_upstash(payload: Dict[str, Any]) -> None:
     data = json.dumps(payload, ensure_ascii=False)
     primary_error: Optional[Exception] = None
     try:
         encoded = quote(data, safe="")
-        _upstash_request(f"set/{UPSTASH_STATE_KEY}/{encoded}", method="POST")
+        await _upstash_request(f"set/{UPSTASH_STATE_KEY}/{encoded}", method="POST")
         return
     except Exception as e:
         primary_error = e
     try:
-        _upstash_request(f"set/{UPSTASH_STATE_KEY}", method="POST", data=data)
+        await _upstash_request(f"set/{UPSTASH_STATE_KEY}", method="POST", data=data)
     except Exception as e:
         if primary_error:
             log.warning(
@@ -687,11 +684,11 @@ def _save_state_to_redis(payload: Dict[str, Any]) -> bool:
         return False
 
 
-def load_state():
+async def load_state():
     global ALERTS, SUBS, PF, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE
     data: Optional[Dict[str, Any]] = None
     if USE_UPSTASH:
-        data = _load_state_from_upstash()
+        data = await _load_state_from_upstash()
     if data is None and USE_UPSTASH_REDIS:
         data = _load_state_from_redis()
     if data is None:
@@ -742,7 +739,7 @@ def _prune_news_history(now: Optional[float] = None, window_hours: int = 72) -> 
     NEWS_HISTORY = [(stem, ts) for stem, ts in NEWS_HISTORY if ts >= cutoff]
 
 
-def save_state():
+async def save_state():
     _prune_news_history()
     payload = {
         "alerts": ALERTS,
@@ -754,7 +751,7 @@ def save_state():
         "news_cache_items": NEWS_CACHE.get("items", []),
     }
     if USE_UPSTASH:
-        _save_state_to_upstash(payload)
+        await _save_state_to_upstash(payload)
         return
     if USE_UPSTASH_REDIS and _save_state_to_redis(payload):
         return
@@ -2101,7 +2098,7 @@ def _normalize_feed_link(link: str) -> str:
         return link
     if parsed.netloc.endswith("news.google.com"):
         qs = parsed.query or ""
-        qparams = dict((k, v[0]) for k, v in urllib.parse.parse_qs(qs).items() if v)
+        qparams = dict((k, v[0]) for k, v in parse_qs(qs).items() if v)
         if "url" in qparams and qparams["url"].startswith("http"):
             return qparams["url"]
     return link
@@ -2277,7 +2274,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         if cache_has_articles and len(cached_items) >= target_limit:
             if len(cached_items) != len(NEWS_CACHE.get("items", [])):
                 NEWS_CACHE["items"] = cached_items
-                save_state()
+                await save_state()
             return cached_items[:limit]
         NEWS_CACHE.clear()
     history_stems: Set[str] = {stem for stem, _ in NEWS_HISTORY}
@@ -2343,10 +2340,10 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         if raw_entries:
             deduped_raw = _dedup_news_items([(t, l) for t, l, _ in raw_entries], limit=target_limit)
             NEWS_CACHE = {"date": today, "items": deduped_raw[:target_limit]}
-            save_state()
+            await save_state()
             return NEWS_CACHE["items"][:limit]
         NEWS_CACHE = {"date": today, "items": fallback_generic[:target_limit]}
-        save_state()
+        await save_state()
         return NEWS_CACHE["items"][:limit]
 
     def _build_scored_entries() -> List[Dict[str, Any]]:
@@ -2607,7 +2604,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
                 deduped_final.append((title, link))
 
     NEWS_CACHE = {"date": today, "items": deduped_final[:target_limit]}
-    save_state()
+    await save_state()
     return NEWS_CACHE["items"][:limit]
 
 def _short_title(text: str, limit: int = 32) -> str:
@@ -3731,13 +3728,13 @@ async def alertas_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "BACK":
         await cmd_alertas_menu(update, context, edit=True); return
     if data == "ALL":
-        cnt = len(rules); ALERTS[chat_id] = []; save_state()
+        cnt = len(rules); ALERTS[chat_id] = []; await save_state()
         await q.edit_message_text(f"Se eliminaron {cnt} alertas."); return
     try: idx = int(data)
     except Exception:
         await q.edit_message_text("Acción inválida."); return
     if 0 <= idx < len(rules):
-        rules.pop(idx); save_state(); await q.edit_message_text("Alerta eliminada.")
+        rules.pop(idx); await save_state(); await q.edit_message_text("Alerta eliminada.")
     else:
         await q.edit_message_text("Número fuera de rango.")
 
@@ -3871,12 +3868,12 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if rule.pop("pause_until", None) is not None:
                         changed = True
                 if changed:
-                    save_state()
+                    await save_state()
                 await cmd_alertas_pause(update, context, prefix="🔔 Alertas reanudadas.", edit=True)
                 return
             if op == "INF":
                 ALERTS_PAUSED.add(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
-                save_state()
+                await save_state()
                 await cmd_alertas_pause(update, context, prefix="🔕 Alertas en pausa (indefinida).", edit=True)
                 return
             try:
@@ -3885,7 +3882,7 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.answer("Acción inválida.", show_alert=True); return
             until = datetime.now(TZ) + timedelta(hours=hrs)
             ALERTS_SILENT_UNTIL[chat_id] = until.timestamp(); ALERTS_PAUSED.discard(chat_id)
-            save_state()
+            await save_state()
             await cmd_alertas_pause(
                 update,
                 context,
@@ -3908,14 +3905,14 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 changed = True
             ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
             if changed:
-                save_state()
+                await save_state()
             await cmd_alertas_pause(update, context, prefix=f"🔔 Alerta {idx+1} reanudada.", edit=True)
             return
         if op == "INF":
             rule["pause_indef"] = True
             rule.pop("pause_until", None)
             ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
-            save_state()
+            await save_state()
             await cmd_alertas_pause(update, context, prefix=f"🔕 Alerta {idx+1} en pausa indefinida.", edit=True)
             return
         try:
@@ -3926,7 +3923,7 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rule["pause_until"] = until.timestamp()
         rule.pop("pause_indef", None)
         ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
-        save_state()
+        await save_state()
         await cmd_alertas_pause(
             update,
             context,
@@ -3947,7 +3944,7 @@ async def cmd_alertas_resume(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if rule.pop("pause_until", None) is not None:
             changed = True
     if changed:
-        save_state()
+        await save_state()
     await update.effective_message.reply_text("🔔 Alertas reanudadas.")
 
 # ---- Conversación Agregar Alerta ----
@@ -4709,7 +4706,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 rules.append(candidate)
             _record_alert_usage(chat_id, al)
-            save_state()
+            await save_state()
             msg = "Listo. Alerta actualizada ✅" if is_edit else "Listo. Alerta agregada ✅"
             await update.message.reply_text(msg)
             await cmd_alertas_menu(update, context)
@@ -4745,7 +4742,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 rules.append(candidate)
             _record_alert_usage(chat_id, al)
-            save_state()
+            await save_state()
             msg = "Listo. Alerta actualizada ✅" if is_edit else "Listo. Alerta agregada ✅"
             await update.message.reply_text(msg)
             await cmd_alertas_menu(update, context)
@@ -4787,7 +4784,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 rules.append(candidate)
             _record_alert_usage(chat_id, al)
-            save_state()
+            await save_state()
             target_s = fmt_crypto_price(thr, quote)
             direction = "sube a" if op == ">" else "baja a"
             prefix = "Listo. Alerta actualizada ✅" if is_edit else "Listo. Alerta agregada ✅"
@@ -4826,7 +4823,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             rules.append(candidate)
         _record_alert_usage(chat_id, al)
-        save_state()
+        await save_state()
         msg = "Listo. Alerta actualizada ✅" if is_edit else "Listo. Alerta agregada ✅"
         await update.message.reply_text(msg)
         await cmd_alertas_menu(update, context)
@@ -4933,7 +4930,7 @@ async def alerts_loop(app: Application):
                                 except Exception as e:
                                     log.warning("send alert failed %s: %s", chat_id, e)
                     if state_dirty:
-                        save_state()
+                        await save_state()
                 await asyncio.sleep(600)
             except asyncio.CancelledError:
                 raise
@@ -4995,12 +4992,12 @@ async def subs_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "SUBS:CLOSE": await q.edit_message_text("Listo."); return ConversationHandler.END
     if data == "SUBS:OFF":
         if chat_id in SUBS and SUBS[chat_id].get("daily"):
-            SUBS[chat_id]["daily"] = None; save_state()
+            SUBS[chat_id]["daily"] = None; await save_state()
             for j in context.application.job_queue.get_jobs_by_name(_job_name_daily(chat_id)): j.schedule_removal()
         await q.edit_message_text("Suscripción cancelada."); return ConversationHandler.END
     if data.startswith("SUBS:T:"):
         hhmm = data.split(":",2)[2]
-        SUBS.setdefault(chat_id, {})["daily"] = hhmm; save_state()
+        SUBS.setdefault(chat_id, {})["daily"] = hhmm; await save_state()
         _schedule_daily_for_chat(context.application, chat_id, hhmm)
         await q.edit_message_text(f"Te suscribí al Resumen Diario a las {hhmm} (hora AR)."); return ConversationHandler.END
     await q.edit_message_text("Acción inválida."); return ConversationHandler.END
@@ -5184,7 +5181,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "tc_timestamp": tc_ts,
         })
         pf["base"] = base_conf
-        save_state()
+        await save_state()
         msg = f"Base fijada: {mon.upper()} / {tc.upper()}"
         await pf_refresh_menu(context, chat_id)
         await _send_below_menu(context, chat_id, text=msg);
@@ -5333,7 +5330,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "PF:ED:DEL":
         pf = pf_get(chat_id); idx = context.user_data.get("pf_edit_idx", -1)
         if 0 <= idx < len(pf["items"]):
-            pf["items"].pop(idx); save_state()
+            pf["items"].pop(idx); await save_state()
             await _send_below_menu(context, chat_id, text="Instrumento eliminado.")
             await pf_refresh_menu(context, chat_id, force_new=True)
             return
@@ -5500,7 +5497,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 stack.append({"index": idx, "item": copy.deepcopy(entry)})
             cnt = len(items)
             pf["items"].clear()
-            save_state()
+            await save_state()
             await pf_refresh_menu(context, chat_id, force_new=True)
             await _send_below_menu(
                 context,
@@ -5518,7 +5515,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             item = copy.deepcopy(last.get("item"))
             pf.setdefault("items", [])
             pf["items"].insert(idx, item)
-            save_state()
+            await save_state()
             await pf_refresh_menu(context, chat_id, force_new=True)
             sym = item.get("simbolo") if isinstance(item, dict) else None
             label = _label_long(sym) if sym else (item.get("tipo", "Instrumento").upper() if isinstance(item, dict) else "Instrumento")
@@ -5539,7 +5536,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if 0 <= idx < len(items):
             removed = items.pop(idx)
             stack.append({"index": idx, "item": copy.deepcopy(removed)})
-            save_state()
+            await save_state()
             await pf_refresh_menu(context, chat_id, force_new=True)
             sym = removed.get("simbolo") if isinstance(removed, dict) else None
             label = _label_long(sym) if sym else (removed.get("tipo", "Instrumento").upper() if isinstance(removed, dict) else "Instrumento")
@@ -5606,7 +5603,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         v = _parse_num_text(text)
         if v is None:
             await update.message.reply_text("Ingresá solo número (sin símbolos)."); return
-        pf["monto"] = float(v); save_state()
+        pf["monto"] = float(v); await save_state()
         usado = await _pf_total_usado(chat_id)
         pf_base = pf["base"]["moneda"].upper()
         f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
@@ -5701,7 +5698,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             item["fx_rate"] = float(fx_rate_used) if fx_rate_used is not None else tc_val if tc_val is not None else None
             item["fx_ts"] = fx_ts_used
         item["added_ts"] = int(time())
-        pf["items"].append(item); save_state()
+        pf["items"].append(item); await save_state()
 
         pf_base = pf["base"]["moneda"].upper()
         qty_str = ""
@@ -5803,7 +5800,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             it["fx_rate"] = float(effective_tc)
             it["fx_ts"] = item_fx_ts if item_fx_rate else tc_ts
 
-        save_state()
+        await save_state()
         usado = await _pf_total_usado(chat_id)
         f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
         await update.message.reply_text("Actualizado ✅ · Restante: " + f_money(max(0.0, pf["monto"]-usado)))
@@ -5840,7 +5837,7 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         symbols = sorted({it.get("simbolo") for it in items if it.get("simbolo")})
         mets, last_ts = await metrics_for_symbols(session, symbols) if symbols else ({}, None)
     if state_updated:
-        save_state()
+        await save_state()
 
     enriched: List[Dict[str, Any]] = []
     total_invertido = 0.0
@@ -6959,7 +6956,7 @@ def build_application() -> Application:
     return app
 
 async def main():
-    load_state()
+    await load_state()
     application = build_application()
     _schedule_all_subs(application)
 
