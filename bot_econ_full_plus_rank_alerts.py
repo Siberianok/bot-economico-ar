@@ -3030,12 +3030,23 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 async def _parse_dolarito_bandas_html(html: str) -> Optional[Dict[str, Any]]:
-    match = re.search(r'bands\\":\{.*?\},\\"timestamp\\":\d+', html, re.DOTALL)
+    patterns = [
+        r'bands\\":\{.*?\},\\"timestamp\\":\d+',   # JSON escapado
+        r'"bands":\{.*?\}(?:,"timestamp":\d+)?',        # JSON sin escapar
+    ]
+
+    match = None
+    for pat in patterns:
+        match = re.search(pat, html, re.DOTALL)
+        if match:
+            break
     if not match:
         return None
 
+    raw = match.group(0)
     try:
-        decoded = match.group(0).encode("utf-8").decode("unicode_escape")
+        decoded = raw.encode("utf-8").decode("unicode_escape") if "\\" in raw else raw
+        decoded = decoded.lstrip("{").rstrip("}")
         parsed = json.loads("{" + decoded + "}")
     except Exception as exc:
         log.warning("No se pudo parsear bandas de Dolarito: %s", exc)
@@ -3051,6 +3062,8 @@ async def _parse_dolarito_bandas_html(html: str) -> Optional[Dict[str, Any]]:
         "variacion_diaria": (bands.get("dolarMayorista") or {}).get("variation"),
         "variacion_superior": bands.get("upperVariation"),
         "variacion_inferior": bands.get("lowerVariation"),
+        "variacion_mensual_superior": bands.get("upperMonthlyVariation") or bands.get("upper_monthly_variation"),
+        "variacion_mensual_inferior": bands.get("lowerMonthlyVariation") or bands.get("lower_monthly_variation"),
         "fecha": None,
         "fuente": "Dolarito.ar",
     }
@@ -3131,6 +3144,9 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
     pct_sup = _fmt_band_pct(
         data,
         [
+            "variacion_mensual_superior",
+            "upperMonthlyVariation",
+            "upper_monthly_variation",
             "variacion_superior",
             "upperVariation",
             "upper_variation",
@@ -3142,6 +3158,9 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
     pct_inf = _fmt_band_pct(
         data,
         [
+            "variacion_mensual_inferior",
+            "lowerMonthlyVariation",
+            "lower_monthly_variation",
             "variacion_inferior",
             "lowerVariation",
             "lower_variation",
@@ -3150,7 +3169,18 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
             "lowerVar",
         ],
     )
-    pct_val = _fmt_band_pct(data, ["variacion_diaria", "variacion", "daily_change", "dailyChange"])
+    pct_val = _fmt_band_pct(
+        data,
+        [
+            "variacion_mensual",
+            "monthly_change",
+            "monthlyChange",
+            "variacion_diaria",
+            "variacion",
+            "daily_change",
+            "dailyChange",
+        ],
+    )
 
     if pct_sup is None:
         pct_sup = pct_val
@@ -3183,7 +3213,7 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
 
     lines = [
         header,
-        "<pre>Nombre           | Importe | Variación\n" + table + "</pre>",
+        "<pre>Nombre           | Importe | Variación mensual\n" + table + "</pre>",
         f"<i>Fuente: {fuente}</i>",
     ]
     return "\n".join(lines)
