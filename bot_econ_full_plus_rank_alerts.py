@@ -2751,7 +2751,12 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     def _fmt_var(val: Optional[float]) -> str:
         if val is None:
             return f"{'—':>12}"
-        icon = "🔴" if val > 0 else "🟢" if val < 0 else "⚪"
+        if val > 0:
+            icon = "🔺"  # flecha roja hacia arriba
+        elif val < 0:
+            icon = "🟢⬇️"  # flecha verde hacia abajo
+        else:
+            icon = "➡️"
         num = f"{val:+.2f}%"
         return f"{icon} {num:>8}"
 
