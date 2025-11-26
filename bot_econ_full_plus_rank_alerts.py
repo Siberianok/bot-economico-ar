@@ -1863,6 +1863,9 @@ async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
 # ============================ NOTICIAS ============================
 
 from xml.etree import ElementTree as ET
+
+NewsItem = Tuple[str, str, Optional[str]]
+RawNewsEntry = Tuple[str, str, Optional[str], Optional[str]]
 RSS_FEEDS = [
     # Google News queries acotadas a Argentina y a las últimas 24hs.
     "https://news.google.com/rss/search?q=econom%C3%ADa+argentina+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
@@ -2073,12 +2076,14 @@ def _news_dedup_key(title: str, max_words: int = 9) -> str:
     return " ".join(parts)
 
 
-def _dedup_news_items(items: List[Tuple[str, str]], limit: Optional[int] = None) -> List[Tuple[str, str]]:
+def _dedup_news_items(items: List[NewsItem], limit: Optional[int] = None) -> List[NewsItem]:
     seen_titles: Set[str] = set()
     seen_stems: Set[str] = set()
     seen_links: Set[str] = set()
-    deduped: List[Tuple[str, str]] = []
-    for title, link in items:
+    deduped: List[NewsItem] = []
+    for entry in items:
+        title, link = entry[0], entry[1]
+        img = entry[2] if len(entry) >= 3 else None
         norm_title = _normalize_news_title(title)
         stem_key = _news_dedup_key(title)
         clean_link = _canonical_news_link(link)
@@ -2087,7 +2092,7 @@ def _dedup_news_items(items: List[Tuple[str, str]], limit: Optional[int] = None)
         seen_titles.add(norm_title)
         seen_stems.add(stem_key)
         seen_links.add(clean_link)
-        deduped.append((title, link))
+        deduped.append((title, link, img))
         if limit is not None and len(deduped) >= limit:
             break
     return deduped
@@ -2193,8 +2198,38 @@ def _is_probably_article_url(link: str) -> bool:
     has_signal = ("-" in tail) or any(ch.isdigit() for ch in tail) or len(tail) >= 10
     return has_signal or len(parts) >= 2
 
-def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
-    out: List[Tuple[str, str, Optional[str]]] = []
+def _image_from_description(desc: str) -> Optional[str]:
+    if not desc:
+        return None
+    m = re.search(r"<img[^>]+src=\"([^\"]+)\"", desc, flags=re.I)
+    if m:
+        url = _html.unescape(m.group(1).strip())
+        return url if url.startswith("http") else None
+    return None
+
+def _extract_feed_image(element: Optional[ET.Element], desc: Optional[str]) -> Optional[str]:
+    if element is None:
+        return _image_from_description(desc or "")
+
+    def _clean(url: Optional[str]) -> Optional[str]:
+        if not url:
+            return None
+        url = _html.unescape(url.strip())
+        return url if url.startswith("http") else None
+
+    for xpath in (".//{*}content", ".//{*}thumbnail", "enclosure"):
+        for child in element.findall(xpath):
+            mime = (child.get("type") or "").lower()
+            if xpath == "enclosure" and mime and not mime.startswith("image"):
+                continue
+            url = _clean(child.get("url") or child.get("href"))
+            if url:
+                return url
+
+    return _image_from_description(desc or "")
+
+def _parse_feed_entries(xml: str) -> List[RawNewsEntry]:
+    out: List[RawNewsEntry] = []
     try:
         root = ET.fromstring(xml)
     except Exception:
@@ -2210,7 +2245,7 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
         if d_el is not None and d_el.text:
             desc = d_el.text.strip()
         if t and l and l.startswith("http") and _is_probably_article_url(l):
-            out.append((t, l, desc))
+            out.append((t, l, desc, _extract_feed_image(item, desc)))
     for entry in root.findall(".//{*}entry") if root is not None else []:
         t_el = entry.find(".//{*}title")
         link_el = entry.find(".//{*}link[@rel='alternate']") or entry.find(".//{*}link")
@@ -2224,12 +2259,12 @@ def _parse_feed_entries(xml: str) -> List[Tuple[str, str, Optional[str]]]:
         if summary_el is not None and summary_el.text:
             desc = summary_el.text.strip()
         if t and l and l.startswith("http") and _is_probably_article_url(l):
-            out.append((t, l, desc))
+            out.append((t, l, desc, _extract_feed_image(entry, desc)))
     if not out:
         for m in re.finditer(r"<title>(.*?)</title>.*?<link>(https?://[^<]+)</link>", xml, flags=re.S|re.I):
             t = re.sub(r"<.*?>", "", m.group(1)).strip(); l = m.group(2).strip()
             if t and l and _is_probably_article_url(l):
-                out.append((t, l, None))
+                out.append((t, l, None, None))
     return out
 
 def _impact_lines(title: str) -> str:
@@ -2323,23 +2358,23 @@ def _mentions_argentina(title: str, desc: Optional[str], domain: Optional[str] =
     return has_keyword
 
 
-async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tuple[str, str]]:
+async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[NewsItem]:
     global NEWS_HISTORY, NEWS_CACHE
     now_ts = time()
     _prune_news_history(now_ts)
     today = datetime.utcfromtimestamp(now_ts).date().isoformat()
     target_limit = max(limit, 5)
-    fallback_generic = [
-        ("Mercados: sin novedades relevantes", "https://www.cronista.com/finanzas-mercados/"),
-        ("Actividad: esperando datos de inflación", "https://www.baenegocios.com/economia/"),
-        ("Consumo: expectativa por ventas minoristas", "https://www.perfil.com/economia"),
-        ("Créditos: panorama de tasas y costos", "https://www.infobae.com/economia/"),
-        ("Comercio exterior: dinámica de importaciones", "https://www.pagina12.com.ar/seccion/economia"),
+    fallback_generic: List[NewsItem] = [
+        ("Mercados: sin novedades relevantes", "https://www.cronista.com/finanzas-mercados/", None),
+        ("Actividad: esperando datos de inflación", "https://www.baenegocios.com/economia/", None),
+        ("Consumo: expectativa por ventas minoristas", "https://www.perfil.com/economia", None),
+        ("Créditos: panorama de tasas y costos", "https://www.infobae.com/economia/", None),
+        ("Comercio exterior: dinámica de importaciones", "https://www.pagina12.com.ar/seccion/economia", None),
     ]
     if NEWS_CACHE.get("date") == today and NEWS_CACHE.get("items"):
         cached_items = _dedup_news_items(NEWS_CACHE.get("items", []), limit=target_limit)
         # Reutilizar solo si el cache tiene suficientes ítems y al menos una nota real
-        cache_has_articles = any(_is_probably_article_url(l) for _, l in cached_items)
+        cache_has_articles = any(_is_probably_article_url(item[1]) for item in cached_items)
         if cache_has_articles and len(cached_items) >= target_limit:
             if len(cached_items) != len(NEWS_CACHE.get("items", [])):
                 NEWS_CACHE["items"] = cached_items
@@ -2347,11 +2382,11 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             return cached_items[:limit]
         NEWS_CACHE.clear()
     history_stems: Set[str] = {stem for stem, _ in NEWS_HISTORY}
-    raw_entries: List[Tuple[str, str, Optional[str]]] = []
+    raw_entries: List[RawNewsEntry] = []
     extended_used = False
 
-    async def _collect_feed_entries(feed_urls: Iterable[str]) -> List[Tuple[str, str, Optional[str]]]:
-        collected: List[Tuple[str, str, Optional[str]]] = []
+    async def _collect_feed_entries(feed_urls: Iterable[str]) -> List[RawNewsEntry]:
+        collected: List[RawNewsEntry] = []
         for url in feed_urls:
             xml = await fetch_text(session, url, headers={"Accept": "application/rss+xml, application/atom+xml, */*"})
             if not xml:
@@ -2364,13 +2399,13 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
 
     raw_entries.extend(await _collect_feed_entries(RSS_FEEDS))
 
-    entries_meta: Dict[str, Tuple[str, Optional[str]]] = {}
+    entries_meta: Dict[str, Tuple[str, Optional[str], Optional[str]]] = {}
     seen_titles: Set[str] = set()
     seen_stems: Set[str] = set()
     seen_links: Set[str] = set()
 
-    def _ingest_entries(entries: Iterable[Tuple[str, str, Optional[str]]]) -> None:
-        for title, link, desc in entries:
+    def _ingest_entries(entries: Iterable[RawNewsEntry]) -> None:
+        for title, link, desc, img in entries:
             if not link.startswith("http"):
                 continue
             if not _is_probably_article_url(link):
@@ -2392,7 +2427,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             seen_titles.add(norm_title)
             seen_stems.add(stem_key)
             seen_links.add(clean_link)
-            entries_meta[link] = (title, desc)
+            entries_meta[link] = (title, desc, img)
 
     _ingest_entries(raw_entries)
 
@@ -2407,7 +2442,13 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
         if NEWS_CACHE.get("items"):
             return NEWS_CACHE.get("items", [])[:limit]
         if raw_entries:
-            deduped_raw = _dedup_news_items([(t, l) for t, l, _ in raw_entries], limit=target_limit)
+            deduped_raw = _dedup_news_items(
+                [
+                    (entry[0], entry[1], entry[3] if len(entry) > 3 else None)
+                    for entry in raw_entries
+                ],
+                limit=target_limit,
+            )
             NEWS_CACHE = {"date": today, "items": deduped_raw[:target_limit]}
             await save_state()
             return NEWS_CACHE["items"][:limit]
@@ -2417,7 +2458,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
 
     def _build_scored_entries() -> List[Dict[str, Any]]:
         scored_local: List[Dict[str, Any]] = []
-        for link, (title, desc) in entries_meta.items():
+        for link, (title, desc, img) in entries_meta.items():
             dom = domain_of(link)
             norm_dom = dom[4:] if dom.startswith("www.") else dom
             mentions_ar = _mentions_argentina(title, desc, norm_dom)
@@ -2434,6 +2475,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
                     "is_national": is_national,
                     "mentions": mentions_ar,
                     "category": _news_category_for(title, desc),
+                    "image": img,
                 }
             )
         scored_local.sort(
@@ -2449,7 +2491,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
 
     scored = _build_scored_entries()
 
-    picked: List[Tuple[str,str]] = []
+    picked: List[NewsItem] = []
     domain_counts: Dict[str, int] = {}
     paywall_cache: Dict[str, bool] = {}
     picked_titles: Set[str] = set()
@@ -2510,6 +2552,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             title = entry["title"]
             link = entry["link"]
             dom = entry["domain"]
+            img = entry.get("image")
             cat = category or entry.get("category")
             if _already_picked(title, link):
                 continue
@@ -2517,7 +2560,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
                 continue
             if not allow_paywall and await is_paywalled(link, dom):
                 continue
-            picked.append((title, _paywall_friendly_link(link)))
+            picked.append((title, _paywall_friendly_link(link), img))
             _register_pick(title, link, dom)
             NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
             filled_categories.add(category)
@@ -2531,13 +2574,14 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             title = entry["title"]
             link = entry["link"]
             dom = entry["domain"]
+            img = entry.get("image")
             if _already_picked(title, link):
                 continue
             if domain_cap is not None and domain_counts.get(dom, 0) >= domain_cap:
                 continue
             if not allow_paywall and await is_paywalled(link, dom):
                 continue
-            picked.append((title, _paywall_friendly_link(link)))
+            picked.append((title, _paywall_friendly_link(link), img))
             _register_pick(title, link, dom)
             NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
 
@@ -2601,7 +2645,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
                 break
     if len(picked) < target_limit:
         fallback_scored: List[Dict[str, Any]] = []
-        for title, link, desc in raw_entries:
+        for title, link, desc, img in raw_entries:
             if not link.startswith("http"):
                 continue
             if not _is_probably_article_url(link):
@@ -2622,6 +2666,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
                     "domain": norm_dom,
                     "is_national": norm_dom in NATIONAL_NEWS_DOMAINS,
                     "mentions": _mentions_argentina(title, desc, norm_dom),
+                    "image": img,
                 }
             )
 
@@ -2641,9 +2686,10 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             title = entry["title"]
             link = entry["link"]
             dom = entry["domain"]
+            img = entry.get("image")
             if await is_paywalled(link, dom):
                 continue
-            picked.append((title, _paywall_friendly_link(link)))
+            picked.append((title, _paywall_friendly_link(link), img))
             _register_pick(title, link, dom)
             NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
 
@@ -2656,21 +2702,23 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[Tupl
             title = entry["title"]
             link = entry["link"]
             dom = entry["domain"]
+            img = entry.get("image")
             if _already_picked(title, link):
                 continue
             if await is_paywalled(link, dom):
                 continue
-            picked.append((title, _paywall_friendly_link(link)))
+            picked.append((title, _paywall_friendly_link(link), img))
             _register_pick(title, link, dom)
             NEWS_HISTORY.append((_news_dedup_key(title), now_ts))
 
     deduped_final = _dedup_news_items(picked, target_limit)
     if len(deduped_final) < target_limit:
-        for title, link in fallback_generic:
+        for title, link, img in fallback_generic:
             if len(deduped_final) >= target_limit:
                 break
-            if (title, link) not in deduped_final:
-                deduped_final.append((title, link))
+            existing_keys = {(t, l) for t, l, _ in deduped_final}
+            if (title, link) not in existing_keys:
+                deduped_final.append((title, link, img))
 
     NEWS_CACHE = {"date": today, "items": deduped_final[:target_limit]}
     await save_state()
@@ -2707,20 +2755,22 @@ def _format_news_item(title: str, link: str) -> str:
     return f"<b>{safe_title}</b>\n<a href=\"{safe_link}\">🔗 {short_link}</a>\n{_impact_lines(title)}"
 
 
-def _build_news_layout(news: List[Tuple[str, str]]) -> Tuple[str, Optional[InlineKeyboardMarkup], List[str]]:
+def _build_news_layout(news: List[NewsItem]) -> Tuple[str, Optional[InlineKeyboardMarkup], List[Tuple[str, Optional[str]]]]:
     header = "<b>📰 Noticias</b>"
     if not news:
         return header, None, []
 
-    body_lines: List[str] = []
-    for title, link in news:
-        body_lines.append(_format_news_item(title, link))
+    body_lines: List[Tuple[str, Optional[str]]] = []
+    for entry in news:
+        title, link = entry[0], entry[1]
+        img = entry[2] if len(entry) >= 3 else None
+        body_lines.append((_format_news_item(title, link), img))
     return header, None, body_lines
 
 
-def format_news_block(news: List[Tuple[str, str]]) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
+def format_news_block(news: List[NewsItem]) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
     header, markup, body_lines = _build_news_layout(news)
-    body = "\n\n".join(body_lines) if body_lines else "—"
+    body = "\n\n".join(text for text, _ in body_lines) if body_lines else "—"
     return f"{header}\n{body}", markup
 
 # ============================ FORMATS & RANKINGS ============================
@@ -3338,12 +3388,19 @@ async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=kb,
         link_preview_options=LinkPreviewOptions(is_disabled=True),
     )
-    for item in items:
-        await update.effective_message.reply_text(
-            item,
-            parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(prefer_small_media=True),
-        )
+    for text, img in items:
+        if img:
+            await update.effective_message.reply_photo(
+                img,
+                caption=text,
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await update.effective_message.reply_text(
+                text,
+                parse_mode=ParseMode.HTML,
+                link_preview_options=LinkPreviewOptions(prefer_small_media=True),
+            )
 
 async def cmd_menu_economia(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_menu_counter(context, "economia", 6)
