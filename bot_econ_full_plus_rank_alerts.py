@@ -1194,6 +1194,13 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
         if not row:
             return
 
+        # Si ya tenemos variación (provista por CriptoYa u otra fuente), no la
+        # pisamos con el cálculo basado en DolarAPI que hoy siempre devuelve el
+        # mismo valor histórico y terminaba dejando la variación en 0 para
+        # todos los tipos de cambio.
+        if row.get("variation") is not None:
+            return
+
         cur_val = _current_val(row)
         if cur_val is None:
             return
