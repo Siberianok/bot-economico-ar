@@ -2616,10 +2616,29 @@ def _short_title(text: str, limit: int = 32) -> str:
     return text[: limit - 1].rstrip() + "…"
 
 
+def _short_link(link: str, max_len: int = 48) -> str:
+    try:
+        parsed = urlparse(link)
+    except Exception:
+        return link
+
+    host = parsed.netloc or link
+    host = host[4:] if host.startswith("www.") else host
+    path = (parsed.path or "").strip()
+    clean_path = re.sub(r"/+", "/", path)
+    preview = f"{host}{clean_path}"
+    if parsed.query:
+        preview = f"{preview}?…"
+    if len(preview) > max_len:
+        preview = preview[: max_len - 1].rstrip("/") + "…"
+    return preview or link
+
+
 def _format_news_item(title: str, link: str) -> str:
     safe_title = _html.escape(title)
     safe_link = _html.escape(link, True)
-    return f"• {safe_title}\n{safe_link}\n{_impact_lines(title)}"
+    short_link = _html.escape(_short_link(link))
+    return f"<b>{safe_title}</b>\n<a href=\"{safe_link}\">🔗 {short_link}</a>\n{_impact_lines(title)}"
 
 
 def _build_news_layout(news: List[Tuple[str, str]]) -> Tuple[str, Optional[InlineKeyboardMarkup], List[str]]:
