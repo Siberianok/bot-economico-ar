@@ -64,6 +64,7 @@ DOLARAPI_BASE = "https://dolarapi.com/v1"
 BANDAS_CAMBIARIAS_URL = f"{DOLARAPI_BASE}/bandas-cambiarias"
 DOLARITO_BANDAS_HTML = "https://dolarito.ar/dolar/bandas-cambiarias"
 
+AMBITO_RIESGO_URL = "https://mercados.ambito.com//riesgo-pais/variacion"
 ARG_DATOS_BASES = [
     "https://api.argentinadatos.com/v1/finanzas/indices",
     "https://argentinadatos.com/v1/finanzas/indices",
@@ -1238,6 +1239,67 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
 
     def _result_ready() -> bool:
         return val is not None and fecha is not None and variation is not None
+
+    def _normalize_number(raw: Any) -> Optional[float]:
+        if isinstance(raw, (int, float)):
+            try:
+                return float(raw)
+            except Exception:
+                return None
+        if isinstance(raw, str):
+            s = raw.strip()
+            s = s.replace("pb", "").replace("%", "")
+            s = s.replace(".", "").replace(",", ".")
+            s = re.sub(r"[^0-9\-\.]+", "", s)
+            try:
+                return float(s)
+            except Exception:
+                return None
+        return None
+
+    # 0) Ámbito (valor y variación diaria)
+    ambito_data = await fetch_json(session, AMBITO_RIESGO_URL, headers=REQ_HEADERS)
+
+    def _from_ambito_row(row: Dict[str, Any]) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+        if not isinstance(row, dict):
+            return (None, None, None)
+        ambito_val = _normalize_number(
+            row.get("valor")
+            or row.get("value")
+            or row.get("venta")
+            or row.get("dato")
+            or row.get("ultimo")
+        )
+        ambito_var = _normalize_number(row.get("variacion") or row.get("var") or row.get("cambio"))
+        ambito_fecha = row.get("fecha") or row.get("actualizacion") or row.get("updated") or row.get("hora")
+        return (ambito_val, ambito_fecha, ambito_var)
+
+    if ambito_data:
+        ambito_val: Optional[float] = None
+        ambito_fecha: Optional[str] = None
+        ambito_var: Optional[float] = None
+
+        if isinstance(ambito_data, dict):
+            ambito_val, ambito_fecha, ambito_var = _from_ambito_row(ambito_data)
+        elif isinstance(ambito_data, list) and ambito_data:
+            last = ambito_data[-1]
+            if isinstance(last, dict):
+                ambito_val, ambito_fecha, ambito_var = _from_ambito_row(last)
+            else:
+                ambito_val = _normalize_number(ambito_data[0]) if len(ambito_data) > 0 else None
+                ambito_var = _normalize_number(ambito_data[1]) if len(ambito_data) > 1 else None
+                if len(ambito_data) > 2 and isinstance(ambito_data[2], str):
+                    ambito_fecha = ambito_data[2]
+
+        if ambito_val is not None:
+            val = ambito_val
+            fecha = ambito_fecha or fecha
+            variation = ambito_var if ambito_var is not None else variation
+            if _result_ready():
+                try:
+                    return (int(round(val)), fecha, variation)
+                except Exception:
+                    val = fecha = variation = None
 
     # 1) Rava (fuente principal)
     data = await _fetch_rava_profile(session, "riesgo pais")
