@@ -1307,6 +1307,10 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
 
     # 1) Rava (fuente principal)
     data = await _fetch_rava_profile(session, "riesgo pais")
+    rava_val: Optional[float] = None
+    rava_fecha: Optional[str] = None
+    rava_var: Optional[float] = None
+
     if isinstance(data, dict):
         history = data.get("coti_hist")
         points = _rava_history_points(history) if isinstance(history, list) else []
@@ -1315,18 +1319,22 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
             last_ts, last_val = points[-1]
             _, prev_val = points[-2] if len(points) > 1 else (None, None)
             if last_ts and now_ts - last_ts <= 3 * 24 * 3600:
-                val = float(last_val)
-                fecha = datetime.fromtimestamp(last_ts, tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
+                rava_val = float(last_val)
+                rava_fecha = datetime.fromtimestamp(last_ts, tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
                 if prev_val not in (None, 0):
-                    variation = ((last_val - prev_val) / prev_val) * 100.0
+                    rava_var = ((last_val - prev_val) / prev_val) * 100.0
+
+    if rava_val is not None:
+        val = rava_val
+        fecha = rava_fecha or fecha
+    if rava_var is not None:
+        variation = rava_var
 
     if _result_ready():
         try:
             return (int(round(val)), fecha, variation)
         except Exception:
             return None
-    else:
-        val = fecha = variation = None
 
     # 2) ArgentinaDatos (respaldo)
     if val is None or variation is None:
