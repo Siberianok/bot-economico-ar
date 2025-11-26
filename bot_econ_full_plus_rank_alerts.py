@@ -60,6 +60,7 @@ CRYPTOYA_DOLAR_URL = "https://criptoya.com/api/dolar"
 DOLARAPI_BASE = "https://dolarapi.com/v1"
 BANDAS_CAMBIARIAS_URL = f"{DOLARAPI_BASE}/bandas-cambiarias"
 DOLARITO_BANDAS_HTML = "https://dolarito.ar/dolar/bandas-cambiarias"
+DOLARITO_BANDAS_JSON = "https://api.dolarito.ar/api/frontend/bandas-cambiarias"
 
 AMBITO_RIESGO_URL = "https://mercados.ambito.com//riesgo-pais/variacion"
 ARG_DATOS_BASES = [
@@ -3111,46 +3112,117 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
 
-async def _parse_dolarito_bandas_html(html: str) -> Optional[Dict[str, Any]]:
-    patterns = [
-        r'bands\\":\{.*?\},\\"timestamp\\":\d+',   # JSON escapado
-        r'"bands":\{.*?\}(?:,"timestamp":\d+)?',        # JSON sin escapar
-    ]
-
-    match = None
-    for pat in patterns:
-        match = re.search(pat, html, re.DOTALL)
-        if match:
-            break
-    if not match:
+def _extract_json_object_with_bands(text: str) -> Optional[Dict[str, Any]]:
+    idx = text.find("\"bands\"")
+    if idx == -1:
         return None
 
-    raw = match.group(0)
+    start = text.rfind("{", 0, idx)
+    if start == -1:
+        return None
+
+    depth = 0
+    end = None
+    for pos in range(start, len(text)):
+        ch = text[pos]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = pos + 1
+                break
+
+    if end is None:
+        return None
+
     try:
-        decoded = raw.encode("utf-8").decode("unicode_escape") if "\\" in raw else raw
-        decoded = decoded.lstrip("{").rstrip("}")
-        parsed = json.loads("{" + decoded + "}")
-    except Exception as exc:
-        log.warning("No se pudo parsear bandas de Dolarito: %s", exc)
+        return json.loads(text[start:end])
+    except Exception:
         return None
 
-    bands = parsed.get("bands") if isinstance(parsed, dict) else None
-    if not isinstance(bands, dict):
+
+async def _parse_dolarito_bandas_html(html: str) -> Optional[Dict[str, Any]]:
+    search_spaces: List[str] = [html]
+
+    for match in re.finditer(r"bands\\\":\{", html):
+        start = max(0, match.start() - 120)
+        end = min(len(html), match.end() + 600)
+        snippet = html[start:end]
+        try:
+            decoded = snippet.encode("utf-8").decode("unicode_escape")
+            search_spaces.append(decoded)
+        except Exception:
+            continue
+
+    for text in search_spaces:
+        parsed = _extract_json_object_with_bands(text)
+        if not isinstance(parsed, dict):
+            continue
+
+        bands = parsed.get("bands")
+        if not isinstance(bands, dict):
+            continue
+
+        data: Dict[str, Any] = {
+            "banda_superior": bands.get("upper") or bands.get("upperBand"),
+            "banda_inferior": bands.get("lower") or bands.get("lowerBand"),
+            "variacion_diaria": (bands.get("dolarMayorista") or {}).get("variation"),
+            "variacion_superior": bands.get("upperVariation"),
+            "variacion_inferior": bands.get("lowerVariation"),
+            "variacion_mensual_superior": bands.get("upperMonthlyVariation") or bands.get("upper_monthly_variation"),
+            "variacion_mensual_inferior": bands.get("lowerMonthlyVariation") or bands.get("lower_monthly_variation"),
+            "fecha": None,
+            "fuente": "Dolarito.ar",
+        }
+
+        ts_candidates = [bands.get("timestamp"), parsed.get("timestamp")]
+        for ts in ts_candidates:
+            try:
+                if ts is None:
+                    continue
+                dt = datetime.fromtimestamp(float(ts) / 1000.0, tz=TZ)
+                data["fecha"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+                break
+            except Exception:
+                continue
+
+        return data
+
+    log.warning("No se pudo parsear bandas de Dolarito: sin coincidencias")
+    return None
+
+
+async def _fetch_dolarito_bandas_json(session: ClientSession) -> Optional[Dict[str, Any]]:
+    try:
+        async with session.get(
+            DOLARITO_BANDAS_JSON, headers=REQ_HEADERS, timeout=ClientTimeout(total=10)
+        ) as resp:
+            if resp.status != 200:
+                return None
+            raw = await resp.json()
+    except Exception:
         return None
 
+    if not isinstance(raw, dict):
+        return None
+
+    bands = raw.get("bands") if isinstance(raw.get("bands"), dict) else raw
     data: Dict[str, Any] = {
         "banda_superior": bands.get("upper") or bands.get("upperBand"),
         "banda_inferior": bands.get("lower") or bands.get("lowerBand"),
+        "variacion_mensual_superior": bands.get("upperMonthlyVariation")
+        or bands.get("upper_monthly_variation"),
+        "variacion_mensual_inferior": bands.get("lowerMonthlyVariation")
+        or bands.get("lower_monthly_variation"),
         "variacion_diaria": (bands.get("dolarMayorista") or {}).get("variation"),
         "variacion_superior": bands.get("upperVariation"),
         "variacion_inferior": bands.get("lowerVariation"),
-        "variacion_mensual_superior": bands.get("upperMonthlyVariation") or bands.get("upper_monthly_variation"),
-        "variacion_mensual_inferior": bands.get("lowerMonthlyVariation") or bands.get("lower_monthly_variation"),
         "fecha": None,
-        "fuente": "Dolarito.ar",
+        "fuente": "Dolarito.ar (JSON)",
     }
 
-    ts_candidates = [bands.get("timestamp"), parsed.get("timestamp")]
+    ts_candidates = [bands.get("timestamp"), raw.get("timestamp")]
     for ts in ts_candidates:
         try:
             if ts is None:
@@ -3176,6 +3248,19 @@ async def _fetch_dolarito_bandas(session: ClientSession) -> Optional[Dict[str, A
 
 async def get_bandas_cambiarias(session: ClientSession) -> Optional[Dict[str, Any]]:
     data = await _fetch_dolarito_bandas(session)
+
+    if not data:
+        data = await _fetch_dolarito_bandas_json(session)
+    elif not (
+        data.get("variacion_mensual_superior") and data.get("variacion_mensual_inferior")
+    ):
+        json_data = await _fetch_dolarito_bandas_json(session)
+        if json_data:
+            for key, val in json_data.items():
+                if data.get(key) is None and val is not None:
+                    data[key] = val
+            if json_data.get("variacion_mensual_superior") or json_data.get("variacion_mensual_inferior"):
+                data["fuente"] = json_data.get("fuente", data.get("fuente"))
     if data:
         return data
 
@@ -3223,12 +3308,25 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
 
     banda_sup = _fmt_band_val(data, ["banda_superior", "upper", "upperBand", "bandaSuperior"])
     banda_inf = _fmt_band_val(data, ["banda_inferior", "lower", "lowerBand", "bandaInferior"])
-    pct_sup = _fmt_band_pct(
+    monthly_sup = _fmt_band_pct(
         data,
         [
             "variacion_mensual_superior",
             "upperMonthlyVariation",
             "upper_monthly_variation",
+        ],
+    )
+    monthly_inf = _fmt_band_pct(
+        data,
+        [
+            "variacion_mensual_inferior",
+            "lowerMonthlyVariation",
+            "lower_monthly_variation",
+        ],
+    )
+    daily_sup = _fmt_band_pct(
+        data,
+        [
             "variacion_superior",
             "upperVariation",
             "upper_variation",
@@ -3237,12 +3335,9 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
             "upperVar",
         ],
     )
-    pct_inf = _fmt_band_pct(
+    daily_inf = _fmt_band_pct(
         data,
         [
-            "variacion_mensual_inferior",
-            "lowerMonthlyVariation",
-            "lower_monthly_variation",
             "variacion_inferior",
             "lowerVariation",
             "lower_variation",
@@ -3251,30 +3346,32 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
             "lowerVar",
         ],
     )
-    pct_val = _fmt_band_pct(
+    daily_generic = _fmt_band_pct(
         data,
         [
-            "variacion_mensual",
-            "monthly_change",
-            "monthlyChange",
             "variacion_diaria",
             "variacion",
             "daily_change",
             "dailyChange",
         ],
     )
+    pct_sup = monthly_sup
+    pct_inf = monthly_inf
+    using_monthly = (monthly_sup is not None) or (monthly_inf is not None)
 
     if pct_sup is None:
-        pct_sup = pct_val
+        pct_sup = daily_sup if daily_sup is not None else daily_generic
     if pct_inf is None:
-        pct_inf = pct_val
+        pct_inf = daily_inf if daily_inf is not None else daily_generic
 
     sup_txt = fmt_money_ars(banda_sup) if banda_sup is not None else "—"
     inf_txt = fmt_money_ars(banda_inf) if banda_inf is not None else "—"
     pct_sup_txt = pct(pct_sup, 2) if pct_sup is not None else "—"
     pct_inf_txt = pct(pct_inf, 2) if pct_inf is not None else "—"
 
-    header = "<b>📊 Bandas cambiarias</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
+    var_label = "Variación mensual" if using_monthly else "Variación diaria"
+    header = "<b>📊 Bandas cambiarias" + (" (solo diaria)" if not using_monthly else "") + "</b>"
+    header += f" <i>Actualizado: {fecha}</i>" if fecha else ""
 
     col1 = ["Banda superior", "Banda inferior"]
     col2 = [sup_txt, inf_txt]
@@ -3295,7 +3392,7 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
 
     lines = [
         header,
-        "<pre>Nombre           | Importe | Variación mensual\n" + table + "</pre>",
+        f"<pre>Nombre           | Importe | {var_label}\n" + table + "</pre>",
         f"<i>Fuente: {fuente}</i>",
     ]
     return "\n".join(lines)
