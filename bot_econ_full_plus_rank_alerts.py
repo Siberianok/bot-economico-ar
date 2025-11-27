@@ -550,6 +550,7 @@ PF: Dict[int, Dict[str, Any]] = {}
 ALERT_USAGE: Dict[int, Dict[str, Dict[str, Any]]] = {}
 NEWS_HISTORY: List[Tuple[str, float]] = []
 NEWS_CACHE: Dict[str, Any] = {"date": "", "items": []}
+RIESGO_CACHE: Dict[str, Any] = {}
 
 _REDIS_CLIENT: Optional[Any] = None
 _REDIS_CLIENT_INITIALIZED = False
@@ -687,7 +688,7 @@ def _save_state_to_redis(payload: Dict[str, Any]) -> bool:
 
 
 async def load_state():
-    global ALERTS, SUBS, PF, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE
+    global ALERTS, SUBS, PF, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE, RIESGO_CACHE
     data: Optional[Dict[str, Any]] = None
     if USE_UPSTASH:
         data = await _load_state_from_upstash()
@@ -725,6 +726,24 @@ async def load_state():
             NEWS_CACHE = {"date": cache_date, "items": cache_items}
         else:
             NEWS_CACHE = {"date": "", "items": []}
+        cache_riesgo = data.get("riesgo_cache")
+        if isinstance(cache_riesgo, dict) and cache_riesgo.get("val") is not None:
+            try:
+                cache_val = int(cache_riesgo.get("val"))
+                cache_fecha = str(cache_riesgo.get("fecha")) if cache_riesgo.get("fecha") is not None else None
+                cache_var = float(cache_riesgo.get("variation")) if cache_riesgo.get("variation") is not None else None
+                cache_ts_raw = cache_riesgo.get("updated_at")
+                cache_ts = float(cache_ts_raw) if cache_ts_raw is not None else None
+                RIESGO_CACHE = {
+                    "val": cache_val,
+                    "fecha": cache_fecha,
+                    "variation": cache_var,
+                    "updated_at": cache_ts,
+                }
+            except Exception:
+                RIESGO_CACHE = {}
+        else:
+            RIESGO_CACHE = {}
         log.info(
             "State loaded. alerts=%d subs=%d pf=%d",
             sum(len(v) for v in ALERTS.values()),
@@ -751,6 +770,7 @@ async def save_state():
         "news_history": NEWS_HISTORY,
         "news_cache_date": NEWS_CACHE.get("date", ""),
         "news_cache_items": NEWS_CACHE.get("items", []),
+        "riesgo_cache": RIESGO_CACHE,
     }
     if USE_UPSTASH:
         await _save_state_to_upstash(payload)
@@ -1237,10 +1257,12 @@ async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Option
     try: return float(v) if v is not None else None
     except: return None
 
-async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str], Optional[float]]]:
+async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str], Optional[float], bool]]:
+    global RIESGO_CACHE
     val: Optional[float] = None
     fecha: Optional[str] = None
     variation: Optional[float] = None
+    from_cache = False
 
     def _result_ready() -> bool:
         return val is not None and fecha is not None and variation is not None
@@ -1261,6 +1283,21 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
             except Exception:
                 return None
         return None
+
+    def _save_riesgo_cache(v: int, f: Optional[str], var: Optional[float]) -> None:
+        global RIESGO_CACHE
+        new_cache = {
+            "val": v,
+            "fecha": f,
+            "variation": var,
+            "updated_at": time(),
+        }
+        if RIESGO_CACHE != new_cache:
+            RIESGO_CACHE = new_cache
+            try:
+                asyncio.create_task(save_state())
+            except Exception:
+                pass
 
     # 0) Ámbito (valor y variación diaria)
     ambito_data = await fetch_json(session, AMBITO_RIESGO_URL, headers=REQ_HEADERS)
@@ -1302,7 +1339,9 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
             variation = ambito_var if ambito_var is not None else variation
             if _result_ready():
                 try:
-                    return (int(round(val)), fecha, variation)
+                    rounded = int(round(val))
+                    _save_riesgo_cache(rounded, fecha, variation)
+                    return (rounded, fecha, variation, from_cache)
                 except Exception:
                     val = fecha = variation = None
 
@@ -1333,7 +1372,9 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
 
     if _result_ready():
         try:
-            return (int(round(val)), fecha, variation)
+            rounded = int(round(val))
+            _save_riesgo_cache(rounded, fecha, variation)
+            return (rounded, fecha, variation, from_cache)
         except Exception:
             return None
 
@@ -1509,12 +1550,27 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                     variation = None
 
     if val is None:
-        return None
+        cache_val = RIESGO_CACHE.get("val") if isinstance(RIESGO_CACHE, dict) else None
+        if cache_val is None:
+            return None
+        try:
+            cache_val_int = int(cache_val)
+        except Exception:
+            return None
+        return (
+            cache_val_int,
+            RIESGO_CACHE.get("fecha") if isinstance(RIESGO_CACHE, dict) else None,
+            RIESGO_CACHE.get("variation") if isinstance(RIESGO_CACHE, dict) else None,
+            True,
+        )
 
     try:
-        return (int(round(val)), fecha, variation)
+        rounded = int(round(val))
     except Exception:
         return None
+
+    _save_riesgo_cache(rounded, fecha, variation)
+    return (rounded, fecha, variation, from_cache)
 
 
 def _format_riesgo_variation(var: Optional[float]) -> str:
@@ -3476,10 +3532,24 @@ async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tup is None:
         txt = "No pude obtener riesgo país ahora."
     else:
-        rp, f, var = tup; f_str = parse_iso_ddmmyyyy(f)
+        rp, f, var, from_cache = tup[0], tup[1], tup[2], bool(tup[3]) if len(tup) > 3 else False
+        f_str = parse_iso_ddmmyyyy(f)
         change_txt = _format_riesgo_variation(var)
-        txt = (f"<b>📈 Riesgo País</b>{f' <i>{f_str}</i>' if f_str else ''}\n"
-               f"<b>{rp} pb</b>{change_txt}")
+        freshness = ""
+        if from_cache:
+            cache_ts = RIESGO_CACHE.get("updated_at") if isinstance(RIESGO_CACHE, dict) else None
+            cache_dt = None
+            try:
+                if cache_ts:
+                    cache_dt = datetime.fromtimestamp(float(cache_ts), tz=TZ)
+            except Exception:
+                cache_dt = None
+            cache_str = cache_dt.strftime("%d/%m %H:%M") if cache_dt else "guardado"
+            freshness = f" <i>(dato de respaldo, {cache_str})</i>"
+        txt = (
+            f"<b>📈 Riesgo País</b>{f' <i>{f_str}</i>' if f_str else ''}{freshness}\n"
+            f"<b>{rp} pb</b>{change_txt}"
+        )
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
