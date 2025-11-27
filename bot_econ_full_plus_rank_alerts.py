@@ -8,7 +8,7 @@ from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable, Iterable
-from urllib.parse import urlparse, quote, parse_qs
+from urllib.parse import urlparse, quote, parse_qs, urljoin
 
 # ====== matplotlib opcional (no rompe si no está instalado) ======
 HAS_MPL = False
@@ -2276,6 +2276,60 @@ def _parse_feed_entries(xml: str) -> List[RawNewsEntry]:
                 out.append((t, l, None, None))
     return out
 
+def _clean_image_url(url: Optional[str], base_url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    url = _html.unescape(url.strip())
+    if url.startswith("//"):
+        url = f"https:{url}"
+    if base_url:
+        url = urljoin(base_url, url)
+    if not url.startswith("http"):
+        return None
+    if url.lower().endswith(".svg"):
+        return None
+    if url.lower().startswith("data:"):
+        return None
+    return url
+
+def _extract_page_image(html: str, base_url: Optional[str]) -> Optional[str]:
+    if not html:
+        return None
+
+    patterns = [
+        r"<meta[^>]+(?:property|name)=['\"]og:image(?::secure_url)?['\"][^>]+content=['\"]([^'\"]+)['\"]",
+        r"<meta[^>]+name=['\"]twitter:image(?::src)?['\"][^>]+content=['\"]([^'\"]+)['\"]",
+        r"<link[^>]+rel=['\"]image_src['\"][^>]+href=['\"]([^'\"]+)['\"]",
+    ]
+    for pat in patterns:
+        m = re.search(pat, html, flags=re.I)
+        if m:
+            img = _clean_image_url(m.group(1), base_url)
+            if img:
+                return img
+
+    for m in re.finditer(r"<img[^>]+src=['\"]([^'\"]+)['\"][^>]*>", html, flags=re.I):
+        img = _clean_image_url(m.group(1), base_url)
+        if img:
+            return img
+    return None
+
+async def _fallback_image_from_url(session: ClientSession, url: str) -> Optional[str]:
+    try:
+        async with session.get(
+            url,
+            timeout=ClientTimeout(total=8),
+            headers={**REQ_HEADERS, "Accept": "text/html,application/xhtml+xml"},
+        ) as resp:
+            if resp.status != 200:
+                return None
+            html = await resp.text()
+            base_url = str(resp.url) if resp.url else url
+    except Exception as exc:
+        log.warning("fallback image %s: %s", url, exc)
+        return None
+    return _extract_page_image(html, base_url)
+
 def _impact_lines(title: str) -> str:
     t = title.lower()
     if any(k in t for k in ["dólar","mep","ccl","blue","brecha"]):
@@ -2380,12 +2434,32 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[News
         ("Créditos: panorama de tasas y costos", "https://www.infobae.com/economia/", None),
         ("Comercio exterior: dinámica de importaciones", "https://www.pagina12.com.ar/seccion/economia", None),
     ]
+
+    async def _enrich_with_fallback_images(items: List[NewsItem]) -> List[NewsItem]:
+        missing = [(idx, entry) for idx, entry in enumerate(items) if len(entry) < 3 or not entry[2]]
+        if not missing:
+            return items
+
+        to_fetch = missing[:6]
+        fetched = await asyncio.gather(*(_fallback_image_from_url(session, entry[1]) for _, entry in to_fetch))
+        enriched: List[NewsItem] = list(items)
+        changed = False
+        for (idx, entry), img in zip(to_fetch, fetched):
+            if img:
+                enriched[idx] = (entry[0], entry[1], img)
+                changed = True
+        return enriched if changed else items
+
     if NEWS_CACHE.get("date") == today and NEWS_CACHE.get("items"):
         cached_items = _dedup_news_items(NEWS_CACHE.get("items", []), limit=target_limit)
         # Reutilizar solo si el cache tiene suficientes ítems y al menos una nota real
         cache_has_articles = any(_is_probably_article_url(item[1]) for item in cached_items)
         if cache_has_articles and len(cached_items) >= target_limit:
             if len(cached_items) != len(NEWS_CACHE.get("items", [])):
+                NEWS_CACHE["items"] = cached_items
+                await save_state()
+            cached_items = await _enrich_with_fallback_images(cached_items)
+            if cached_items != NEWS_CACHE.get("items"):
                 NEWS_CACHE["items"] = cached_items
                 await save_state()
             return cached_items[:limit]
@@ -2449,7 +2523,11 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[News
 
     if not entries_meta:
         if NEWS_CACHE.get("items"):
-            return NEWS_CACHE.get("items", [])[:limit]
+            cached = await _enrich_with_fallback_images(NEWS_CACHE.get("items", []))
+            if cached != NEWS_CACHE.get("items"):
+                NEWS_CACHE["items"] = cached
+                await save_state()
+            return cached[:limit]
         if raw_entries:
             deduped_raw = _dedup_news_items(
                 [
@@ -2458,10 +2536,12 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[News
                 ],
                 limit=target_limit,
             )
+            deduped_raw = await _enrich_with_fallback_images(deduped_raw)
             NEWS_CACHE = {"date": today, "items": deduped_raw[:target_limit]}
             await save_state()
             return NEWS_CACHE["items"][:limit]
-        NEWS_CACHE = {"date": today, "items": fallback_generic[:target_limit]}
+        enriched_generic = await _enrich_with_fallback_images(fallback_generic[:target_limit])
+        NEWS_CACHE = {"date": today, "items": enriched_generic}
         await save_state()
         return NEWS_CACHE["items"][:limit]
 
@@ -2729,6 +2809,7 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[News
             if (title, link) not in existing_keys:
                 deduped_final.append((title, link, img))
 
+    deduped_final = await _enrich_with_fallback_images(deduped_final)
     NEWS_CACHE = {"date": today, "items": deduped_final[:target_limit]}
     await save_state()
     return NEWS_CACHE["items"][:limit]
@@ -2773,7 +2854,8 @@ def _build_news_layout(news: List[NewsItem]) -> Tuple[str, Optional[InlineKeyboa
     for entry in news:
         title, link = entry[0], entry[1]
         img = entry[2] if len(entry) >= 3 else None
-        body_lines.append((_format_news_item(title, link), img))
+        fallback_img = entry[3] if len(entry) >= 4 else None
+        body_lines.append((_format_news_item(title, link), img or fallback_img))
     return header, None, body_lines
 
 
