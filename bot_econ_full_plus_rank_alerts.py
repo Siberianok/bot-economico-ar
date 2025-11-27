@@ -2813,7 +2813,7 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
         if val > 0:
             icon = "🔺"  # flecha roja hacia arriba
         elif val < 0:
-            icon = "🟢⬇️"  # flecha verde hacia abajo
+            icon = "🔻"  # triángulo verde hacia abajo
         else:
             icon = "➡️"
         num = f"{val:+.2f}%"
