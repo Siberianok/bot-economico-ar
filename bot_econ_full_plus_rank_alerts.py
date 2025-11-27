@@ -3507,19 +3507,19 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
     inf_txt = fmt_money_ars(banda_inf) if banda_inf is not None else "—"
     var_label = "Variación diaria" if has_daily_data else "Variación"
 
-    def _fmt_var(val: Optional[float]) -> str:
+    def _fmt_var(val: Optional[float], is_upper: bool) -> str:
         if val is None:
             return "—"
         if val > 0:
-            icon = "🟢🔼"
+            icon = "🟢🔼" if is_upper else "🔺"
         elif val < 0:
-            icon = "🔻"
+            icon = "🔻" if is_upper else "🟢🔻"
         else:
             icon = "➡️"
         return f"{icon} {pct(val, 2)}"
 
-    pct_sup_txt = _fmt_var(pct_sup)
-    pct_inf_txt = _fmt_var(pct_inf)
+    pct_sup_txt = _fmt_var(pct_sup, True)
+    pct_inf_txt = _fmt_var(pct_inf, False)
 
     header = "<b>📊 Bandas cambiarias" + (" (solo diaria)" if not has_daily_data else "") + "</b>"
     header += f" <i>Actualizado: {fecha}</i>" if fecha else ""
