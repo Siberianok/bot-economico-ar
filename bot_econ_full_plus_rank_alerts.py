@@ -2332,6 +2332,22 @@ def _parse_feed_entries(xml: str) -> List[RawNewsEntry]:
                 out.append((t, l, None, None))
     return out
 
+_IMAGE_LOGO_PATTERNS = [
+    "logo",
+    "favicon",
+    "sprite",
+    "icon",
+    "placeholder",
+    "default",
+    "brand",
+    "header",
+    "print",
+    "google_news",
+    "googlenews",
+    "gn-logo",
+]
+
+
 def _clean_image_url(url: Optional[str], base_url: Optional[str]) -> Optional[str]:
     if not url:
         return None
@@ -2348,6 +2364,45 @@ def _clean_image_url(url: Optional[str], base_url: Optional[str]) -> Optional[st
         return None
     return url
 
+
+def _is_logo_like(url: str) -> bool:
+    low = url.lower()
+    if any(pattern in low for pattern in _IMAGE_LOGO_PATTERNS):
+        return True
+    if re.search(r"/(?:logo|logos|favicon|icons?)/", low):
+        return True
+    if re.search(r"(?:^|[\W_])logo(?:[\W_]|$)", low):
+        return True
+    return False
+
+
+def _extract_json_ld_images(html: str, base_url: Optional[str]) -> List[str]:
+    images: List[str] = []
+    for match in re.finditer(r"<script[^>]+type=['\"]application/ld\+json['\"][^>]*>(.*?)</script>", html, flags=re.I | re.S):
+        try:
+            data = json.loads(match.group(1))
+        except Exception:
+            continue
+
+        def _collect_image(obj: Any) -> None:
+            if isinstance(obj, str):
+                cleaned = _clean_image_url(obj, base_url)
+                if cleaned:
+                    images.append(cleaned)
+            elif isinstance(obj, list):
+                for it in obj:
+                    _collect_image(it)
+            elif isinstance(obj, dict):
+                if "image" in obj:
+                    _collect_image(obj.get("image"))
+                for key in ("thumbnailUrl", "thumbnail", "logo"):
+                    if key in obj:
+                        _collect_image(obj.get(key))
+
+        _collect_image(data)
+    return images
+
+
 def _extract_page_image(html: str, base_url: Optional[str]) -> Optional[str]:
     if not html:
         return None
@@ -2357,17 +2412,33 @@ def _extract_page_image(html: str, base_url: Optional[str]) -> Optional[str]:
         r"<meta[^>]+name=['\"]twitter:image(?::src)?['\"][^>]+content=['\"]([^'\"]+)['\"]",
         r"<link[^>]+rel=['\"]image_src['\"][^>]+href=['\"]([^'\"]+)['\"]",
     ]
+
+    candidates: List[str] = []
+
     for pat in patterns:
-        m = re.search(pat, html, flags=re.I)
-        if m:
+        for m in re.finditer(pat, html, flags=re.I):
             img = _clean_image_url(m.group(1), base_url)
-            if img:
-                return img
+            if img and not _is_logo_like(img):
+                candidates.append(img)
+
+    for json_img in _extract_json_ld_images(html, base_url):
+        if json_img and not _is_logo_like(json_img):
+            candidates.append(json_img)
+
+    if candidates:
+        return candidates[0]
 
     for m in re.finditer(r"<img[^>]+src=['\"]([^'\"]+)['\"][^>]*>", html, flags=re.I):
         img = _clean_image_url(m.group(1), base_url)
-        if img:
-            return img
+        if not img or _is_logo_like(img):
+            continue
+        width_match = re.search(r"width=['\"]?(\d+)", m.group(0), flags=re.I)
+        height_match = re.search(r"height=['\"]?(\d+)", m.group(0), flags=re.I)
+        if width_match and int(width_match.group(1)) < 80:
+            continue
+        if height_match and int(height_match.group(1)) < 80:
+            continue
+        return img
     return None
 
 async def _fallback_image_from_url(session: ClientSession, url: str) -> Optional[str]:
@@ -2500,9 +2571,11 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[News
         fetched = await asyncio.gather(*(_fallback_image_from_url(session, entry[1]) for _, entry in to_fetch))
         enriched: List[NewsItem] = list(items)
         changed = False
+        used_images: Set[str] = {entry[2] for entry in items if len(entry) >= 3 and entry[2]}
         for (idx, entry), img in zip(to_fetch, fetched):
-            if img:
+            if img and img not in used_images:
                 enriched[idx] = (entry[0], entry[1], img)
+                used_images.add(img)
                 changed = True
         return enriched if changed else items
 
