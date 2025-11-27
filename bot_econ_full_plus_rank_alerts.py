@@ -68,7 +68,8 @@ ARG_DATOS_BASES = [
     "https://argentinadatos.com/v1/finanzas/indices",
 ]
 
-DOLARITO_RIESGO_API = "https://api.dolarito.ar/api/frontend/indices/riesgoPais"
+DOLARITO_RIESGO_API = "https://api.dolarito.ar/api/frontend/indices/riesgo-pais"
+DOLARITO_RIESGO_HTML = "https://www.dolarito.ar/indices/riesgo-pais"
 CRIPTOYA_RIESGO_URL = "https://criptoya.com/charts/riesgo-pais"
 
 LAMACRO_RESERVAS_URL = "https://www.lamacro.ar/variables/1"
@@ -1291,24 +1292,7 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
     from_cache = False
 
     def _result_ready() -> bool:
-        return val is not None and fecha is not None and variation is not None
-
-    def _normalize_number(raw: Any) -> Optional[float]:
-        if isinstance(raw, (int, float)):
-            try:
-                return float(raw)
-            except Exception:
-                return None
-        if isinstance(raw, str):
-            s = raw.strip()
-            s = s.replace("pb", "").replace("%", "")
-            s = s.replace(".", "").replace(",", ".")
-            s = re.sub(r"[^0-9\-\.]+", "", s)
-            try:
-                return float(s)
-            except Exception:
-                return None
-        return None
+        return val is not None and variation is not None
 
     def _save_riesgo_cache(v: int, f: Optional[str], var: Optional[float]) -> None:
         global RIESGO_CACHE
@@ -1325,76 +1309,92 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
             except Exception:
                 pass
 
-    # 0) Ámbito (valor y variación diaria)
-    ambito_data = await fetch_json(session, AMBITO_RIESGO_URL, headers=REQ_HEADERS)
+    # 1) Dolarito (fuente principal)
+    dolarito_data = await fetch_json(session, DOLARITO_RIESGO_API, headers=REQ_HEADERS)
 
-    def _from_ambito_row(row: Dict[str, Any]) -> Tuple[Optional[float], Optional[str], Optional[float]]:
-        if not isinstance(row, dict):
-            return (None, None, None)
-        ambito_val = _normalize_number(
-            row.get("valor")
-            or row.get("value")
-            or row.get("venta")
-            or row.get("dato")
-            or row.get("ultimo")
+    def _dolarito_get(paths: Iterable[Tuple[str, ...]], source: Any) -> Any:
+        for path in paths:
+            current: Any = source
+            for key in path:
+                if isinstance(current, dict) and key in current:
+                    current = current.get(key)
+                else:
+                    current = None
+                    break
+            if current is not None:
+                return current
+        return None
+
+    def _safe_number(raw: Any) -> Optional[float]:
+        try:
+            num = float(raw)
+            return num if math.isfinite(num) else None
+        except (TypeError, ValueError):
+            return None
+
+    if isinstance(dolarito_data, dict):
+        val_raw = _dolarito_get(
+            (
+                ("valor",),
+                ("value",),
+                ("ultimo",),
+                ("last",),
+                ("data", "valor"),
+                ("data", "value"),
+                ("data", "ultimo"),
+                ("data", "last"),
+            ),
+            dolarito_data,
         )
-        ambito_var = _normalize_number(row.get("variacion") or row.get("var") or row.get("cambio"))
-        ambito_fecha = row.get("fecha") or row.get("actualizacion") or row.get("updated") or row.get("hora")
-        return (ambito_val, ambito_fecha, ambito_var)
+        parsed_val = _safe_number(val_raw)
+        if parsed_val is not None:
+            val = parsed_val
 
-    if ambito_data:
-        ambito_val: Optional[float] = None
-        ambito_fecha: Optional[str] = None
-        ambito_var: Optional[float] = None
+        fecha_raw = _dolarito_get(
+            (("fecha",), ("updatedAt",), ("data", "fecha"), ("data", "updatedAt")),
+            dolarito_data,
+        )
+        if fecha_raw:
+            fecha = str(fecha_raw)
 
-        if isinstance(ambito_data, dict):
-            ambito_val, ambito_fecha, ambito_var = _from_ambito_row(ambito_data)
-        elif isinstance(ambito_data, list) and ambito_data:
-            last = ambito_data[-1]
-            if isinstance(last, dict):
-                ambito_val, ambito_fecha, ambito_var = _from_ambito_row(last)
-            else:
-                ambito_val = _normalize_number(ambito_data[0]) if len(ambito_data) > 0 else None
-                ambito_var = _normalize_number(ambito_data[1]) if len(ambito_data) > 1 else None
-                if len(ambito_data) > 2 and isinstance(ambito_data[2], str):
-                    ambito_fecha = ambito_data[2]
+        prev_val = _safe_number(
+            _dolarito_get(
+                (
+                    ("valorAnterior",),
+                    ("previous",),
+                    ("prev",),
+                    ("anterior",),
+                    ("data", "valorAnterior"),
+                    ("data", "previous"),
+                    ("data", "prev"),
+                    ("data", "anterior"),
+                ),
+                dolarito_data,
+            )
+        )
+        if prev_val not in (None, 0) and val is not None:
+            try:
+                variation = ((val - prev_val) / prev_val) * 100.0
+            except Exception:
+                variation = None
 
-        if ambito_val is not None:
-            val = ambito_val
-            fecha = ambito_fecha or fecha
-            variation = ambito_var if ambito_var is not None else variation
-            if _result_ready():
+    if val is None:
+        html = await fetch_text(session, DOLARITO_RIESGO_HTML, headers=REQ_HEADERS)
+        if html:
+            stripped = re.sub(r"<[^>]+>", " ", html)
+            stripped = " ".join(stripped.split())
+            m_val = re.search(r"Riesgo\s+pa[ií]s[^\d]{0,8}(\d{3,5})", stripped, flags=re.I)
+            if m_val:
                 try:
-                    rounded = int(round(val))
-                    _save_riesgo_cache(rounded, fecha, variation)
-                    return (rounded, fecha, variation, from_cache)
+                    val = float(m_val.group(1))
                 except Exception:
-                    val = fecha = variation = None
-
-    # 1) Rava (fuente principal)
-    data = await _fetch_rava_profile(session, "riesgo pais")
-    rava_val: Optional[float] = None
-    rava_fecha: Optional[str] = None
-    rava_var: Optional[float] = None
-
-    if isinstance(data, dict):
-        history = data.get("coti_hist")
-        points = _rava_history_points(history) if isinstance(history, list) else []
-        if points:
-            now_ts = datetime.now(tz=TZ).timestamp()
-            last_ts, last_val = points[-1]
-            _, prev_val = points[-2] if len(points) > 1 else (None, None)
-            if last_ts and now_ts - last_ts <= 3 * 24 * 3600:
-                rava_val = float(last_val)
-                rava_fecha = datetime.fromtimestamp(last_ts, tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
-                if prev_val not in (None, 0):
-                    rava_var = ((last_val - prev_val) / prev_val) * 100.0
-
-    if rava_val is not None:
-        val = rava_val
-        fecha = rava_fecha or fecha
-    if rava_var is not None:
-        variation = rava_var
+                    val = None
+            m_var = re.search(r"([+\-]?\d+[\.,]\d+)%", stripped)
+            if m_var:
+                try:
+                    variation = float(m_var.group(1).replace(",", "."))
+                except Exception:
+                    variation = variation
 
     if _result_ready():
         try:
@@ -1402,9 +1402,9 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
             _save_riesgo_cache(rounded, fecha, variation)
             return (rounded, fecha, variation, from_cache)
         except Exception:
-            return None
+            val = fecha = variation = None
 
-    # 2) ArgentinaDatos (respaldo)
+    # 2) ArgentinaDatos (respaldo ligero)
     if val is None or variation is None:
         for base in ARG_DATOS_BASES:
             history: List[Dict[str, Any]] = []
@@ -1440,141 +1440,6 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
             if val is not None and variation is not None:
                 break
 
-    # 3) CriptoYa
-    if val is None:
-        html = await fetch_text(session, CRIPTOYA_RIESGO_URL)
-        if html:
-            cd_match = re.search(r"chart-data=\"(.*?)\"", html)
-            endpoint: Optional[str] = None
-            if cd_match:
-                try:
-                    data_str = _html.unescape(cd_match.group(1))
-                    data_obj = json.loads(data_str)
-                    series = data_obj.get("series") if isinstance(data_obj, dict) else None
-                    if isinstance(series, list) and series and isinstance(series[0], dict):
-                        endpoint = series[0].get("endpoint")
-                except Exception:
-                    endpoint = None
-
-            if endpoint:
-                for api_url in (
-                    f"https://criptoya.com/api/charts{endpoint}?interval=D&limit=1",
-                    f"https://criptoya.com/api/charts{endpoint}",
-                    f"https://criptoya.com/charts{endpoint}",
-                ):
-                    j = await fetch_json(session, api_url)
-                    if isinstance(j, dict):
-                        for k in ("close", "value", "ultimo", "cierre", "price"):
-                            raw_val = j.get(k)
-                            if raw_val is not None:
-                                try:
-                                    val = float(raw_val)
-                                    break
-                                except (TypeError, ValueError):
-                                    val = None
-                        ts = j.get("timestamp") or j.get("time")
-                        if ts and not fecha:
-                            try:
-                                fecha = datetime.fromtimestamp(float(ts), tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
-                            except Exception:
-                                pass
-                    elif isinstance(j, list) and j:
-                        last = j[-1]
-                        if isinstance(last, dict):
-                            raw_val = last.get("close") or last.get("value") or last.get("ultimo") or last.get("cierre") or last.get("price")
-                            try:
-                                val = float(raw_val) if raw_val is not None else None
-                            except (TypeError, ValueError):
-                                val = None
-                            ts = last.get("timestamp") or last.get("time")
-                            if ts and not fecha:
-                                try:
-                                    fecha = datetime.fromtimestamp(float(ts), tz=TZ).strftime("%Y-%m-%d %H:%M:%S")
-                                except Exception:
-                                    pass
-                    if val is not None:
-                        break
-
-            if val is None:
-                for pat in (
-                    r"\bRiesgo\s+Pa[ií]s\b.*?(\d{3,5})",
-                    r"\bEMBI\b.*?(\d{3,5})",
-                    r"\b(?:riesgo|embi)[^\d]{0,15}(\d{3,5})",
-                ):
-                    m = re.search(pat, html, flags=re.I | re.S)
-                    if m:
-                        try:
-                            val = float(m.group(1))
-                            fecha = None
-                            break
-                        except Exception:
-                            continue
-
-    # 4) Dolarito (última prioridad)
-    if val is None:
-        dolarito_data = await fetch_json(session, DOLARITO_RIESGO_API, headers=REQ_HEADERS)
-        if isinstance(dolarito_data, dict):
-            def _get_from_paths(paths: Iterable[Tuple[str, ...]]) -> Any:
-                for path in paths:
-                    current: Any = dolarito_data
-                    for key in path:
-                        if isinstance(current, dict) and key in current:
-                            current = current.get(key)
-                        else:
-                            current = None
-                            break
-                    if current is not None:
-                        return current
-                return None
-
-            def _safe_number(raw: Any) -> Optional[float]:
-                try:
-                    num = float(raw)
-                    return num if math.isfinite(num) and num > 0 else None
-                except (TypeError, ValueError):
-                    return None
-
-            val_raw = _get_from_paths(
-                (
-                    ("valor",),
-                    ("value",),
-                    ("ultimo",),
-                    ("last",),
-                    ("data", "valor"),
-                    ("data", "value"),
-                    ("data", "ultimo"),
-                    ("data", "last"),
-                )
-            )
-            parsed_val = _safe_number(val_raw)
-            if parsed_val is not None:
-                val = parsed_val
-
-            fecha_raw = _get_from_paths((("fecha",), ("updatedAt",), ("data", "fecha"), ("data", "updatedAt")))
-            if fecha_raw:
-                fecha = str(fecha_raw)
-
-            prev_val = _safe_number(
-                _get_from_paths(
-                    (
-                        ("valorAnterior",),
-                        ("previous",),
-                        ("prev",),
-                        ("anterior",),
-                        ("data", "valorAnterior"),
-                        ("data", "previous"),
-                        ("data", "prev"),
-                        ("data", "anterior"),
-                    )
-                )
-            )
-
-            if prev_val not in (None, 0) and val is not None:
-                try:
-                    variation = ((val - prev_val) / prev_val) * 100.0
-                except Exception:
-                    variation = None
-
     if val is None:
         cache_val = RIESGO_CACHE.get("val") if isinstance(RIESGO_CACHE, dict) else None
         if cache_val is None:
@@ -1607,26 +1472,17 @@ def _format_riesgo_variation(var: Optional[float]) -> str:
     sign = "" if var < 0 else "+" if var > 0 else ""
     return f" <span style='color:{color}'>{arrow} {sign}{var:.2f}%</span>"
 
+def _format_inflacion_variation(var: Optional[float]) -> str:
+    if not isinstance(var, (int, float)):
+        return " —"
+    arrow = "⬆️" if var > 0 else "⬇️" if var < 0 else "➡️"
+    color = "#0abf53" if var > 0 else "#d7263d" if var < 0 else "#888"
+    sign = "+" if var > 0 else ""
+    return f" <span style='color:{color}'>{arrow} {sign}{var:.1f}%</span>"
 
-def _format_reservas_variation(prev: Optional[float], cur: Optional[float]) -> str:
-    if not isinstance(prev, (int, float)) or not isinstance(cur, (int, float)):
-        return ""
-    try:
-        if prev == 0:
-            return ""
-        change = ((float(cur) - float(prev)) / float(prev)) * 100.0
-    except Exception:
-        return ""
-    if abs(change) < 1e-9:
-        return " <span style='color:#888'>➡️ 0,0%</span>"
-    arrow = "⬆️" if change > 0 else "⬇️"
-    color = "#0abf53" if change > 0 else "#d7263d"
-    sign = "+" if change > 0 else "-"
-    pct_val = abs(change)
-    pct_str = f"{pct_val:.1f}%".replace(".", ",")
-    return f" <span style='color:{color}'>{arrow} {sign}{pct_str}</span>"
-
-async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
+async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str], Optional[float]]]:
+    variation: Optional[float] = None
+    prev_val: Optional[float] = None
     for suf in ("/inflacion", "/inflacion/mensual/ultimo", "/inflacion/mensual"):
         j = None
         for base in ARG_DATOS_BASES:
@@ -1638,12 +1494,28 @@ async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float,
         if j: break
     if isinstance(j, list) and j:
         last = j[-1]; val = last.get("valor"); per = last.get("fecha") or last.get("periodo")
+        for prev_item in reversed(j[:-1]):
+            if isinstance(prev_item, dict) and prev_item.get("valor") not in (None, ""):
+                try:
+                    prev_val = float(prev_item.get("valor"))
+                    break
+                except Exception:
+                    prev_val = None
+                    break
     elif isinstance(j, dict):
         val = j.get("valor"); per = j.get("fecha") or j.get("periodo")
     else: return None
     if val is None: return None
-    try: return (float(val), per)
-    except Exception: return None
+    try:
+        val_f = float(val)
+    except Exception:
+        return None
+    if prev_val not in (None, 0):
+        try:
+            variation = ((val_f - prev_val) / prev_val) * 100.0
+        except Exception:
+            variation = None
+    return (val_f, per, variation)
 
 
 def _save_reservas_cache(val: float, fecha: Optional[str], prev_val: Optional[float]) -> None:
@@ -2422,6 +2294,22 @@ def _parse_feed_entries(xml: str) -> List[RawNewsEntry]:
                 out.append((t, l, None, None))
     return out
 
+_IMAGE_LOGO_PATTERNS = [
+    "logo",
+    "favicon",
+    "sprite",
+    "icon",
+    "placeholder",
+    "default",
+    "brand",
+    "header",
+    "print",
+    "google_news",
+    "googlenews",
+    "gn-logo",
+]
+
+
 def _clean_image_url(url: Optional[str], base_url: Optional[str]) -> Optional[str]:
     if not url:
         return None
@@ -2438,6 +2326,45 @@ def _clean_image_url(url: Optional[str], base_url: Optional[str]) -> Optional[st
         return None
     return url
 
+
+def _is_logo_like(url: str) -> bool:
+    low = url.lower()
+    if any(pattern in low for pattern in _IMAGE_LOGO_PATTERNS):
+        return True
+    if re.search(r"/(?:logo|logos|favicon|icons?)/", low):
+        return True
+    if re.search(r"(?:^|[\W_])logo(?:[\W_]|$)", low):
+        return True
+    return False
+
+
+def _extract_json_ld_images(html: str, base_url: Optional[str]) -> List[str]:
+    images: List[str] = []
+    for match in re.finditer(r"<script[^>]+type=['\"]application/ld\+json['\"][^>]*>(.*?)</script>", html, flags=re.I | re.S):
+        try:
+            data = json.loads(match.group(1))
+        except Exception:
+            continue
+
+        def _collect_image(obj: Any) -> None:
+            if isinstance(obj, str):
+                cleaned = _clean_image_url(obj, base_url)
+                if cleaned:
+                    images.append(cleaned)
+            elif isinstance(obj, list):
+                for it in obj:
+                    _collect_image(it)
+            elif isinstance(obj, dict):
+                if "image" in obj:
+                    _collect_image(obj.get("image"))
+                for key in ("thumbnailUrl", "thumbnail", "logo"):
+                    if key in obj:
+                        _collect_image(obj.get(key))
+
+        _collect_image(data)
+    return images
+
+
 def _extract_page_image(html: str, base_url: Optional[str]) -> Optional[str]:
     if not html:
         return None
@@ -2447,17 +2374,33 @@ def _extract_page_image(html: str, base_url: Optional[str]) -> Optional[str]:
         r"<meta[^>]+name=['\"]twitter:image(?::src)?['\"][^>]+content=['\"]([^'\"]+)['\"]",
         r"<link[^>]+rel=['\"]image_src['\"][^>]+href=['\"]([^'\"]+)['\"]",
     ]
+
+    candidates: List[str] = []
+
     for pat in patterns:
-        m = re.search(pat, html, flags=re.I)
-        if m:
+        for m in re.finditer(pat, html, flags=re.I):
             img = _clean_image_url(m.group(1), base_url)
-            if img:
-                return img
+            if img and not _is_logo_like(img):
+                candidates.append(img)
+
+    for json_img in _extract_json_ld_images(html, base_url):
+        if json_img and not _is_logo_like(json_img):
+            candidates.append(json_img)
+
+    if candidates:
+        return candidates[0]
 
     for m in re.finditer(r"<img[^>]+src=['\"]([^'\"]+)['\"][^>]*>", html, flags=re.I):
         img = _clean_image_url(m.group(1), base_url)
-        if img:
-            return img
+        if not img or _is_logo_like(img):
+            continue
+        width_match = re.search(r"width=['\"]?(\d+)", m.group(0), flags=re.I)
+        height_match = re.search(r"height=['\"]?(\d+)", m.group(0), flags=re.I)
+        if width_match and int(width_match.group(1)) < 80:
+            continue
+        if height_match and int(height_match.group(1)) < 80:
+            continue
+        return img
     return None
 
 async def _fallback_image_from_url(session: ClientSession, url: str) -> Optional[str]:
@@ -2590,9 +2533,11 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[News
         fetched = await asyncio.gather(*(_fallback_image_from_url(session, entry[1]) for _, entry in to_fetch))
         enriched: List[NewsItem] = list(items)
         changed = False
+        used_images: Set[str] = {entry[2] for entry in items if len(entry) >= 3 and entry[2]}
         for (idx, entry), img in zip(to_fetch, fetched):
-            if img:
+            if img and img not in used_images:
                 enriched[idx] = (entry[0], entry[1], img)
+                used_images.add(img)
                 changed = True
         return enriched if changed else items
 
@@ -3597,19 +3542,19 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
     inf_txt = fmt_money_ars(banda_inf) if banda_inf is not None else "—"
     var_label = "Variación diaria" if has_daily_data else "Variación"
 
-    def _fmt_var(val: Optional[float]) -> str:
+    def _fmt_var(val: Optional[float], is_upper: bool) -> str:
         if val is None:
             return "—"
         if val > 0:
-            icon = "🟢🔼"
+            icon = "🟢🔼" if is_upper else "🔺"
         elif val < 0:
-            icon = "🔻"
+            icon = "🔻" if is_upper else "🟢🔻"
         else:
             icon = "➡️"
         return f"{icon} {pct(val, 2)}"
 
-    pct_sup_txt = _fmt_var(pct_sup)
-    pct_inf_txt = _fmt_var(pct_inf)
+    pct_sup_txt = _fmt_var(pct_sup, True)
+    pct_inf_txt = _fmt_var(pct_inf, False)
 
     header = "<b>📊 Bandas cambiarias" + (" (solo diaria)" if not has_daily_data else "") + "</b>"
     header += f" <i>Actualizado: {fecha}</i>" if fecha else ""
@@ -3705,8 +3650,10 @@ async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tup is None:
         txt = "No pude obtener inflación ahora."
     else:
-        val, fecha = tup; val_str = str(round(val,1)).replace(".", ",")
-        txt = f"<b>📉 Inflación Mensual</b>{f' <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>"
+        val, fecha, variation = (tup + (None, None, None))[:3]
+        val_str = str(round(val,1)).replace(".", ",")
+        change_txt = _format_inflacion_variation(variation)
+        txt = f"<b>📉 Inflación Mensual</b>{f' <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>{change_txt}"
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
