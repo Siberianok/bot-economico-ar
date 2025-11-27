@@ -552,6 +552,7 @@ ALERT_USAGE: Dict[int, Dict[str, Dict[str, Any]]] = {}
 NEWS_HISTORY: List[Tuple[str, float]] = []
 NEWS_CACHE: Dict[str, Any] = {"date": "", "items": []}
 RIESGO_CACHE: Dict[str, Any] = {}
+RESERVAS_CACHE: Dict[str, Any] = {}
 
 _REDIS_CLIENT: Optional[Any] = None
 _REDIS_CLIENT_INITIALIZED = False
@@ -689,7 +690,7 @@ def _save_state_to_redis(payload: Dict[str, Any]) -> bool:
 
 
 async def load_state():
-    global ALERTS, SUBS, PF, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE, RIESGO_CACHE
+    global ALERTS, SUBS, PF, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE, RIESGO_CACHE, RESERVAS_CACHE
     data: Optional[Dict[str, Any]] = None
     if USE_UPSTASH:
         data = await _load_state_from_upstash()
@@ -745,6 +746,30 @@ async def load_state():
                 RIESGO_CACHE = {}
         else:
             RIESGO_CACHE = {}
+
+        cache_reservas = data.get("reservas_cache")
+        if isinstance(cache_reservas, dict) and cache_reservas.get("val") is not None:
+            try:
+                cache_val = float(cache_reservas.get("val"))
+                cache_prev = cache_reservas.get("prev_val")
+                cache_prev_val = float(cache_prev) if cache_prev is not None else None
+                cache_fecha = (
+                    str(cache_reservas.get("fecha"))
+                    if cache_reservas.get("fecha") is not None
+                    else None
+                )
+                cache_ts_raw = cache_reservas.get("updated_at")
+                cache_ts = float(cache_ts_raw) if cache_ts_raw is not None else None
+                RESERVAS_CACHE = {
+                    "val": cache_val,
+                    "prev_val": cache_prev_val,
+                    "fecha": cache_fecha,
+                    "updated_at": cache_ts,
+                }
+            except Exception:
+                RESERVAS_CACHE = {}
+        else:
+            RESERVAS_CACHE = {}
         log.info(
             "State loaded. alerts=%d subs=%d pf=%d",
             sum(len(v) for v in ALERTS.values()),
@@ -772,6 +797,7 @@ async def save_state():
         "news_cache_date": NEWS_CACHE.get("date", ""),
         "news_cache_items": NEWS_CACHE.get("items", []),
         "riesgo_cache": RIESGO_CACHE,
+        "reservas_cache": RESERVAS_CACHE,
     }
     if USE_UPSTASH:
         await _save_state_to_upstash(payload)
@@ -1491,6 +1517,22 @@ async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float,
             variation = None
     return (val_f, per, variation)
 
+
+def _save_reservas_cache(val: float, fecha: Optional[str], prev_val: Optional[float]) -> None:
+    global RESERVAS_CACHE
+    new_cache = {
+        "val": val,
+        "prev_val": prev_val,
+        "fecha": fecha,
+        "updated_at": time(),
+    }
+    if RESERVAS_CACHE != new_cache:
+        RESERVAS_CACHE = new_cache
+        try:
+            asyncio.create_task(save_state())
+        except Exception:
+            pass
+
 async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
     html = await fetch_text(session, LAMACRO_RESERVAS_URL)
     if not html: return None
@@ -1502,6 +1544,35 @@ async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, 
     except Exception: return None
     fecha = m_date.group(1) if m_date else None
     return (val, fecha)
+
+
+async def get_reservas_con_variacion(
+    session: ClientSession,
+) -> Optional[Tuple[float, Optional[str], Optional[float]]]:
+    global RESERVAS_CACHE
+    res = await get_reservas_lamacro(session)
+    if not res:
+        return None
+    val, fecha = res
+    try:
+        cur_val = float(val)
+    except Exception:
+        return None
+    cached_val = RESERVAS_CACHE.get("val") if isinstance(RESERVAS_CACHE, dict) else None
+    cached_prev = RESERVAS_CACHE.get("prev_val") if isinstance(RESERVAS_CACHE, dict) else None
+    prev_val: Optional[float] = None
+    if isinstance(cached_val, (int, float)):
+        try:
+            prev_val = float(cached_val)
+        except Exception:
+            prev_val = None
+    elif isinstance(cached_prev, (int, float)):
+        try:
+            prev_val = float(cached_prev)
+        except Exception:
+            prev_val = None
+    _save_reservas_cache(cur_val, fecha, prev_val)
+    return (cur_val, fecha, prev_val)
 
 # ============================ RAVA ============================
 
@@ -3563,13 +3634,14 @@ async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
-        res = await get_reservas_lamacro(session)
+        res = await get_reservas_con_variacion(session)
     if not res:
         txt = "No pude obtener reservas ahora."
     else:
-        val, fecha = res
+        val, fecha, prev_val = res
+        var_txt = _format_reservas_variation(prev_val, val)
         txt = (f"<b>🏦 Reservas BCRA</b>{f' <i>Últ. Act.: {fecha}</i>' if fecha else ''}\n"
-               f"<b>{fmt_number(val,0)} MUS$</b>")
+               f"<b>{fmt_number(val,0)} MUS$</b>{var_txt}")
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
