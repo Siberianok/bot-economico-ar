@@ -1446,7 +1446,17 @@ def _format_riesgo_variation(var: Optional[float]) -> str:
     sign = "" if var < 0 else "+" if var > 0 else ""
     return f" <span style='color:{color}'>{arrow} {sign}{var:.2f}%</span>"
 
-async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
+def _format_inflacion_variation(var: Optional[float]) -> str:
+    if not isinstance(var, (int, float)):
+        return " —"
+    arrow = "⬆️" if var > 0 else "⬇️" if var < 0 else "➡️"
+    color = "#0abf53" if var > 0 else "#d7263d" if var < 0 else "#888"
+    sign = "+" if var > 0 else ""
+    return f" <span style='color:{color}'>{arrow} {sign}{var:.1f}%</span>"
+
+async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str], Optional[float]]]:
+    variation: Optional[float] = None
+    prev_val: Optional[float] = None
     for suf in ("/inflacion", "/inflacion/mensual/ultimo", "/inflacion/mensual"):
         j = None
         for base in ARG_DATOS_BASES:
@@ -1458,12 +1468,28 @@ async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float,
         if j: break
     if isinstance(j, list) and j:
         last = j[-1]; val = last.get("valor"); per = last.get("fecha") or last.get("periodo")
+        for prev_item in reversed(j[:-1]):
+            if isinstance(prev_item, dict) and prev_item.get("valor") not in (None, ""):
+                try:
+                    prev_val = float(prev_item.get("valor"))
+                    break
+                except Exception:
+                    prev_val = None
+                    break
     elif isinstance(j, dict):
         val = j.get("valor"); per = j.get("fecha") or j.get("periodo")
     else: return None
     if val is None: return None
-    try: return (float(val), per)
-    except Exception: return None
+    try:
+        val_f = float(val)
+    except Exception:
+        return None
+    if prev_val not in (None, 0):
+        try:
+            variation = ((val_f - prev_val) / prev_val) * 100.0
+        except Exception:
+            variation = None
+    return (val_f, per, variation)
 
 async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
     html = await fetch_text(session, LAMACRO_RESERVAS_URL)
@@ -3552,8 +3578,10 @@ async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if tup is None:
         txt = "No pude obtener inflación ahora."
     else:
-        val, fecha = tup; val_str = str(round(val,1)).replace(".", ",")
-        txt = f"<b>📉 Inflación Mensual</b>{f' <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>"
+        val, fecha, variation = (tup + (None, None, None))[:3]
+        val_str = str(round(val,1)).replace(".", ",")
+        change_txt = _format_inflacion_variation(variation)
+        txt = f"<b>📉 Inflación Mensual</b>{f' <i>{fecha}</i>' if fecha else ''}\n<b>{val_str}%</b>{change_txt}"
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
