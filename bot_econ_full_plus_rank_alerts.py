@@ -3446,22 +3446,6 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
 
     banda_sup = _fmt_band_val(data, ["banda_superior", "upper", "upperBand", "bandaSuperior"])
     banda_inf = _fmt_band_val(data, ["banda_inferior", "lower", "lowerBand", "bandaInferior"])
-    monthly_sup = _fmt_band_pct(
-        data,
-        [
-            "variacion_mensual_superior",
-            "upperMonthlyVariation",
-            "upper_monthly_variation",
-        ],
-    )
-    monthly_inf = _fmt_band_pct(
-        data,
-        [
-            "variacion_mensual_inferior",
-            "lowerMonthlyVariation",
-            "lower_monthly_variation",
-        ],
-    )
     daily_sup = _fmt_band_pct(
         data,
         [
@@ -3493,22 +3477,51 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
             "dailyChange",
         ],
     )
-    pct_sup = monthly_sup
-    pct_inf = monthly_inf
-    using_monthly = (monthly_sup is not None) or (monthly_inf is not None)
+    monthly_sup = _fmt_band_pct(
+        data,
+        [
+            "variacion_mensual_superior",
+            "upperMonthlyVariation",
+            "upper_monthly_variation",
+        ],
+    )
+    monthly_inf = _fmt_band_pct(
+        data,
+        [
+            "variacion_mensual_inferior",
+            "lowerMonthlyVariation",
+            "lower_monthly_variation",
+        ],
+    )
+
+    pct_sup = daily_sup if daily_sup is not None else daily_generic
+    pct_inf = daily_inf if daily_inf is not None else daily_generic
+    has_daily_data = (pct_sup is not None) or (pct_inf is not None)
 
     if pct_sup is None:
-        pct_sup = daily_sup if daily_sup is not None else daily_generic
+        pct_sup = monthly_sup
     if pct_inf is None:
-        pct_inf = daily_inf if daily_inf is not None else daily_generic
+        pct_inf = monthly_inf
 
     sup_txt = fmt_money_ars(banda_sup) if banda_sup is not None else "—"
     inf_txt = fmt_money_ars(banda_inf) if banda_inf is not None else "—"
-    pct_sup_txt = pct(pct_sup, 2) if pct_sup is not None else "—"
-    pct_inf_txt = pct(pct_inf, 2) if pct_inf is not None else "—"
+    var_label = "Variación diaria" if has_daily_data else "Variación"
 
-    var_label = "Variación mensual" if using_monthly else "Variación diaria"
-    header = "<b>📊 Bandas cambiarias" + (" (solo diaria)" if not using_monthly else "") + "</b>"
+    def _fmt_var(val: Optional[float]) -> str:
+        if val is None:
+            return "—"
+        if val > 0:
+            icon = "🟢🔼"
+        elif val < 0:
+            icon = "🔻"
+        else:
+            icon = "➡️"
+        return f"{icon} {pct(val, 2)}"
+
+    pct_sup_txt = _fmt_var(pct_sup)
+    pct_inf_txt = _fmt_var(pct_inf)
+
+    header = "<b>📊 Bandas cambiarias" + (" (solo diaria)" if not has_daily_data else "") + "</b>"
     header += f" <i>Actualizado: {fecha}</i>" if fecha else ""
 
     col1 = ["Banda superior", "Banda inferior"]
@@ -3526,12 +3539,9 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
 
     table = "\n".join(rows)
 
-    fuente = data.get("fuente") or "DolarAPI"
-
     lines = [
         header,
         f"<pre>Nombre           | Importe | {var_label}\n" + table + "</pre>",
-        f"<i>Fuente: {fuente}</i>",
     ]
     return "\n".join(lines)
 
