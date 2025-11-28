@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, time as dtime
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable, Iterable
 from urllib.parse import urlparse, quote, parse_qs, urljoin
+import httpx
 
 # ====== matplotlib opcional (no rompe si no está instalado) ======
 HAS_MPL = False
@@ -951,6 +952,24 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
         log.warning("fetch_json error %s: %s", url, e)
     return None
 
+
+async def fetch_json_httpx(url: str, **kwargs) -> Optional[Dict[str, Any]]:
+    try:
+        timeout = kwargs.pop("timeout", 15)
+        headers = kwargs.pop("headers", {})
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            headers={**REQ_HEADERS, **headers},
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(url, **kwargs)
+            if 200 <= resp.status_code < 300:
+                return resp.json()
+            log.warning("httpx GET %s -> %s", url, resp.status_code)
+    except Exception as e:
+        log.warning("fetch_json_httpx error %s: %s", url, e)
+    return None
+
 async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str]:
     try:
         timeout = kwargs.pop("timeout", ClientTimeout(total=15))
@@ -1489,7 +1508,10 @@ async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float,
     for suf in ("/inflacion", "/inflacion/mensual/ultimo", "/inflacion/mensual"):
         j = None
         for base in ARG_DATOS_BASES:
-            j = await fetch_json(session, base + suf)
+            url = base + suf
+            j = await fetch_json_httpx(url)
+            if not j:
+                j = await fetch_json(session, url)
             if j:
                 if isinstance(j, dict) and "serie" in j and isinstance(j["serie"], list) and j["serie"]:
                     j = j["serie"]
