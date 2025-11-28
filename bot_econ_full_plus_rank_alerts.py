@@ -545,6 +545,32 @@ def metric_last_price(metrics: Dict[str, Any]) -> Optional[float]:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("bot-econ-ar")
 
+
+# ============================ ERRORES ============================
+
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error = context.error
+
+    if isinstance(error, asyncio.CancelledError):
+        return
+
+    try:
+        update_repr = repr(update)
+    except Exception:
+        update_repr = "<update no serializable>"
+
+    log.error("Excepción no manejada (update=%s)", update_repr, exc_info=error)
+
+    try:
+        chat = getattr(update, "effective_chat", None)
+        if chat:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="Ocurrió un error inesperado. Intentalo de nuevo en unos minutos.",
+            )
+    except Exception as notify_error:
+        log.debug("No se pudo notificar el error al chat: %s", notify_error)
+
 # ============================ PERSISTENCIA ============================
 
 def _writable_path(candidate: str) -> str:
@@ -7876,6 +7902,8 @@ def build_application() -> Application:
 
     # Resumen diario on-demand
     app.add_handler(CommandHandler("resumen", cmd_resumen_diario))
+
+    app.add_error_handler(handle_error)
 
     return app
 
