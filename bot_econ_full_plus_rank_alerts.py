@@ -1341,9 +1341,6 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
     variation: Optional[float] = None
     from_cache = False
 
-    def _result_ready() -> bool:
-        return val is not None and variation is not None
-
     def _save_riesgo_cache(v: int, f: Optional[str], var: Optional[float]) -> None:
         global RIESGO_CACHE
         new_cache = {
@@ -1359,22 +1356,6 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
             except Exception:
                 pass
 
-    # 1) Dolarito (fuente principal)
-    dolarito_data = await fetch_json(session, DOLARITO_RIESGO_API, headers=REQ_HEADERS)
-
-    def _dolarito_get(paths: Iterable[Tuple[str, ...]], source: Any) -> Any:
-        for path in paths:
-            current: Any = source
-            for key in path:
-                if isinstance(current, dict) and key in current:
-                    current = current.get(key)
-                else:
-                    current = None
-                    break
-            if current is not None:
-                return current
-        return None
-
     def _safe_number(raw: Any) -> Optional[float]:
         try:
             num = float(raw)
@@ -1382,113 +1363,68 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
         except (TypeError, ValueError):
             return None
 
-    if isinstance(dolarito_data, dict):
-        val_raw = _dolarito_get(
-            (
-                ("valor",),
-                ("value",),
-                ("ultimo",),
-                ("last",),
-                ("data", "valor"),
-                ("data", "value"),
-                ("data", "ultimo"),
-                ("data", "last"),
-            ),
-            dolarito_data,
-        )
-        parsed_val = _safe_number(val_raw)
+    def _extract_field(data: Any, keys: Iterable[str]) -> Optional[Any]:
+        if isinstance(data, dict):
+            for k, v in data.items():
+                if str(k).lower() in keys and v is not None:
+                    return v
+                res = _extract_field(v, keys)
+                if res is not None:
+                    return res
+        elif isinstance(data, list):
+            for item in data:
+                res = _extract_field(item, keys)
+                if res is not None:
+                    return res
+        return None
+
+    def _parse_json_payload(payload: Any) -> None:
+        nonlocal val, fecha, variation
+        parsed_val = _safe_number(_extract_field(payload, {"valor", "value", "ultimo", "last"}))
         if parsed_val is not None:
             val = parsed_val
-
-        fecha_raw = _dolarito_get(
-            (("fecha",), ("updatedAt",), ("data", "fecha"), ("data", "updatedAt")),
-            dolarito_data,
-        )
-        if fecha_raw:
-            fecha = str(fecha_raw)
-
-        prev_val = _safe_number(
-            _dolarito_get(
-                (
-                    ("valorAnterior",),
-                    ("previous",),
-                    ("prev",),
-                    ("anterior",),
-                    ("data", "valorAnterior"),
-                    ("data", "previous"),
-                    ("data", "prev"),
-                    ("data", "anterior"),
-                ),
-                dolarito_data,
-            )
-        )
-        if prev_val not in (None, 0) and val is not None:
+        fetched_fecha = _extract_field(payload, {"fecha", "updatedat", "lastUpdated"})
+        if fetched_fecha:
+            fecha = str(fetched_fecha)
+        prev_val = _safe_number(_extract_field(payload, {"anterior", "previous", "prev", "valoranterior"}))
+        if prev_val not in (None, 0) and val is not None and variation is None:
             try:
                 variation = ((val - prev_val) / prev_val) * 100.0
             except Exception:
                 variation = None
+        direct_var = _safe_number(_extract_field(payload, {"variacion", "variation", "cambio"}))
+        if direct_var is not None:
+            variation = direct_var
 
-    if val is None:
-        html = await fetch_text(session, DOLARITO_RIESGO_HTML, headers=REQ_HEADERS)
-        if html:
-            stripped = re.sub(r"<[^>]+>", " ", html)
-            stripped = " ".join(stripped.split())
-            m_val = re.search(r"Riesgo\s+pa[ií]s[^\d]{0,8}(\d{3,5})", stripped, flags=re.I)
-            if m_val:
-                try:
-                    val = float(m_val.group(1))
-                except Exception:
-                    val = None
+    html = await fetch_text(session, DOLARITO_RIESGO_HTML, headers=REQ_HEADERS)
+    build_id: Optional[str] = None
+    if html:
+        m_build = re.search(r"<!--([A-Za-z0-9]{10,})-->", html)
+        if m_build:
+            build_id = m_build.group(1)
+
+    if build_id:
+        json_url = f"https://www.dolarito.ar/_next/data/{build_id}/indices/riesgo-pais.json"
+        payload = await fetch_json(session, json_url, headers=REQ_HEADERS)
+        if isinstance(payload, dict):
+            _parse_json_payload(payload)
+
+    if (val is None or variation is None) and html:
+        stripped = re.sub(r"<[^>]+>", " ", html)
+        stripped = " ".join(stripped.split())
+        m_val = re.search(r"Riesgo\s+pa[ií]s[^\d]{0,10}(\d{3,5})", stripped, flags=re.I)
+        if m_val:
+            try:
+                val = float(m_val.group(1))
+            except Exception:
+                val = None
+        if variation is None:
             m_var = re.search(r"([+\-]?\d+[\.,]\d+)%", stripped)
             if m_var:
                 try:
                     variation = float(m_var.group(1).replace(",", "."))
                 except Exception:
                     variation = variation
-
-    if _result_ready():
-        try:
-            rounded = int(round(val))
-            _save_riesgo_cache(rounded, fecha, variation)
-            return (rounded, fecha, variation, from_cache)
-        except Exception:
-            val = fecha = variation = None
-
-    # 2) ArgentinaDatos (respaldo ligero)
-    if val is None or variation is None:
-        for base in ARG_DATOS_BASES:
-            history: List[Dict[str, Any]] = []
-            for suf in ("/riesgo-pais/", "/riesgo-pais/ultimo/", "/riesgo-pais/ultimo"):
-                j = await fetch_json(session, base + suf)
-                if not j:
-                    continue
-                if isinstance(j, list):
-                    history = [row for row in j if isinstance(row, dict)]
-                elif isinstance(j, dict):
-                    history = [j]
-                if history:
-                    break
-            if not history:
-                continue
-
-            last = history[-1]
-            prev = history[-2] if len(history) > 1 else None
-            try:
-                raw_val = last.get("valor")
-                if val is None and raw_val is not None:
-                    val = float(raw_val)
-            except (TypeError, ValueError):
-                val = val if val is not None else None
-            fecha = str(last.get("fecha")) if last.get("fecha") and not fecha else fecha
-            if prev and variation is None and val is not None:
-                try:
-                    prev_val = float(prev.get("valor")) if prev.get("valor") is not None else None
-                    if prev_val not in (None, 0):
-                        variation = ((val - prev_val) / prev_val) * 100.0
-                except (TypeError, ValueError):
-                    variation = variation
-            if val is not None and variation is not None:
-                break
 
     if val is None:
         cache_val = RIESGO_CACHE.get("val") if isinstance(RIESGO_CACHE, dict) else None
