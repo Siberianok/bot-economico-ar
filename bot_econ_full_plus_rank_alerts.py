@@ -639,6 +639,13 @@ def _writable_path(candidate: str) -> str:
             )
             return fallback
 
+
+def _ensure_state_path() -> Optional[str]:
+    try:
+        return _writable_path(STATE_PATH)
+    except Exception:
+        return None
+
 USE_UPSTASH = bool(UPSTASH_URL and UPSTASH_TOKEN)
 USE_UPSTASH_REDIS = bool(UPSTASH_REDIS_URL)
 STATE_PATH = ensure_writable_path(ENV_STATE_PATH, log)
@@ -708,11 +715,14 @@ async def load_state():
                     extra={"event": "persistence_failure", "path": path, "error": str(e)},
                 )
                 data = None
+    version = CURRENT_STATE_VERSION
     if data:
+        version = data.get("version", CURRENT_STATE_VERSION)
         ALERTS = {int(k): v for k, v in data.get("alerts", {}).items()}
         SUBS = {int(k): v for k, v in data.get("subs", {}).items()}
         PF = {int(k): v for k, v in data.get("pf", {}).items()}
         ALERT_USAGE = {int(k): v for k, v in data.get("alert_usage", {}).items()}
+
         raw_history = data.get("news_history", [])
         if isinstance(raw_history, list):
             NEWS_HISTORY = []
@@ -726,89 +736,78 @@ async def load_state():
                 except Exception:
                     continue
                 NEWS_HISTORY.append((stem_str, ts_val))
+
         cache_date = data.get("news_cache_date")
         cache_items = data.get("news_cache_items")
         if isinstance(cache_items, list) and isinstance(cache_date, str):
             NEWS_CACHE = {"date": cache_date, "items": cache_items}
         else:
             NEWS_CACHE = {"date": "", "items": []}
+
         cache_riesgo = data.get("riesgo_cache")
         if isinstance(cache_riesgo, dict) and cache_riesgo.get("val") is not None:
             try:
-                stem_str = str(stem)
-                ts_val = float(ts)
+                cache_val = int(cache_riesgo.get("val"))
+                cache_fecha = (
+                    str(cache_riesgo.get("fecha")) if cache_riesgo.get("fecha") is not None else None
+                )
+                cache_var = (
+                    float(cache_riesgo.get("variation")) if cache_riesgo.get("variation") is not None else None
+                )
+                cache_ts_raw = cache_riesgo.get("updated_at")
+                cache_ts = float(cache_ts_raw) if cache_ts_raw is not None else None
+                RIESGO_CACHE = {
+                    "val": cache_val,
+                    "fecha": cache_fecha,
+                    "variation": cache_var,
+                    "updated_at": cache_ts,
+                }
             except Exception:
-                continue
-            NEWS_HISTORY.append((stem_str, ts_val))
-    cache_date = payload.get("news_cache_date")
-    cache_items = payload.get("news_cache_items")
-    if isinstance(cache_items, list) and isinstance(cache_date, str):
-        NEWS_CACHE = {"date": cache_date, "items": cache_items}
-    else:
-        NEWS_CACHE = {"date": "", "items": []}
-    cache_riesgo = payload.get("riesgo_cache")
-    if isinstance(cache_riesgo, dict) and cache_riesgo.get("val") is not None:
-        try:
-            cache_val = int(cache_riesgo.get("val"))
-            cache_fecha = str(cache_riesgo.get("fecha")) if cache_riesgo.get("fecha") is not None else None
-            cache_var = float(cache_riesgo.get("variation")) if cache_riesgo.get("variation") is not None else None
-            cache_ts_raw = cache_riesgo.get("updated_at")
-            cache_ts = float(cache_ts_raw) if cache_ts_raw is not None else None
-            RIESGO_CACHE = {
-                "val": cache_val,
-                "fecha": cache_fecha,
-                "variation": cache_var,
-                "updated_at": cache_ts,
-            }
-        except Exception:
+                RIESGO_CACHE = {}
+        else:
             RIESGO_CACHE = {}
-    else:
-        RIESGO_CACHE = {}
 
-    cache_reservas = payload.get("reservas_cache")
-    if isinstance(cache_reservas, dict) and cache_reservas.get("val") is not None:
-        try:
-            cache_val = float(cache_reservas.get("val"))
-            cache_prev = cache_reservas.get("prev_val")
-            cache_prev_val = float(cache_prev) if cache_prev is not None else None
-            cache_fecha = (
-                str(cache_reservas.get("fecha"))
-                if cache_reservas.get("fecha") is not None
-                else None
-            )
-            cache_ts_raw = cache_reservas.get("updated_at")
-            cache_ts = float(cache_ts_raw) if cache_ts_raw is not None else None
-            RESERVAS_CACHE = {
-                "val": cache_val,
-                "prev_val": cache_prev_val,
-                "fecha": cache_fecha,
-                "updated_at": cache_ts,
-            }
-        except Exception:
+        cache_reservas = data.get("reservas_cache")
+        if isinstance(cache_reservas, dict) and cache_reservas.get("val") is not None:
+            try:
+                cache_val = float(cache_reservas.get("val"))
+                cache_prev = cache_reservas.get("prev_val")
+                cache_prev_val = float(cache_prev) if cache_prev is not None else None
+                cache_fecha = (
+                    str(cache_reservas.get("fecha")) if cache_reservas.get("fecha") is not None else None
+                )
+                cache_ts_raw = cache_reservas.get("updated_at")
+                cache_ts = float(cache_ts_raw) if cache_ts_raw is not None else None
+                RESERVAS_CACHE = {
+                    "val": cache_val,
+                    "prev_val": cache_prev_val,
+                    "fecha": cache_fecha,
+                    "updated_at": cache_ts,
+                }
+            except Exception:
+                RESERVAS_CACHE = {}
+        else:
             RESERVAS_CACHE = {}
-    else:
-        RESERVAS_CACHE = {}
 
-    cache_dolar = payload.get("dolar_cache")
-    version = payload.get("version", CURRENT_STATE_VERSION)
-    if isinstance(cache_dolar, dict):
-        cached_data = cache_dolar.get("data") if isinstance(cache_dolar.get("data"), dict) else None
-        ts_raw = cache_dolar.get("updated_at")
-        try:
-            ts_val = float(ts_raw) if ts_raw is not None else None
-        except Exception:
-            ts_val = None
+        cache_dolar = data.get("dolar_cache")
+        if isinstance(cache_dolar, dict):
+            cached_data = cache_dolar.get("data") if isinstance(cache_dolar.get("data"), dict) else None
+            ts_raw = cache_dolar.get("updated_at")
+            try:
+                ts_val = float(ts_raw) if ts_raw is not None else None
+            except Exception:
+                ts_val = None
 
-        if cached_data and any(
-            isinstance(v, dict) and (v.get("compra") is not None or v.get("venta") is not None)
-            for v in cached_data.values()
-        ):
-            DOLAR_CACHE = {"data": cached_data, "updated_at": ts_val}
+            if cached_data and any(
+                isinstance(v, dict) and (v.get("compra") is not None or v.get("venta") is not None)
+                for v in cached_data.values()
+            ):
+                DOLAR_CACHE = {"data": cached_data, "updated_at": ts_val}
+            else:
+                DOLAR_CACHE = {}
         else:
             DOLAR_CACHE = {}
-    else:
-        DOLAR_CACHE = {}
-    if data:
+
         log.info(
             "State loaded (v%s). alerts=%d subs=%d pf=%d",
             version,
@@ -845,6 +844,10 @@ async def save_state():
     )
     stored = await STATE_STORE.save(payload)
     if stored or FALLBACK_STATE_STORE is None:
+        return
+    path = _ensure_state_path()
+    if not path:
+        log.error("No path available to persist state locally", extra={"event": "persistence_failure"})
         return
     try:
         with open(path, "w", encoding="utf-8") as f:
@@ -957,17 +960,24 @@ def parse_iso_ddmmyyyy(s: Optional[str]) -> Optional[str]:
 async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dict[str, Any]]:
     started = time()
     host = urlparse(url).netloc
+    timeout = kwargs.pop("timeout", ClientTimeout(total=12))
+    headers = kwargs.pop("headers", {})
+    source = kwargs.pop("source", None)
+    http_timeout = timeout.total if isinstance(timeout, ClientTimeout) else timeout
     try:
-        return await http_service.get_json(url, source=source, headers=headers, **kwargs)
+        return await http_service.get_json(
+            url, source=source, headers={**REQ_HEADERS, **headers}, timeout=http_timeout, **kwargs
+        )
     except SourceSuspendedError as exc:
         log.warning(
             "source_suspended source=%s resume_at=%s url=%s",
             exc.source,
             exc.resume_at,
             url,
-            timeout=timeout,
-            headers={**REQ_HEADERS, **headers},
-            **kwargs,
+        )
+    try:
+        async with session.get(
+            url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs
         ) as resp:
             if 200 <= resp.status < 300:
                 payload = await resp.json(content_type=None)
