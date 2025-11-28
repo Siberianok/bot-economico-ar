@@ -1203,7 +1203,10 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
 
     def _safe_float(val: Any) -> Optional[float]:
         try:
-            return float(val) if val is not None else None
+            num = float(val) if val is not None else None
+            if num is None or not math.isfinite(num):
+                return None
+            return num
         except Exception:
             return None
 
@@ -1279,8 +1282,20 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
             or (data[k].get("compra") is None and data[k].get("venta") is None)
             or not data[k].get("fecha")
         )
-        if needs_fallback:
+        async def _fetch_with_history() -> Tuple[Optional[float], Optional[float], Optional[str]]:
             c, v, fecha = await dolarapi(path)
+            if c is not None or v is not None:
+                return c, v, fecha
+
+            for date_str in prev_dates:
+                c_prev, v_prev, fecha_prev = await dolarapi(path, date_str)
+                if c_prev is not None or v_prev is not None:
+                    return c_prev, v_prev, fecha_prev
+
+            return None, None, None
+
+        if needs_fallback:
+            c, v, fecha = await _fetch_with_history()
             if c is not None or v is not None:
                 data[k] = {"compra": c, "venta": v, "fuente": "DolarAPI", "fecha": fecha}
             elif k in data and fecha:
@@ -1331,20 +1346,66 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
     for k, path in mapping.items():
         await _update_variation(k, path)
 
-    oficial = data.get("oficial") or {}
-    tarjeta = data.get("tarjeta") or {}
+    def _normalize_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        compra = _safe_float(row.get("compra"))
+        venta = _safe_float(row.get("venta"))
+        variation = _safe_float(row.get("variation"))
+        fecha = row.get("fecha")
+
+        if compra is None and venta is not None:
+            compra = venta
+        if venta is None and compra is not None:
+            venta = compra
+        if compra is None and venta is None:
+            return None
+
+        normalized = {
+            "compra": compra,
+            "venta": venta,
+            "fuente": row.get("fuente"),
+            "fecha": fecha,
+        }
+        if variation is not None:
+            normalized["variation"] = variation
+        return normalized
+
+    cached_data = DOLAR_CACHE.get("data") if isinstance(DOLAR_CACHE, dict) else None
+    merged: Dict[str, Dict[str, Any]] = {}
+    keys = set(data.keys()) | (set(cached_data.keys()) if isinstance(cached_data, dict) else set())
+
+    for k in keys:
+        fresh = _normalize_row(data.get(k, {})) if data.get(k) else None
+        cached = _normalize_row(cached_data.get(k, {})) if isinstance(cached_data, dict) else None
+
+        if fresh is None and cached is None:
+            continue
+        if fresh is None:
+            merged[k] = cached  # type: ignore[assignment]
+            continue
+        row = fresh.copy()
+        if cached:
+            if row.get("compra") is None and cached.get("compra") is not None:
+                row["compra"] = cached["compra"]
+            if row.get("venta") is None and cached.get("venta") is not None:
+                row["venta"] = cached["venta"]
+            if row.get("fecha") is None and cached.get("fecha") is not None:
+                row["fecha"] = cached["fecha"]
+            if row.get("variation") is None and cached.get("variation") is not None:
+                row["variation"] = cached["variation"]
+            if row.get("fuente") is None and cached.get("fuente") is not None:
+                row["fuente"] = cached["fuente"]
+        merged[k] = row
 
     # Tipos de cambio especiales (promedio bancos, Qatar) ya no se calculan
     # aquí para simplificar el panel principal.
-    if _has_fx_data(data):
-        _save_dolar_cache(data)
-        return data
+    if _has_fx_data(merged):
+        _save_dolar_cache(merged)
+        return merged
 
-    cached_data = DOLAR_CACHE.get("data") if isinstance(DOLAR_CACHE, dict) else None
     if isinstance(cached_data, dict) and _has_fx_data(cached_data):
         return cached_data
 
-    return data
+    return merged
 
 async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
     if not tc_name: return None
@@ -3520,7 +3581,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with ClientSession() as session:
         data = await get_dolares(session)
-    if not data:
+    if not data or not _has_fx_data(data):
         await update.effective_message.reply_text(
             "No pude obtener cotizaciones ahora.",
             parse_mode=ParseMode.HTML,
