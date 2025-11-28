@@ -1945,24 +1945,21 @@ from xml.etree import ElementTree as ET
 NewsItem = Tuple[str, str, Optional[str]]
 RawNewsEntry = Tuple[str, str, Optional[str], Optional[str]]
 RSS_FEEDS = [
-    # Google News queries acotadas a Argentina y a las últimas 24hs.
-    "https://news.google.com/rss/search?q=econom%C3%ADa+argentina+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
-    "https://news.google.com/rss/search?q=finanzas+argentinas+OR+mercados+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
-    "https://news.google.com/rss/search?q=empresas+argentina+OR+negocios+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
-    "https://news.google.com/rss/search?q=inflaci%C3%B3n+argentina+OR+bcra+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
-    "https://news.google.com/rss/search?q=bancos+argentinos+OR+creditos+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
-    "https://news.google.com/rss/search?q=exportaciones+importaciones+argentina+when:1d&hl=es-419&gl=AR&ceid=AR:es-419",
+    # Fuentes nacionales directas para evitar links de Google News.
+    "https://www.clarin.com/rss/economia/",
+    "https://www.ambito.com/rss/pages/economia.xml",
+    "https://www.cronista.com/rss/economiapolitica/",
+    "https://www.iprofesional.com/rss/economia",
+    "https://www.perfil.com/feed/economia",
 ]
 
-# Fuentes extendidas (más sitios nacionales y ventana de 48h) que se consultan
-# de manera incremental cuando faltan notas relevantes en las fuentes
-# principales.
+# Fuentes extendidas (más sitios nacionales) que se consultan de manera
+# incremental cuando faltan notas relevantes en las fuentes principales.
 RSS_FEEDS_EXTENDED = [
-    "https://news.google.com/rss/search?q=site:cronista.com+OR+site:ambito.com+economia+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
-    "https://news.google.com/rss/search?q=site:infobae.com/economia+OR+site:iprofesional.com/economia+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
-    "https://news.google.com/rss/search?q=mercados+argentinos+OR+merval+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
-    "https://news.google.com/rss/search?q=inflacion+argentina+OR+actividad+economica+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
-    "https://news.google.com/rss/search?q=deuda+argentina+OR+bonos+when:2d&hl=es-419&gl=AR&ceid=AR:es-419",
+    "https://www.clarin.com/rss/mundo/",
+    "https://www.cronista.com/rss/finanzas-mercados/",
+    "https://www.pagina12.com.ar/rss/economia/",
+    "https://www.telam.com.ar/rss2/economia.xml",
 ]
 NATIONAL_NEWS_DOMAINS: Set[str] = {
     "ambito.com",
