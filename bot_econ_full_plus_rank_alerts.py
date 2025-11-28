@@ -553,6 +553,7 @@ NEWS_HISTORY: List[Tuple[str, float]] = []
 NEWS_CACHE: Dict[str, Any] = {"date": "", "items": []}
 RIESGO_CACHE: Dict[str, Any] = {}
 RESERVAS_CACHE: Dict[str, Any] = {}
+DOLAR_CACHE: Dict[str, Any] = {}
 
 _REDIS_CLIENT: Optional[Any] = None
 _REDIS_CLIENT_INITIALIZED = False
@@ -690,7 +691,7 @@ def _save_state_to_redis(payload: Dict[str, Any]) -> bool:
 
 
 async def load_state():
-    global ALERTS, SUBS, PF, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE, RIESGO_CACHE, RESERVAS_CACHE
+    global ALERTS, SUBS, PF, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE, RIESGO_CACHE, RESERVAS_CACHE, DOLAR_CACHE
     data: Optional[Dict[str, Any]] = None
     if USE_UPSTASH:
         data = await _load_state_from_upstash()
@@ -770,6 +771,25 @@ async def load_state():
                 RESERVAS_CACHE = {}
         else:
             RESERVAS_CACHE = {}
+
+        cache_dolar = data.get("dolar_cache")
+        if isinstance(cache_dolar, dict):
+            cached_data = cache_dolar.get("data") if isinstance(cache_dolar.get("data"), dict) else None
+            ts_raw = cache_dolar.get("updated_at")
+            try:
+                ts_val = float(ts_raw) if ts_raw is not None else None
+            except Exception:
+                ts_val = None
+
+            if cached_data and any(
+                isinstance(v, dict) and (v.get("compra") is not None or v.get("venta") is not None)
+                for v in cached_data.values()
+            ):
+                DOLAR_CACHE = {"data": cached_data, "updated_at": ts_val}
+            else:
+                DOLAR_CACHE = {}
+        else:
+            DOLAR_CACHE = {}
         log.info(
             "State loaded. alerts=%d subs=%d pf=%d",
             sum(len(v) for v in ALERTS.values()),
@@ -798,6 +818,7 @@ async def save_state():
         "news_cache_items": NEWS_CACHE.get("items", []),
         "riesgo_cache": RIESGO_CACHE,
         "reservas_cache": RESERVAS_CACHE,
+        "dolar_cache": DOLAR_CACHE,
     }
     if USE_UPSTASH:
         await _save_state_to_upstash(payload)
@@ -1135,7 +1156,28 @@ async def get_crypto_price(
 
 # ============================ DATA SOURCES ============================
 
+
+def _has_fx_data(rows: Dict[str, Dict[str, Any]]) -> bool:
+    for row in rows.values():
+        if not isinstance(row, dict):
+            continue
+        if row.get("compra") is not None or row.get("venta") is not None:
+            return True
+    return False
+
+
+def _save_dolar_cache(payload: Dict[str, Dict[str, Any]]) -> None:
+    global DOLAR_CACHE
+    new_cache = {"data": payload, "updated_at": time()}
+    if DOLAR_CACHE != new_cache:
+        DOLAR_CACHE = new_cache
+        try:
+            asyncio.create_task(save_state())
+        except Exception:
+            pass
+
 async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
+    global DOLAR_CACHE
     data: Dict[str, Dict[str, Any]] = {}
     variations: Dict[str, float] = {}
 
@@ -1274,6 +1316,14 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
 
     # Tipos de cambio especiales (promedio bancos, Qatar) ya no se calculan
     # aquí para simplificar el panel principal.
+    if _has_fx_data(data):
+        _save_dolar_cache(data)
+        return data
+
+    cached_data = DOLAR_CACHE.get("data") if isinstance(DOLAR_CACHE, dict) else None
+    if isinstance(cached_data, dict) and _has_fx_data(cached_data):
+        return cached_data
+
     return data
 
 async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
