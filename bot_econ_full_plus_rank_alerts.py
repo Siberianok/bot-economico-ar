@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable, Iterable
 from urllib.parse import urlparse, quote, parse_qs, urljoin
 import httpx
+import certifi
 
 # ====== matplotlib opcional (no rompe si no está instalado) ======
 HAS_MPL = False
@@ -81,7 +82,13 @@ YF_URLS = [
     "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}",
 ]
 YF_HEADERS = {"User-Agent": "Mozilla/5.0"}
-REQ_HEADERS = {"User-Agent":"Mozilla/5.0", "Accept":"*/*"}
+REQ_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
+    "Cache-Control": "no-cache",
+}
 
 # ============================ LISTADOS ============================
 
@@ -962,6 +969,7 @@ async def fetch_json_httpx(url: str, **kwargs) -> Optional[Dict[str, Any]]:
             timeout=timeout,
             headers={**REQ_HEADERS, **headers},
             follow_redirects=True,
+            verify=certifi.where(),
         ) as client:
             resp = await client.get(url, **kwargs)
             if 200 <= resp.status_code < 300:

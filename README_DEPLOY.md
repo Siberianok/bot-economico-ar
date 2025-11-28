@@ -49,3 +49,9 @@ pip install -r requirements.txt  # incluye la extra "webhooks" de PTB
 export BOT_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 python bot_econ_full_plus_rank_alerts.py
 ```
+
+## 7) Política de tokens y secretos
+- **Rotación periódica**: regenerá el `BOT_TOKEN` desde BotFather al menos una vez por trimestre o ante cualquier sospecha de fuga. Luego de generar uno nuevo, revocá el anterior para evitar usos indebidos.
+- **Alcances mínimos**: si agregás claves de terceros (ej. Redis, Upstash), usá credenciales con el menor scope posible y evita compartirlas entre ambientes (dev/stage/prod).
+- **Almacenamiento seguro**: cargá todos los secretos solo como *Environment Variables* en Render (o en tu plataforma) y nunca los subas al repositorio. Evitá volcarlos en logs o mensajes de error.
+- **Reemplazos controlados**: documentá la fecha de creación y próxima rotación de cada secreto. Si cambiás una credencial, desplegá inmediatamente después del update de variables para minimizar ventanas de inconsistencia.
