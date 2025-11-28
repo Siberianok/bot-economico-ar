@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable, Iterable
 from urllib.parse import urlparse, quote, parse_qs, urljoin
 import httpx
+import certifi
 
 # ====== matplotlib opcional (no rompe si no está instalado) ======
 HAS_MPL = False
@@ -32,11 +33,32 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes, CallbackQueryHandler,
     MessageHandler, ConversationHandler, filters
 )
-from bot.services.cache import RateLimiter, ShortCache
+from metrics import metrics
 
 # ============================ CONFIG ============================
 
 TZ = ZoneInfo("America/Argentina/Buenos_Aires")
+
+
+def _env_flag(name: str, default: str = "false") -> bool:
+    return (os.getenv(name, default) or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _env_int(name: str, default: str, *, min_value: int, max_value: Optional[int] = None) -> int:
+    try:
+        value = int(os.getenv(name, default))
+    except Exception:
+        value = int(default)
+    value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+LINK_PREVIEWS_ENABLED = _env_flag("LINK_PREVIEWS_ENABLED")
+LINK_PREVIEWS_PREFER_SMALL = _env_flag("LINK_PREVIEWS_PREFER_SMALL")
+ALERTS_PAGE_SIZE = _env_int("ALERTS_PAGE_SIZE", "10", min_value=1)
+RANK_TOP_LIMIT = _env_int("RANK_TOP_LIMIT", "3", min_value=1)
+RANK_PROJ_LIMIT = _env_int("RANK_PROJ_LIMIT", "5", min_value=1)
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "tgwebhook").strip().strip("/")
 PORT = int(os.getenv("PORT", "10000"))
@@ -82,7 +104,13 @@ YF_URLS = [
     "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}",
 ]
 YF_HEADERS = {"User-Agent": "Mozilla/5.0"}
-REQ_HEADERS = {"User-Agent":"Mozilla/5.0", "Accept":"*/*"}
+REQ_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
+    "Cache-Control": "no-cache",
+}
 
 # ============================ LISTADOS ============================
 
@@ -522,8 +550,56 @@ def metric_last_price(metrics: Dict[str, Any]) -> Optional[float]:
 
 # ============================ LOGGING ============================
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-log = logging.getLogger("bot-econ-ar")
+log = logging.getLogger(__name__)
+
+
+def instrument_command(name: str, handler: Callable[..., Awaitable[Any]]):
+    async def _wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        metrics.increment(f"command.{name}.total")
+        started = time()
+        try:
+            return await handler(update, context)
+        except Exception:
+            metrics.increment(f"command.{name}.errors")
+            raise
+        finally:
+            metrics.observe_latency_ms(f"command.{name}.latency_ms", (time() - started) * 1000)
+
+    return _wrapper
+
+
+def _record_http_metrics(host: str, duration_ms: float, *, success: bool, timeout: bool = False) -> None:
+    base_key = f"http.{host}" if host else "http.unknown"
+    metrics.observe_latency_ms(f"{base_key}.latency_ms", duration_ms)
+    metrics.increment(f"{base_key}.success" if success else f"{base_key}.errors")
+    if timeout:
+        metrics.increment(f"{base_key}.timeouts")
+
+
+# ============================ ERRORES ============================
+
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error = context.error
+
+    if isinstance(error, asyncio.CancelledError):
+        return
+
+    try:
+        update_repr = repr(update)
+    except Exception:
+        update_repr = "<update no serializable>"
+
+    log.error("Excepción no manejada (update=%s)", update_repr, exc_info=error)
+
+    try:
+        chat = getattr(update, "effective_chat", None)
+        if chat:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="Ocurrió un error inesperado. Intentalo de nuevo en unos minutos.",
+            )
+    except Exception as notify_error:
+        log.debug("No se pudo notificar el error al chat: %s", notify_error)
 
 # ============================ PERSISTENCIA ============================
 
@@ -539,10 +615,16 @@ def _writable_path(candidate: str) -> str:
         fallback = "./state.json"
         try:
             with open(fallback, "a", encoding="utf-8"): pass
-            log.warning("STATE_PATH no escribible (%s). Usando fallback: %s", candidate, fallback)
+            log.error(
+                "STATE_PATH no escribible, usando fallback.",
+                extra={"event": "persistence_failure", "candidate": candidate, "fallback": fallback},
+            )
             return fallback
         except Exception as e:
-            log.warning("No puedo escribir estado: %s", e)
+            log.error(
+                "No puedo escribir estado",
+                extra={"event": "persistence_failure", "candidate": candidate, "error": str(e)},
+            )
             return fallback
 
 USE_UPSTASH = bool(UPSTASH_URL and UPSTASH_TOKEN)
@@ -728,7 +810,11 @@ async def load_state():
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except Exception:
+            except Exception as e:
+                log.error(
+                    "No pude leer estado local",
+                    extra={"event": "persistence_failure", "path": path, "error": str(e)},
+                )
                 data = None
     if data:
         ALERTS = {int(k): v for k, v in data.get("alerts", {}).items()}
@@ -858,7 +944,10 @@ async def save_state():
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
     except Exception as e:
-        log.warning("save_state error: %s", e)
+        log.error(
+            "save_state error",
+            extra={"event": "persistence_failure", "path": path, "error": str(e)},
+        )
 
 # ============================ UTILS ============================
 
@@ -960,6 +1049,8 @@ def parse_iso_ddmmyyyy(s: Optional[str]) -> Optional[str]:
 # ============================ HTTP HELPERS ============================
 
 async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dict[str, Any]]:
+    started = time()
+    host = urlparse(url).netloc
     try:
         timeout = kwargs.pop("timeout", ClientTimeout(total=15))
         headers = kwargs.pop("headers", {})
@@ -970,14 +1061,26 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
             **kwargs,
         ) as resp:
             if 200 <= resp.status < 300:
-                return await resp.json(content_type=None)
+                payload = await resp.json(content_type=None)
+                _record_http_metrics(host, (time() - started) * 1000, success=True)
+                return payload
             log.warning("GET %s -> %s", url, resp.status)
+    except asyncio.TimeoutError:
+        duration_ms = (time() - started) * 1000
+        _record_http_metrics(host, duration_ms, success=False, timeout=True)
+        log.error("fetch_json timeout", extra={"url": url, "event": "api_timeout", "duration_ms": duration_ms})
+        return None
     except Exception as e:
+        _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning("fetch_json error %s: %s", url, e)
+        return None
+    _record_http_metrics(host, (time() - started) * 1000, success=False)
     return None
 
 
 async def fetch_json_httpx(url: str, **kwargs) -> Optional[Dict[str, Any]]:
+    started = time()
+    host = urlparse(url).netloc
     try:
         timeout = kwargs.pop("timeout", 15)
         headers = kwargs.pop("headers", {})
@@ -985,25 +1088,48 @@ async def fetch_json_httpx(url: str, **kwargs) -> Optional[Dict[str, Any]]:
             timeout=timeout,
             headers={**REQ_HEADERS, **headers},
             follow_redirects=True,
+            verify=certifi.where(),
         ) as client:
             resp = await client.get(url, **kwargs)
             if 200 <= resp.status_code < 300:
-                return resp.json()
+                payload = resp.json()
+                _record_http_metrics(host, (time() - started) * 1000, success=True)
+                return payload
             log.warning("httpx GET %s -> %s", url, resp.status_code)
+    except httpx.TimeoutException:
+        duration_ms = (time() - started) * 1000
+        _record_http_metrics(host, duration_ms, success=False, timeout=True)
+        log.error("fetch_json_httpx timeout", extra={"url": url, "event": "api_timeout", "duration_ms": duration_ms})
+        return None
     except Exception as e:
+        _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning("fetch_json_httpx error %s: %s", url, e)
+        return None
+    _record_http_metrics(host, (time() - started) * 1000, success=False)
     return None
 
 async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str]:
+    started = time()
+    host = urlparse(url).netloc
     try:
         timeout = kwargs.pop("timeout", ClientTimeout(total=15))
         headers = kwargs.pop("headers", {})
         async with session.get(url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs) as resp:
             if resp.status == 200:
-                return await resp.text()
+                body = await resp.text()
+                _record_http_metrics(host, (time() - started) * 1000, success=True)
+                return body
             log.warning("GET %s -> %s", url, resp.status)
+    except asyncio.TimeoutError:
+        duration_ms = (time() - started) * 1000
+        _record_http_metrics(host, duration_ms, success=False, timeout=True)
+        log.error("fetch_text timeout", extra={"url": url, "event": "api_timeout", "duration_ms": duration_ms})
+        return None
     except Exception as e:
+        _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning("fetch_text error %s: %s", url, e)
+        return None
+    _record_http_metrics(host, (time() - started) * 1000, success=False)
     return None
 
 
@@ -2935,7 +3061,10 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[News
             try:
                 collected.extend(_parse_feed_entries(xml))
             except Exception as e:
-                log.warning("RSS parse %s: %s", url, e)
+                log.error(
+                    "RSS parse error",
+                    extra={"url": url, "event": "rss_parse_error", "error": str(e)},
+                )
         return collected
 
     raw_entries.extend(await _collect_feed_entries(RSS_FEEDS))
@@ -3515,17 +3644,17 @@ async def _rank_top3(update: Update, symbols: List[str], title: str):
         mets, last_ts = await metrics_for_symbols_cached(session, symbols)
         fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
         pairs = sorted([(sym, m["6m"]) for sym, m in mets.items() if m.get("6m") is not None], key=lambda x: x[1], reverse=True)
-        top_syms = [sym for sym, _ in pairs[:3]]
+        top_syms = [sym for sym, _ in pairs[: RANK_TOP_LIMIT]]
         msg = format_top3_table(title, fecha, top_syms, mets)
         await update.effective_message.reply_text(
             msg,
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
 
         if HAS_MPL and pairs:
             chart_rows: List[Tuple[str, List[Optional[float]]]] = []
-            for sym, _ in pairs[:3]:
+            for sym, _ in pairs[: RANK_TOP_LIMIT]:
                 metrics = mets.get(sym, {})
                 values: List[Optional[float]] = []
                 for key, _ in RET_SERIES_ORDER:
@@ -3566,12 +3695,12 @@ async def _rank_proj5(update: Update, symbols: List[str], title: str):
                 continue
             rows.append((sym, projection_3m(m), projection_6m(m)))
         rows.sort(key=lambda x: x[2], reverse=True)
-        top_rows = rows[:5]
+        top_rows = rows[: RANK_PROJ_LIMIT]
         msg = format_proj_dual(title, fecha, top_rows)
         await update.effective_message.reply_text(
             msg,
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
 
         if HAS_MPL and top_rows:
@@ -3632,7 +3761,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("🌐 Cedears Proyección", callback_data="CED:TOP5"),
-            InlineKeyboardButton("🔔 Mis alertas", callback_data="AL:LIST"),
+            InlineKeyboardButton("🔔 Mis alertas", callback_data="AL:LIST:0"),
         ],
         [
             InlineKeyboardButton("🧾 Resumen diario", callback_data="ST:SUBS"),
@@ -3644,7 +3773,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         intro,
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(kb_rows),
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        link_preview_options=build_preview_options(),
     )
 
 async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3654,7 +3783,7 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             "No pude obtener cotizaciones ahora.",
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
         return
 
@@ -3663,7 +3792,7 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             msg,
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
 
 def _extract_json_object_with_bands(text: str) -> Optional[Dict[str, Any]]:
@@ -3987,7 +4116,7 @@ async def cmd_bandas_cambiarias(update: Update, context: ContextTypes.DEFAULT_TY
         await update.effective_message.reply_text(
             "No pude obtener bandas cambiarias ahora.",
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
         return
 
@@ -3995,7 +4124,7 @@ async def cmd_bandas_cambiarias(update: Update, context: ContextTypes.DEFAULT_TY
     await update.effective_message.reply_text(
         msg,
         parse_mode=ParseMode.HTML,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        link_preview_options=build_preview_options(),
     )
 
 async def cmd_acciones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4029,6 +4158,8 @@ async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "CED:TOP5":
         await _rank_proj5(update, CEDEARS_BA, "🏁 Top 5 Cedears (Proyección)")
         await dec_and_maybe_show(update, context, "cedears", cmd_cedears_menu)
+    else:
+        await q.answer("Selección inválida.", show_alert=True)
 
 # ---------- Macro ----------
 
@@ -4100,7 +4231,7 @@ async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
         header_body,
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        link_preview_options=build_preview_options(),
     )
     for text, img in items:
         if img:
@@ -4113,7 +4244,7 @@ async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text(
                 text,
                 parse_mode=ParseMode.HTML,
-                link_preview_options=LinkPreviewOptions(prefer_small_media=True),
+                link_preview_options=build_preview_options(disable_by_default=False, prefer_small_media=True),
             )
 
 async def cmd_menu_economia(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4202,6 +4333,19 @@ def _has_duplicate_alert(
 
 def kb(rows: List[List[Tuple[str,str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=data) for text, data in r] for r in rows])
+
+
+def build_preview_options(
+    *, disable_by_default: bool = True, prefer_small_media: bool = False
+) -> Optional[LinkPreviewOptions]:
+    prefer_small = prefer_small_media or LINK_PREVIEWS_PREFER_SMALL
+    if LINK_PREVIEWS_ENABLED:
+        return LinkPreviewOptions(is_disabled=False, prefer_small_media=prefer_small)
+    if disable_by_default:
+        return LinkPreviewOptions(is_disabled=True)
+    if prefer_small:
+        return LinkPreviewOptions(prefer_small_media=True)
+    return None
 
 def kb_tickers(symbols: List[str], back_target: str, prefix: str) -> InlineKeyboardMarkup:
     rows: List[List[Tuple[str,str]]] = []; row: List[Tuple[str,str]] = []
@@ -4355,7 +4499,7 @@ async def get_top_crypto_bases(
 
 def kb_alertas_menu() -> InlineKeyboardMarkup:
     return kb([
-        [("Listar", "AL:LIST"), ("Agregar", "AL:ADD")],
+        [("Listar", "AL:LIST:0"), ("Agregar", "AL:ADD")],
         [("Modificar", "AL:EDIT"), ("Borrar", "AL:CLEAR")],
         [("Pausar", "AL:PAUSE"), ("Reanudar", "AL:RESUME")],
     ])
@@ -4379,10 +4523,7 @@ async def cmd_alertas_menu(
 async def alertas_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
-    if data == "AL:LIST":
-        await cmd_alertas_list(update, context)
-        await cmd_alertas_menu(update, context)
-    elif data == "AL:EDIT":
+    if data == "AL:EDIT":
         await cmd_alertas_edit(update, context)
     elif data == "AL:CLEAR":
         await cmd_alertas_clear(update, context)
@@ -4391,16 +4532,34 @@ async def alertas_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "AL:RESUME":
         await cmd_alertas_resume(update, context)
         await cmd_alertas_menu(update, context)
+    else:
+        await q.answer("Opción de menú inválida.", show_alert=True)
 
-async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_alertas_list(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    start_idx: int = 0,
+    *,
+    edit: bool = False,
+) -> None:
     chat_id = update.effective_chat.id
-    rules = ALERTS.get(chat_id, [])
+    rules = ALERTS.get(chat_id, []) or []
     now = datetime.now(TZ)
+
     if not rules:
         txt = "No tenés alertas configuradas.\nUsá /alertas_menu → Agregar."
+        markup = kb([[("Volver", "AL:MENU")]])
     else:
-        lines = ["<b>🔔 Alertas Configuradas</b>"]
-        for i, r in enumerate(rules, 1):
+        page_size = ALERTS_PAGE_SIZE
+        last_start = max(0, ((len(rules) - 1) // page_size) * page_size)
+        start = max(0, min(start_idx, last_start))
+        end = min(len(rules), start + page_size)
+
+        lines = [
+            "<b>🔔 Alertas Configuradas</b>",
+            f"<i>Mostrando {start + 1}-{end} de {len(rules)}</i>",
+        ]
+        for i, r in enumerate(rules[start:end], start=start + 1):
             label = _alert_rule_label(r)
             status = _alert_pause_status(r, now=now)
             if status:
@@ -4413,7 +4572,49 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             until = datetime.fromtimestamp(ALERTS_SILENT_UNTIL[chat_id], TZ)
             lines.append(f"\n<i>Alertas en pausa hasta {until.strftime('%d/%m %H:%M')}</i>")
         txt = "\n".join(lines)
-    await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
+
+        buttons: List[List[Tuple[str, str]]] = []
+        if len(rules) > page_size:
+            row: List[Tuple[str, str]] = []
+            prev_idx = max(0, start - page_size)
+            if start > 0:
+                row.append(("⬅️ Anteriores", f"AL:LIST:{prev_idx}"))
+            if end < len(rules):
+                row.append(("➡️ Siguientes", f"AL:LIST:{end}"))
+            if row:
+                buttons.append(row)
+        buttons.append([("Volver", "AL:MENU")])
+        markup = kb(buttons)
+
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(
+            txt, parse_mode=ParseMode.HTML, reply_markup=markup
+        )
+    else:
+        await update.effective_message.reply_text(
+            txt, parse_mode=ParseMode.HTML, reply_markup=markup
+        )
+
+
+async def alertas_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    parts = data.split(":", 2)
+    start_idx = 0
+    if len(parts) >= 3:
+        try:
+            start_idx = max(0, int(parts[2]))
+        except ValueError:
+            await q.answer("Página inválida.", show_alert=True)
+            return
+    await cmd_alertas_list(update, context, start_idx=start_idx, edit=True)
+
+
+async def alertas_menu_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await cmd_alertas_menu(update, context, edit=True)
 
 async def cmd_alertas_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -7706,7 +7907,11 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
         partes.append(format_news_block(news)[0])
 
     txt = "\n\n".join(partes) if partes else "Sin datos para el resumen ahora."
-    await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    await update.effective_message.reply_text(
+        txt,
+        parse_mode=ParseMode.HTML,
+        link_preview_options=build_preview_options(),
+    )
 
 # ============================ WEBHOOK / APP ============================
 
@@ -7752,9 +7957,12 @@ def setup_health_routes(application: Application) -> None:
     async def _health(_: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
 
+    async def _metrics(_: web.Request) -> web.Response:
+        return web.json_response(metrics.snapshot())
+
     router = inner_app.router
 
-    for path in ("/", "/healthz"):
+    for path, handler in (("/", _health), ("/healthz", _health), ("/metrics", _metrics)):
         already_registered = False
         for route in router.routes():
             resource = getattr(route, "resource", None)
@@ -7768,13 +7976,12 @@ def setup_health_routes(application: Application) -> None:
         if already_registered:
             continue
         try:
-            router.add_get(path, _health)
+            router.add_get(path, handler)
         except (RuntimeError, ValueError) as exc:
             logging.debug("No se pudo registrar ruta %s: %s", path, exc)
 
 BOT_COMMANDS = [
     BotCommand("economia","Menú de economía"),
-    BotCommand("dolar","Tipos de cambio"),
     BotCommand("acciones","Menú acciones"),
     BotCommand("cedears","Menú cedears"),
     BotCommand("alertas_menu","Configurar alertas"),
@@ -7789,7 +7996,6 @@ def build_application() -> Application:
     # Comandos
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("economia", cmd_menu_economia))
-    app.add_handler(CommandHandler("dolar", cmd_dolar))
     app.add_handler(CommandHandler("reservas", cmd_reservas))
     app.add_handler(CommandHandler("inflacion", cmd_inflacion))
     app.add_handler(CommandHandler("riesgo", cmd_riesgo))
@@ -7801,10 +8007,12 @@ def build_application() -> Application:
 
     # Alertas - menú simple
     app.add_handler(CommandHandler("alertas_menu", cmd_alertas_menu))
-    app.add_handler(CallbackQueryHandler(alertas_menu_cb, pattern="^AL:(LIST|EDIT|CLEAR|PAUSE|RESUME)$"))
+    app.add_handler(CallbackQueryHandler(alertas_list_cb, pattern="^AL:LIST(:[0-9]+)?$"))
+    app.add_handler(CallbackQueryHandler(alertas_menu_back_cb, pattern="^AL:MENU$", block=False))
+    app.add_handler(CallbackQueryHandler(alertas_menu_cb, pattern="^AL:(EDIT|CLEAR|PAUSE|RESUME)$"))
     app.add_handler(CallbackQueryHandler(alertas_edit_cancel, pattern="^AL:EDIT:CANCEL$"))
     app.add_handler(CallbackQueryHandler(alertas_clear_cb, pattern="^CLR:"))
-    app.add_handler(CommandHandler("alertas_pause", cmd_alertas_pause))
+    app.add_handler(CommandHandler("alertas_pause", instrument_command("alertas_pause", cmd_alertas_pause)))
     app.add_handler(CallbackQueryHandler(alerts_pause_cb, pattern="^AP:"))
 
     # Alertas - conversación Agregar
@@ -7844,7 +8052,7 @@ def build_application() -> Application:
     # Suscripciones
     subs_conv = ConversationHandler(
         entry_points=[
-            CommandHandler("subs", cmd_subs),
+            CommandHandler("subs", instrument_command("subs", cmd_subs)),
             CallbackQueryHandler(subs_start_from_cb, pattern="^ST:SUBS$"),
         ],
         states={SUBS_SET_TIME: [CallbackQueryHandler(subs_cb, pattern="^SUBS:")]},
@@ -7856,12 +8064,14 @@ def build_application() -> Application:
     app.add_handler(subs_conv)
 
     # Portafolio
-    app.add_handler(CommandHandler("portafolio", cmd_portafolio))
+    app.add_handler(CommandHandler("portafolio", instrument_command("portafolio", cmd_portafolio)))
     app.add_handler(CallbackQueryHandler(pf_menu_cb, pattern="^PF:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pf_text_input))
 
     # Resumen diario on-demand
-    app.add_handler(CommandHandler("resumen", cmd_resumen_diario))
+    app.add_handler(CommandHandler("resumen", instrument_command("resumen", cmd_resumen_diario)))
+
+    app.add_error_handler(handle_error)
 
     return app
 
@@ -7930,6 +8140,9 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        from main import configure_logging
+
+        configure_logging()
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
