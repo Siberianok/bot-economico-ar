@@ -2248,16 +2248,24 @@ def _canonical_news_link(link: str) -> str:
     except Exception:
         return link
 
-def _normalize_feed_link(link: str) -> str:
+GOOGLE_NEWS_DOMAINS = {"news.google.com", "news.google.com.ar", "news.google.com.br"}
+
+
+def _normalize_feed_link(link: str) -> Optional[str]:
     try:
         parsed = urlparse(link)
     except Exception:
         return link
-    if parsed.netloc.endswith("news.google.com"):
+    netloc = parsed.netloc.lower()
+    if netloc in GOOGLE_NEWS_DOMAINS:
         qs = parsed.query or ""
         qparams = dict((k, v[0]) for k, v in parse_qs(qs).items() if v)
-        if "url" in qparams and qparams["url"].startswith("http"):
-            return qparams["url"]
+        target = qparams.get("url")
+        if target and target.startswith("http"):
+            target_netloc = domain_of(target)
+            if target_netloc not in GOOGLE_NEWS_DOMAINS:
+                return target
+        return None
     return link
 
 def _is_probably_article_url(link: str) -> bool:
@@ -2363,6 +2371,8 @@ _IMAGE_LOGO_PATTERNS = [
     "google_news",
     "googlenews",
     "gn-logo",
+    "gstatic",
+    "googleusercontent",
 ]
 
 
@@ -2392,6 +2402,20 @@ def _is_logo_like(url: str) -> bool:
     if re.search(r"(?:^|[\W_])logo(?:[\W_]|$)", low):
         return True
     return False
+
+
+def _is_unwanted_image_host(url: str) -> bool:
+    dom = domain_of(url)
+    dom = dom[4:] if dom.startswith("www.") else dom
+    if dom in GOOGLE_NEWS_DOMAINS:
+        return True
+    unwanted_hosts = {
+        "gstatic.com",
+        "googleusercontent.com",
+        "google.com",
+        "google.com.ar",
+    }
+    return dom in unwanted_hosts
 
 
 def _extract_json_ld_images(html: str, base_url: Optional[str]) -> List[str]:
@@ -2431,32 +2455,54 @@ def _extract_page_image(html: str, base_url: Optional[str]) -> Optional[str]:
         r"<link[^>]+rel=['\"]image_src['\"][^>]+href=['\"]([^'\"]+)['\"]",
     ]
 
-    candidates: List[str] = []
+    candidates: List[Tuple[str, int]] = []
+
+    def _score_image(url: str, width: Optional[int] = None, height: Optional[int] = None) -> int:
+        score = 0
+        if width and width >= 180:
+            score += 2
+        if height and height >= 180:
+            score += 2
+        if width and height and min(width, height) >= 300:
+            score += 2
+        if _is_unwanted_image_host(url):
+            score -= 4
+        if _is_logo_like(url):
+            score -= 3
+        return score
 
     for pat in patterns:
         for m in re.finditer(pat, html, flags=re.I):
             img = _clean_image_url(m.group(1), base_url)
-            if img and not _is_logo_like(img):
-                candidates.append(img)
+            if img and not _is_logo_like(img) and not _is_unwanted_image_host(img):
+                candidates.append((img, _score_image(img)))
 
     for json_img in _extract_json_ld_images(html, base_url):
-        if json_img and not _is_logo_like(json_img):
-            candidates.append(json_img)
+        if json_img and not _is_logo_like(json_img) and not _is_unwanted_image_host(json_img):
+            candidates.append((json_img, _score_image(json_img)))
 
     if candidates:
-        return candidates[0]
+        candidates.sort(key=lambda it: it[1], reverse=True)
+        return candidates[0][0]
 
     for m in re.finditer(r"<img[^>]+src=['\"]([^'\"]+)['\"][^>]*>", html, flags=re.I):
         img = _clean_image_url(m.group(1), base_url)
-        if not img or _is_logo_like(img):
+        if not img or _is_logo_like(img) or _is_unwanted_image_host(img):
             continue
         width_match = re.search(r"width=['\"]?(\d+)", m.group(0), flags=re.I)
         height_match = re.search(r"height=['\"]?(\d+)", m.group(0), flags=re.I)
-        if width_match and int(width_match.group(1)) < 80:
+        width = int(width_match.group(1)) if width_match else None
+        height = int(height_match.group(1)) if height_match else None
+        if width and width < 120:
             continue
-        if height_match and int(height_match.group(1)) < 80:
+        if height and height < 120:
             continue
-        return img
+        scored = _score_image(img, width, height)
+        candidates.append((img, scored))
+
+    if candidates:
+        candidates.sort(key=lambda it: it[1], reverse=True)
+        return candidates[0][0]
     return None
 
 async def _fallback_image_from_url(session: ClientSession, url: str) -> Optional[str]:
@@ -2637,6 +2683,9 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[News
     def _ingest_entries(entries: Iterable[RawNewsEntry]) -> None:
         for title, link, desc, img in entries:
             if not link.startswith("http"):
+                continue
+            dom = domain_of(link)
+            if dom in GOOGLE_NEWS_DOMAINS:
                 continue
             if not _is_probably_article_url(link):
                 continue
