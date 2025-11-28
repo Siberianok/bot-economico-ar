@@ -69,6 +69,7 @@ ARG_DATOS_BASES = [
     "https://argentinadatos.com/v1/finanzas/indices",
 ]
 
+ARG_DATOS_RIESGO_URL = "https://api.argentinadatos.com/v1/finanzas/indices/riesgo-pais"
 DOLARITO_RIESGO_API = "https://api.dolarito.ar/api/frontend/indices/riesgo-pais"
 DOLARITO_RIESGO_HTML = "https://www.dolarito.ar/indices/riesgo-pais"
 CRIPTOYA_RIESGO_URL = "https://criptoya.com/charts/riesgo-pais"
@@ -1360,6 +1361,31 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
     variation: Optional[float] = None
     from_cache = False
 
+    value_keys = {"valor", "value", "ultimo", "last", "riesgo", "embi", "current", "close", "latest"}
+    date_keys = {
+        "fecha",
+        "updatedat",
+        "lastupdated",
+        "last_update",
+        "fechaactualizacion",
+        "fechaactualizada",
+        "date",
+        "timestamp",
+    }
+    prev_keys = {"anterior", "previous", "prev", "valoranterior", "prev_value", "valorprevio", "previo"}
+    variation_keys = {
+        "variacion",
+        "variation",
+        "cambio",
+        "cambioporcentual",
+        "porcentaje",
+        "porcentual",
+        "delta",
+        "change",
+        "pctchange",
+        "variaciondiaria",
+    }
+
     def _save_riesgo_cache(v: int, f: Optional[str], var: Optional[float]) -> None:
         global RIESGO_CACHE
         new_cache = {
@@ -1377,15 +1403,23 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
 
     def _safe_number(raw: Any) -> Optional[float]:
         try:
+            if isinstance(raw, str):
+                cleaned = raw.strip().replace("%", "").replace("+", "").replace(",", ".")
+                if cleaned.startswith("–"):
+                    cleaned = "-" + cleaned[1:]
+                raw = cleaned
             num = float(raw)
             return num if math.isfinite(num) else None
         except (TypeError, ValueError):
             return None
 
     def _extract_field(data: Any, keys: Iterable[str]) -> Optional[Any]:
+        normalized_keys = {re.sub(r"[^a-z0-9]", "", str(k).lower()) for k in keys}
+
         if isinstance(data, dict):
             for k, v in data.items():
-                if str(k).lower() in keys and v is not None:
+                key_norm = re.sub(r"[^a-z0-9]", "", str(k).lower())
+                if key_norm in normalized_keys and v is not None:
                     return v
                 res = _extract_field(v, keys)
                 if res is not None:
@@ -1399,21 +1433,58 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
 
     def _parse_json_payload(payload: Any) -> None:
         nonlocal val, fecha, variation
-        parsed_val = _safe_number(_extract_field(payload, {"valor", "value", "ultimo", "last"}))
+        parsed_val = _safe_number(_extract_field(payload, value_keys))
         if parsed_val is not None:
             val = parsed_val
-        fetched_fecha = _extract_field(payload, {"fecha", "updatedat", "lastUpdated"})
+        fetched_fecha = _extract_field(payload, date_keys)
         if fetched_fecha:
             fecha = str(fetched_fecha)
-        prev_val = _safe_number(_extract_field(payload, {"anterior", "previous", "prev", "valoranterior"}))
+        prev_val = _safe_number(_extract_field(payload, prev_keys))
         if prev_val not in (None, 0) and val is not None and variation is None:
             try:
                 variation = ((val - prev_val) / prev_val) * 100.0
             except Exception:
                 variation = None
-        direct_var = _safe_number(_extract_field(payload, {"variacion", "variation", "cambio"}))
+        direct_var = _safe_number(_extract_field(payload, variation_keys))
         if direct_var is not None:
             variation = direct_var
+
+    async def _parse_argdatos() -> None:
+        nonlocal val, fecha, variation
+        data = await fetch_json_httpx(ARG_DATOS_RIESGO_URL)
+        if not data:
+            data = await fetch_json(session, ARG_DATOS_RIESGO_URL)
+        series = None
+        if isinstance(data, list):
+            series = data
+        elif isinstance(data, dict):
+            # Some endpoints wrap the series
+            for candidate_key in ("data", "serie", "results"):
+                if isinstance(data.get(candidate_key), list):
+                    series = data[candidate_key]
+                    break
+        if not series:
+            return
+        latest_item = None
+        prev_item = None
+        for item in reversed(series):
+            cur_val = _safe_number(_extract_field(item, value_keys))
+            if cur_val is None:
+                continue
+            if latest_item is None:
+                latest_item = (cur_val, _extract_field(item, date_keys))
+            elif prev_item is None:
+                prev_item = (cur_val, _extract_field(item, date_keys))
+                break
+        if latest_item:
+            val = latest_item[0]
+            if latest_item[1]:
+                fecha = str(latest_item[1])
+        if variation is None and latest_item and prev_item and prev_item[0] not in (None, 0):
+            try:
+                variation = ((latest_item[0] - prev_item[0]) / prev_item[0]) * 100.0
+            except Exception:
+                variation = None
 
     html = await fetch_text(session, DOLARITO_RIESGO_HTML, headers=REQ_HEADERS)
     build_id: Optional[str] = None
@@ -1427,6 +1498,9 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
         payload = await fetch_json(session, json_url, headers=REQ_HEADERS)
         if isinstance(payload, dict):
             _parse_json_payload(payload)
+
+    if val is None or variation is None:
+        await _parse_argdatos()
 
     if (val is None or variation is None) and html:
         stripped = re.sub(r"<[^>]+>", " ", html)
@@ -1444,6 +1518,18 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
                     variation = float(m_var.group(1).replace(",", "."))
                 except Exception:
                     variation = variation
+
+    if variation is None and isinstance(RIESGO_CACHE, dict):
+        cached_var = _safe_number(RIESGO_CACHE.get("variation"))
+        if cached_var is not None:
+            variation = cached_var
+        elif val is not None:
+            prev_cached_val = _safe_number(RIESGO_CACHE.get("val"))
+            if prev_cached_val not in (None, 0):
+                try:
+                    variation = ((val - prev_cached_val) / prev_cached_val) * 100.0
+                except Exception:
+                    variation = None
 
     if val is None:
         cache_val = RIESGO_CACHE.get("val") if isinstance(RIESGO_CACHE, dict) else None
@@ -3721,23 +3807,31 @@ async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         txt = "No pude obtener riesgo país ahora."
     else:
         rp, f, var, from_cache = tup[0], tup[1], tup[2], bool(tup[3]) if len(tup) > 3 else False
-        f_str = parse_iso_ddmmyyyy(f)
-        change_txt = _format_riesgo_variation(var)
-        freshness = ""
-        if from_cache:
-            cache_ts = RIESGO_CACHE.get("updated_at") if isinstance(RIESGO_CACHE, dict) else None
-            cache_dt = None
-            try:
-                if cache_ts:
-                    cache_dt = datetime.fromtimestamp(float(cache_ts), tz=TZ)
-            except Exception:
+        rp_num = rp if isinstance(rp, (int, float)) else None
+        var_num = var if isinstance(var, (int, float)) else None
+        if rp_num is None:
+            txt = "No pude obtener riesgo país ahora."
+        else:
+            if var_num is None and isinstance(RIESGO_CACHE, dict):
+                cached_var = RIESGO_CACHE.get("variation")
+                var_num = cached_var if isinstance(cached_var, (int, float)) else None
+            f_str = parse_iso_ddmmyyyy(f)
+            change_txt = _format_riesgo_variation(var_num) if isinstance(var_num, (int, float)) else " —"
+            freshness = ""
+            if from_cache:
+                cache_ts = RIESGO_CACHE.get("updated_at") if isinstance(RIESGO_CACHE, dict) else None
                 cache_dt = None
-            cache_str = cache_dt.strftime("%d/%m %H:%M") if cache_dt else "guardado"
-            freshness = f" <i>(dato de respaldo, {cache_str})</i>"
-        txt = (
-            f"<b>📈 Riesgo País</b>{f' <i>{f_str}</i>' if f_str else ''}{freshness}\n"
-            f"<b>{rp} pb</b>{change_txt}"
-        )
+                try:
+                    if cache_ts:
+                        cache_dt = datetime.fromtimestamp(float(cache_ts), tz=TZ)
+                except Exception:
+                    cache_dt = None
+                cache_str = cache_dt.strftime("%d/%m %H:%M") if cache_dt else "guardado"
+                freshness = f" <i>(dato de respaldo, {cache_str})</i>"
+            txt = (
+                f"<b>📈 Riesgo País</b>{f' <i>{f_str}</i>' if f_str else ''}{freshness}\n"
+                f"<b>{int(rp_num)} pb</b>{change_txt}"
+            )
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
