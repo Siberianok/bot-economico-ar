@@ -1677,14 +1677,54 @@ def _save_reservas_cache(val: float, fecha: Optional[str], prev_val: Optional[fl
 
 async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, Optional[str]]]:
     html = await fetch_text(session, LAMACRO_RESERVAS_URL)
-    if not html: return None
-    m_val = re.search(r"(?:Último dato|Valor actual)\s*:\s*([0-9\.\,]+)", html)
-    m_date = re.search(r"([0-3]\d/[0-1]\d/\d{4})", html)
-    if not m_val: return None
-    s = m_val.group(1).replace('.', '').replace(',', '.')
-    try: val = float(s)
-    except Exception: return None
-    fecha = m_date.group(1) if m_date else None
+    if not html:
+        log.warning("Reservas lamacro: HTML vacío o inaccesible (%s)", LAMACRO_RESERVAS_URL)
+        return None
+
+    def _parse_reserva_val(raw: str) -> Optional[float]:
+        cleaned = raw.strip().replace("\xa0", " ")
+        cleaned = cleaned.replace(".", "").replace(",", ".")
+        cleaned = re.sub(r"[^0-9\.-]", "", cleaned)
+        try:
+            return float(cleaned)
+        except Exception:
+            return None
+
+    val: Optional[float] = None
+    fecha: Optional[str] = None
+
+    meta_match = re.search(
+        r"Valor actual:\s*([0-9\.,]+).*?Última actualización:\s*([0-3]\d/[0-1]\d/\d{4})",
+        html,
+        flags=re.S,
+    )
+    if meta_match:
+        val = _parse_reserva_val(meta_match.group(1))
+        fecha = meta_match.group(2)
+
+    if val is None:
+        m_val = re.search(r"initialValue\\\":\s*([0-9\.,]+)", html) or re.search(r"initialValue\":\s*([0-9\.,]+)", html)
+        if m_val:
+            val = _parse_reserva_val(m_val.group(1))
+
+    if val is None:
+        m_val = re.search(r"(?:Último dato|Valor actual)\s*:\s*([0-9\.,]+)", html)
+        if m_val:
+            val = _parse_reserva_val(m_val.group(1))
+
+    if fecha is None:
+        m_date = re.search(r"Última actualización:?\s*([0-3]\d/[0-1]\d/\d{4})", html)
+        if m_date:
+            fecha = m_date.group(1)
+    if fecha is None:
+        m_date = re.search(r"([0-3]\d/[0-1]\d/\d{4})", html)
+        if m_date:
+            fecha = m_date.group(1)
+
+    if val is None:
+        log.warning("Reservas lamacro: no pude extraer valor desde HTML actual")
+        return None
+
     return (val, fecha)
 
 
@@ -1699,7 +1739,9 @@ async def get_reservas_con_variacion(
         cache_fecha = RESERVAS_CACHE.get("fecha") if isinstance(RESERVAS_CACHE, dict) else None
         cache_prev = RESERVAS_CACHE.get("prev_val") if isinstance(RESERVAS_CACHE, dict) else None
         if cache_val is None:
+            log.warning("Reservas: sin dato fresco ni caché válida")
             return None
+        log.warning("Reservas: usando dato en caché por fallo de scraping")
         try:
             cur_val = float(cache_val)
             prev_val = float(cache_prev) if cache_prev is not None else None
@@ -1716,16 +1758,23 @@ async def get_reservas_con_variacion(
         cached_val = RESERVAS_CACHE.get("val") if isinstance(RESERVAS_CACHE, dict) else None
         cached_prev = RESERVAS_CACHE.get("prev_val") if isinstance(RESERVAS_CACHE, dict) else None
         prev_val: Optional[float] = None
+        cached_val_f: Optional[float] = None
+        cached_prev_f: Optional[float] = None
         if isinstance(cached_val, (int, float)):
             try:
-                prev_val = float(cached_val)
+                cached_val_f = float(cached_val)
             except Exception:
-                prev_val = None
-        elif isinstance(cached_prev, (int, float)):
+                cached_val_f = None
+        if isinstance(cached_prev, (int, float)):
             try:
-                prev_val = float(cached_prev)
+                cached_prev_f = float(cached_prev)
             except Exception:
-                prev_val = None
+                cached_prev_f = None
+
+        if cached_val_f is not None and cached_val_f != cur_val:
+            prev_val = cached_val_f
+        elif cached_prev_f is not None:
+            prev_val = cached_prev_f
         _save_reservas_cache(cur_val, fecha, prev_val)
     return (cur_val, fecha, prev_val, from_cache)
 
