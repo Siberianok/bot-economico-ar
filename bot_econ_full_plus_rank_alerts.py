@@ -1586,68 +1586,78 @@ def _format_reservas_variation(prev_val: Optional[float], cur_val: Optional[floa
     return f" <span style='color:{color}'>{arrow} {sign}{var:.2f}%</span>"
 
 async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str], Optional[float]]]:
-    variation: Optional[float] = None
-    prev_val: Optional[float] = None
-    val: Optional[float] = None
-    per: Optional[str] = None
+    def _parse_period(raw: Optional[str]) -> Optional[datetime]:
+        if not raw:
+            return None
+        for fmt in ("%Y-%m-%d", "%Y-%m", "%Y%m", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(raw[: len(fmt)], fmt)
+            except Exception:
+                continue
+        return None
 
-    for suf in ("/inflacion", "/inflacion/mensual/ultimo", "/inflacion/mensual"):
-        j = None
+    def _calc_variation(cur: Optional[float], prev: Optional[float]) -> Optional[float]:
+        if not isinstance(cur, (int, float)) or not isinstance(prev, (int, float)):
+            return None
+        if prev == 0:
+            return None
+        try:
+            return ((cur - prev) / prev) * 100.0
+        except Exception:
+            return None
+
+    candidates: List[str] = []
+    for suf in ("/inflacion", "/inflacion/mensual", "/inflacion/mensual/ultimo"):
         for base in ARG_DATOS_BASES:
-            url = base + suf
-            j = await fetch_json_httpx(url)
-            if not j:
-                j = await fetch_json(session, url)
-            if j:
-                if isinstance(j, dict) and "serie" in j and isinstance(j["serie"], list) and j["serie"]:
-                    j = j["serie"]
-                break
-        if j:
+            candidates.append(base + suf)
+    candidates.append("https://api.argentinadatos.com/v1/finanzas/indices/inflacion")
+
+    series: List[Dict[str, Any]] = []
+    latest_val: Optional[float] = None
+    latest_period: Optional[str] = None
+    prev_val: Optional[float] = None
+
+    for url in candidates:
+        j: Any = await fetch_json_httpx(url, follow_redirects=True)
+        if not j:
+            j = await fetch_json(session, url)
+        if not j:
+            continue
+        if isinstance(j, dict) and "serie" in j and isinstance(j.get("serie"), list):
+            j = j.get("serie") or []
+        if isinstance(j, list):
+            series = [item for item in j if isinstance(item, dict)]
+        elif isinstance(j, dict):
+            series = [j]
+        else:
+            continue
+        if series:
             break
 
-    if isinstance(j, list) and j:
-        latest_idx: Optional[int] = None
-        for idx in range(len(j) - 1, -1, -1):
-            item = j[idx]
-            if isinstance(item, dict) and item.get("valor") not in (None, ""):
-                try:
-                    val = float(item.get("valor"))
-                    per = item.get("fecha") or item.get("periodo")
-                    latest_idx = idx
-                    break
-                except Exception:
-                    val = None
-                    per = None
-                    latest_idx = None
-                    break
-        if val is not None and latest_idx not in (None, 0):
-            for prev_item in reversed(j[:latest_idx]):
-                if isinstance(prev_item, dict) and prev_item.get("valor") not in (None, ""):
-                    try:
-                        prev_val = float(prev_item.get("valor"))
-                        break
-                    except Exception:
-                        prev_val = None
-                        break
-    elif isinstance(j, dict):
-        val_raw = j.get("valor")
-        per = j.get("fecha") or j.get("periodo")
-        try:
-            val = float(val_raw) if val_raw is not None else None
-        except Exception:
-            val = None
-    else:
+    if not series:
         return None
 
-    if val is None:
+    parsed_entries: List[Tuple[Optional[datetime], str, float]] = []
+    for item in series:
+        raw_val = item.get("valor")
+        if raw_val in (None, ""):
+            continue
+        try:
+            value = float(raw_val)
+        except Exception:
+            continue
+        per = item.get("fecha") or item.get("periodo")
+        parsed_entries.append((_parse_period(per), per or "", value))
+
+    if not parsed_entries:
         return None
 
-    if prev_val not in (None, 0):
-        try:
-            variation = ((val - prev_val) / prev_val) * 100.0
-        except Exception:
-            variation = None
-    return (val, per, variation)
+    parsed_entries.sort(key=lambda t: (t[0] or datetime.min))
+    _, latest_period, latest_val = parsed_entries[-1]
+    prev_val = parsed_entries[-2][2] if len(parsed_entries) > 1 else None
+
+    variation = _calc_variation(latest_val, prev_val)
+    return (latest_val, latest_period or None, variation)
 
 
 def _save_reservas_cache(val: float, fecha: Optional[str], prev_val: Optional[float]) -> None:
