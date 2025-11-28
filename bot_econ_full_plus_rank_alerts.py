@@ -11,6 +11,8 @@ from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable, I
 from urllib.parse import urlparse, quote, parse_qs, urljoin
 import httpx
 
+from bot.config import config
+
 # ====== matplotlib opcional (no rompe si no está instalado) ======
 HAS_MPL = False
 try:
@@ -36,23 +38,15 @@ from telegram.ext import (
 # ============================ CONFIG ============================
 
 TZ = ZoneInfo("America/Argentina/Buenos_Aires")
-TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "tgwebhook").strip().strip("/")
-PORT = int(os.getenv("PORT", "10000"))
-BASE_URL = os.getenv("BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "http://localhost")).rstrip("/")
-ENV_STATE_PATH = os.getenv("STATE_PATH", "state.json")
-UPSTASH_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("UPSTASH_URL") or "").strip()
-UPSTASH_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("UPSTASH_TOKEN") or "").strip()
-UPSTASH_REDIS_URL = (
-    os.getenv("UPSTASH_REDIS_URL")
-    or os.getenv("REDIS_URL")
-    or os.getenv("redis-url")
-    or ""
-).strip()
-UPSTASH_STATE_KEY = os.getenv("UPSTASH_STATE_KEY", "bot-econ-state").strip()
-
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN/BOT_TOKEN no configurado.")
+TELEGRAM_TOKEN = config.telegram_token
+WEBHOOK_SECRET = config.webhook_secret
+PORT = config.port
+BASE_URL = config.base_url
+ENV_STATE_PATH = str(config.state_path)
+UPSTASH_URL = config.upstash.rest_url
+UPSTASH_TOKEN = config.upstash.rest_token
+UPSTASH_REDIS_URL = config.upstash.redis_url
+UPSTASH_STATE_KEY = config.upstash.state_key
 
 WEBHOOK_PATH = f"/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
