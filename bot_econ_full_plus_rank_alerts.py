@@ -1052,9 +1052,12 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
     started = time()
     host = urlparse(url).netloc
     try:
-        timeout = kwargs.pop("timeout", ClientTimeout(total=15))
-        headers = kwargs.pop("headers", {})
-        async with session.get(
+        return await http_service.get_json(url, source=source, headers=headers, **kwargs)
+    except SourceSuspendedError as exc:
+        log.warning(
+            "source_suspended source=%s resume_at=%s url=%s",
+            exc.source,
+            exc.resume_at,
             url,
             timeout=timeout,
             headers={**REQ_HEADERS, **headers},
@@ -1394,20 +1397,25 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
         except Exception:
             return (None, None, var if isinstance(var, float) else None)
 
-    cj = await fetch_json(session, CRYPTOYA_DOLAR_URL)
-    if cj:
-        for k in ["oficial", "mayorista", "blue", "mep", "ccl", "cripto", "tarjeta", "ahorro"]:
-            c, v, var = _safe(cj.get(k, {}))
-            if c is not None or v is not None:
-                data[k] = {"compra": c, "venta": v, "fuente": "CriptoYa"}
-            if var is not None:
-                variations[k] = var
+    if not http_service.is_suspended("criptoya"):
+        cj = await fetch_json(session, CRYPTOYA_DOLAR_URL, source="criptoya")
+        if cj:
+            for k in ["oficial", "mayorista", "blue", "mep", "ccl", "cripto", "tarjeta", "ahorro"]:
+                c, v, var = _safe(cj.get(k, {}))
+                if c is not None or v is not None:
+                    data[k] = {"compra": c, "venta": v, "fuente": "CriptoYa"}
+                if var is not None:
+                    variations[k] = var
+        else:
+            log.warning("fallback_to_dolarapi source=criptoya")
+    else:
+        log.info("source_skip_due_to_suspension source=criptoya")
 
     async def dolarapi(path: str, date: Optional[str] = None):
         url = f"{DOLARAPI_BASE}{path}"
         if date:
             url = f"{url}?fecha={date}"
-        j = await fetch_json(session, url)
+        j = await fetch_json(session, url, source="dolarapi")
         if not j:
             return (None, None, None)
         c, v, fecha = j.get("compra"), j.get("venta"), j.get("fechaActualizacion") or j.get("fecha")
@@ -2227,7 +2235,18 @@ async def _rava_metrics(session: ClientSession, symbol: str) -> Dict[str, Option
 async def _yf_chart_1y(session: ClientSession, symbol: str, interval: str) -> Optional[Dict[str, Any]]:
     for base in YF_URLS:
         params = {"range": "1y", "interval": interval, "events": "div,split"}
-        j = await fetch_json(session, base.format(symbol=symbol), headers=YF_HEADERS, params=params)
+        base_url = base.format(symbol=symbol)
+        suspended_until = http_service.is_suspended(urlparse(base_url).netloc or "yahoo")
+        if suspended_until:
+            log.info("skip_yahoo_source_suspended host=%s resume_at=%s", urlparse(base_url).netloc, suspended_until)
+            continue
+        j = await fetch_json(
+            session,
+            base_url,
+            headers=YF_HEADERS,
+            params=params,
+            source=urlparse(base_url).netloc or "yahoo",
+        )
         try:
             res = j.get("chart", {}).get("result", [])[0]
             return res
