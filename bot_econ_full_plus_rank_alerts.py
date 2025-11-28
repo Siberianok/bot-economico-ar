@@ -1475,47 +1475,85 @@ def _format_riesgo_variation(var: Optional[float]) -> str:
 def _format_inflacion_variation(var: Optional[float]) -> str:
     if not isinstance(var, (int, float)):
         return " —"
-    arrow = "⬆️" if var > 0 else "⬇️" if var < 0 else "➡️"
-    color = "#0abf53" if var > 0 else "#d7263d" if var < 0 else "#888"
+    arrow = "↑" if var > 0 else "↓" if var < 0 else "→"
+    color = "#d7263d" if var > 0 else "#0abf53" if var < 0 else "#888"
     sign = "+" if var > 0 else ""
     return f" <span style='color:{color}'>{arrow} {sign}{var:.1f}%</span>"
+
+def _format_reservas_variation(prev_val: Optional[float], cur_val: Optional[float]) -> str:
+    if not isinstance(prev_val, (int, float)) or not isinstance(cur_val, (int, float)):
+        return ""
+    if prev_val == 0:
+        return ""
+    try:
+        var = ((cur_val - prev_val) / prev_val) * 100.0
+    except Exception:
+        return ""
+    arrow = "↑" if var > 0 else "↓" if var < 0 else "→"
+    color = "#0abf53" if var > 0 else "#d7263d" if var < 0 else "#888"
+    sign = "+" if var > 0 else ""
+    return f" <span style='color:{color}'>{arrow} {sign}{var:.2f}%</span>"
 
 async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str], Optional[float]]]:
     variation: Optional[float] = None
     prev_val: Optional[float] = None
+    val: Optional[float] = None
+    per: Optional[str] = None
+
     for suf in ("/inflacion", "/inflacion/mensual/ultimo", "/inflacion/mensual"):
         j = None
         for base in ARG_DATOS_BASES:
-            j = await fetch_json(session, base+suf)
+            j = await fetch_json(session, base + suf)
             if j:
                 if isinstance(j, dict) and "serie" in j and isinstance(j["serie"], list) and j["serie"]:
                     j = j["serie"]
                 break
-        if j: break
+        if j:
+            break
+
     if isinstance(j, list) and j:
-        last = j[-1]; val = last.get("valor"); per = last.get("fecha") or last.get("periodo")
-        for prev_item in reversed(j[:-1]):
-            if isinstance(prev_item, dict) and prev_item.get("valor") not in (None, ""):
+        latest_idx: Optional[int] = None
+        for idx in range(len(j) - 1, -1, -1):
+            item = j[idx]
+            if isinstance(item, dict) and item.get("valor") not in (None, ""):
                 try:
-                    prev_val = float(prev_item.get("valor"))
+                    val = float(item.get("valor"))
+                    per = item.get("fecha") or item.get("periodo")
+                    latest_idx = idx
                     break
                 except Exception:
-                    prev_val = None
+                    val = None
+                    per = None
+                    latest_idx = None
                     break
+        if val is not None and latest_idx not in (None, 0):
+            for prev_item in reversed(j[:latest_idx]):
+                if isinstance(prev_item, dict) and prev_item.get("valor") not in (None, ""):
+                    try:
+                        prev_val = float(prev_item.get("valor"))
+                        break
+                    except Exception:
+                        prev_val = None
+                        break
     elif isinstance(j, dict):
-        val = j.get("valor"); per = j.get("fecha") or j.get("periodo")
-    else: return None
-    if val is None: return None
-    try:
-        val_f = float(val)
-    except Exception:
+        val_raw = j.get("valor")
+        per = j.get("fecha") or j.get("periodo")
+        try:
+            val = float(val_raw) if val_raw is not None else None
+        except Exception:
+            val = None
+    else:
         return None
+
+    if val is None:
+        return None
+
     if prev_val not in (None, 0):
         try:
-            variation = ((val_f - prev_val) / prev_val) * 100.0
+            variation = ((val - prev_val) / prev_val) * 100.0
         except Exception:
             variation = None
-    return (val_f, per, variation)
+    return (val, per, variation)
 
 
 def _save_reservas_cache(val: float, fecha: Optional[str], prev_val: Optional[float]) -> None:
@@ -1548,31 +1586,44 @@ async def get_reservas_lamacro(session: ClientSession) -> Optional[Tuple[float, 
 
 async def get_reservas_con_variacion(
     session: ClientSession,
-) -> Optional[Tuple[float, Optional[str], Optional[float]]]:
+) -> Optional[Tuple[float, Optional[str], Optional[float], bool]]:
     global RESERVAS_CACHE
+    from_cache = False
     res = await get_reservas_lamacro(session)
     if not res:
-        return None
-    val, fecha = res
-    try:
-        cur_val = float(val)
-    except Exception:
-        return None
-    cached_val = RESERVAS_CACHE.get("val") if isinstance(RESERVAS_CACHE, dict) else None
-    cached_prev = RESERVAS_CACHE.get("prev_val") if isinstance(RESERVAS_CACHE, dict) else None
-    prev_val: Optional[float] = None
-    if isinstance(cached_val, (int, float)):
+        cache_val = RESERVAS_CACHE.get("val") if isinstance(RESERVAS_CACHE, dict) else None
+        cache_fecha = RESERVAS_CACHE.get("fecha") if isinstance(RESERVAS_CACHE, dict) else None
+        cache_prev = RESERVAS_CACHE.get("prev_val") if isinstance(RESERVAS_CACHE, dict) else None
+        if cache_val is None:
+            return None
         try:
-            prev_val = float(cached_val)
+            cur_val = float(cache_val)
+            prev_val = float(cache_prev) if cache_prev is not None else None
         except Exception:
-            prev_val = None
-    elif isinstance(cached_prev, (int, float)):
+            return None
+        fecha = cache_fecha
+        from_cache = True
+    else:
+        val, fecha = res
         try:
-            prev_val = float(cached_prev)
+            cur_val = float(val)
         except Exception:
-            prev_val = None
-    _save_reservas_cache(cur_val, fecha, prev_val)
-    return (cur_val, fecha, prev_val)
+            return None
+        cached_val = RESERVAS_CACHE.get("val") if isinstance(RESERVAS_CACHE, dict) else None
+        cached_prev = RESERVAS_CACHE.get("prev_val") if isinstance(RESERVAS_CACHE, dict) else None
+        prev_val: Optional[float] = None
+        if isinstance(cached_val, (int, float)):
+            try:
+                prev_val = float(cached_val)
+            except Exception:
+                prev_val = None
+        elif isinstance(cached_prev, (int, float)):
+            try:
+                prev_val = float(cached_prev)
+            except Exception:
+                prev_val = None
+        _save_reservas_cache(cur_val, fecha, prev_val)
+    return (cur_val, fecha, prev_val, from_cache)
 
 # ============================ RAVA ============================
 
@@ -2983,14 +3034,10 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     def _fmt_var(val: Optional[float]) -> str:
         if val is None:
             return f"{'—':>12}"
-        if val > 0:
-            icon = "🔺"  # flecha roja hacia arriba
-        elif val < 0:
-            icon = "🔻"  # triángulo verde hacia abajo
-        else:
-            icon = "➡️"
+        arrow = "↑" if val > 0 else "↓" if val < 0 else "→"
+        color = "#d7263d" if val > 0 else "#0abf53" if val < 0 else "#888"
         num = f"{val:+.2f}%"
-        return f"{icon} {num:>8}"
+        return f"<span style='color:{color}'>{arrow} {num:>8}</span>"
 
     compra_lines = [
         header,
@@ -3638,9 +3685,10 @@ async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not res:
         txt = "No pude obtener reservas ahora."
     else:
-        val, fecha, prev_val = res
+        val, fecha, prev_val, from_cache = res
         var_txt = _format_reservas_variation(prev_val, val)
-        txt = (f"<b>🏦 Reservas BCRA</b>{f' <i>Últ. Act.: {fecha}</i>' if fecha else ''}\n"
+        cache_hint = " <i>(dato en caché)</i>" if from_cache else ""
+        txt = (f"<b>🏦 Reservas BCRA</b>{f' <i>Últ. Act.: {fecha}</i>' if fecha else ''}{cache_hint}\n"
                f"<b>{fmt_number(val,0)} MUS$</b>{var_txt}")
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
