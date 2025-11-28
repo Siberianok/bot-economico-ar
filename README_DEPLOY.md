@@ -23,8 +23,6 @@
 > Plan Free: Render puede reiniciar el worker de vez en cuando. Con Upstash configurado el estado queda fuera de Render; si no, se escribe en un JSON local (`STATE_PATH`). El archivo en `/var/tmp` suele sobrevivir a reinicios suaves, pero no a *redeploys* completos. Para persistencia “fuerte”, usá Upstash o un volumen/bucket externo.
 
 ## 4) Comandos finales
-- `/dolar` — Tipos de cambio (Blue, MEP, CCL, Cripto, Oficial, Mayorista).  
-  Fuente principal: DolarAPI (Ámbito); fallback: CriptoYa.
 - `/reservas` — Reservas BCRA (series oficiales via `apis.datos.gob.ar`).
 - `/inflacion` — Inflación (variación mensual, INDEC via `apis.datos.gob.ar`).
 - `/riesgo` — Riesgo país (Rava).
@@ -49,3 +47,9 @@ pip install -r requirements.txt  # incluye la extra "webhooks" de PTB
 export BOT_TOKEN=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 python bot_econ_full_plus_rank_alerts.py
 ```
+
+## 7) Política de tokens y secretos
+- **Rotación periódica**: regenerá el `BOT_TOKEN` desde BotFather al menos una vez por trimestre o ante cualquier sospecha de fuga. Luego de generar uno nuevo, revocá el anterior para evitar usos indebidos.
+- **Alcances mínimos**: si agregás claves de terceros (ej. Redis, Upstash), usá credenciales con el menor scope posible y evita compartirlas entre ambientes (dev/stage/prod).
+- **Almacenamiento seguro**: cargá todos los secretos solo como *Environment Variables* en Render (o en tu plataforma) y nunca los subas al repositorio. Evitá volcarlos en logs o mensajes de error.
+- **Reemplazos controlados**: documentá la fecha de creación y próxima rotación de cada secreto. Si cambiás una credencial, desplegá inmediatamente después del update de variables para minimizar ventanas de inconsistencia.
