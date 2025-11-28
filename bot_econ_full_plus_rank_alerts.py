@@ -647,6 +647,7 @@ def _ensure_state_path() -> Optional[str]:
         return None
 
 USE_UPSTASH = bool(UPSTASH_URL and UPSTASH_TOKEN)
+USE_UPSTASH_REST = USE_UPSTASH
 USE_UPSTASH_REDIS = bool(UPSTASH_REDIS_URL)
 STATE_PATH = ensure_writable_path(ENV_STATE_PATH, log)
 STATE_STORE: StateStore
