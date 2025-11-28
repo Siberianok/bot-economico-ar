@@ -32,6 +32,7 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes, CallbackQueryHandler,
     MessageHandler, ConversationHandler, filters
 )
+from metrics import metrics
 
 # ============================ CONFIG ============================
 
@@ -521,8 +522,30 @@ def metric_last_price(metrics: Dict[str, Any]) -> Optional[float]:
 
 # ============================ LOGGING ============================
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-log = logging.getLogger("bot-econ-ar")
+log = logging.getLogger(__name__)
+
+
+def instrument_command(name: str, handler: Callable[..., Awaitable[Any]]):
+    async def _wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        metrics.increment(f"command.{name}.total")
+        started = time()
+        try:
+            return await handler(update, context)
+        except Exception:
+            metrics.increment(f"command.{name}.errors")
+            raise
+        finally:
+            metrics.observe_latency_ms(f"command.{name}.latency_ms", (time() - started) * 1000)
+
+    return _wrapper
+
+
+def _record_http_metrics(host: str, duration_ms: float, *, success: bool, timeout: bool = False) -> None:
+    base_key = f"http.{host}" if host else "http.unknown"
+    metrics.observe_latency_ms(f"{base_key}.latency_ms", duration_ms)
+    metrics.increment(f"{base_key}.success" if success else f"{base_key}.errors")
+    if timeout:
+        metrics.increment(f"{base_key}.timeouts")
 
 # ============================ PERSISTENCIA ============================
 
@@ -538,10 +561,16 @@ def _writable_path(candidate: str) -> str:
         fallback = "./state.json"
         try:
             with open(fallback, "a", encoding="utf-8"): pass
-            log.warning("STATE_PATH no escribible (%s). Usando fallback: %s", candidate, fallback)
+            log.error(
+                "STATE_PATH no escribible, usando fallback.",
+                extra={"event": "persistence_failure", "candidate": candidate, "fallback": fallback},
+            )
             return fallback
         except Exception as e:
-            log.warning("No puedo escribir estado: %s", e)
+            log.error(
+                "No puedo escribir estado",
+                extra={"event": "persistence_failure", "candidate": candidate, "error": str(e)},
+            )
             return fallback
 
 USE_UPSTASH = bool(UPSTASH_URL and UPSTASH_TOKEN)
@@ -705,7 +734,11 @@ async def load_state():
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except Exception:
+            except Exception as e:
+                log.error(
+                    "No pude leer estado local",
+                    extra={"event": "persistence_failure", "path": path, "error": str(e)},
+                )
                 data = None
     if data:
         ALERTS = {int(k): v for k, v in data.get("alerts", {}).items()}
@@ -835,7 +868,10 @@ async def save_state():
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
     except Exception as e:
-        log.warning("save_state error: %s", e)
+        log.error(
+            "save_state error",
+            extra={"event": "persistence_failure", "path": path, "error": str(e)},
+        )
 
 # ============================ UTILS ============================
 
@@ -937,6 +973,8 @@ def parse_iso_ddmmyyyy(s: Optional[str]) -> Optional[str]:
 # ============================ HTTP HELPERS ============================
 
 async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dict[str, Any]]:
+    started = time()
+    host = urlparse(url).netloc
     try:
         timeout = kwargs.pop("timeout", ClientTimeout(total=15))
         headers = kwargs.pop("headers", {})
@@ -947,14 +985,26 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
             **kwargs,
         ) as resp:
             if 200 <= resp.status < 300:
-                return await resp.json(content_type=None)
+                payload = await resp.json(content_type=None)
+                _record_http_metrics(host, (time() - started) * 1000, success=True)
+                return payload
             log.warning("GET %s -> %s", url, resp.status)
+    except asyncio.TimeoutError:
+        duration_ms = (time() - started) * 1000
+        _record_http_metrics(host, duration_ms, success=False, timeout=True)
+        log.error("fetch_json timeout", extra={"url": url, "event": "api_timeout", "duration_ms": duration_ms})
+        return None
     except Exception as e:
+        _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning("fetch_json error %s: %s", url, e)
+        return None
+    _record_http_metrics(host, (time() - started) * 1000, success=False)
     return None
 
 
 async def fetch_json_httpx(url: str, **kwargs) -> Optional[Dict[str, Any]]:
+    started = time()
+    host = urlparse(url).netloc
     try:
         timeout = kwargs.pop("timeout", 15)
         headers = kwargs.pop("headers", {})
@@ -965,22 +1015,44 @@ async def fetch_json_httpx(url: str, **kwargs) -> Optional[Dict[str, Any]]:
         ) as client:
             resp = await client.get(url, **kwargs)
             if 200 <= resp.status_code < 300:
-                return resp.json()
+                payload = resp.json()
+                _record_http_metrics(host, (time() - started) * 1000, success=True)
+                return payload
             log.warning("httpx GET %s -> %s", url, resp.status_code)
+    except httpx.TimeoutException:
+        duration_ms = (time() - started) * 1000
+        _record_http_metrics(host, duration_ms, success=False, timeout=True)
+        log.error("fetch_json_httpx timeout", extra={"url": url, "event": "api_timeout", "duration_ms": duration_ms})
+        return None
     except Exception as e:
+        _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning("fetch_json_httpx error %s: %s", url, e)
+        return None
+    _record_http_metrics(host, (time() - started) * 1000, success=False)
     return None
 
 async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str]:
+    started = time()
+    host = urlparse(url).netloc
     try:
         timeout = kwargs.pop("timeout", ClientTimeout(total=15))
         headers = kwargs.pop("headers", {})
         async with session.get(url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs) as resp:
             if resp.status == 200:
-                return await resp.text()
+                body = await resp.text()
+                _record_http_metrics(host, (time() - started) * 1000, success=True)
+                return body
             log.warning("GET %s -> %s", url, resp.status)
+    except asyncio.TimeoutError:
+        duration_ms = (time() - started) * 1000
+        _record_http_metrics(host, duration_ms, success=False, timeout=True)
+        log.error("fetch_text timeout", extra={"url": url, "event": "api_timeout", "duration_ms": duration_ms})
+        return None
     except Exception as e:
+        _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning("fetch_text error %s: %s", url, e)
+        return None
+    _record_http_metrics(host, (time() - started) * 1000, success=False)
     return None
 
 
@@ -2876,7 +2948,10 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[News
             try:
                 collected.extend(_parse_feed_entries(xml))
             except Exception as e:
-                log.warning("RSS parse %s: %s", url, e)
+                log.error(
+                    "RSS parse error",
+                    extra={"url": url, "event": "rss_parse_error", "error": str(e)},
+                )
         return collected
 
     raw_entries.extend(await _collect_feed_entries(RSS_FEEDS))
@@ -7667,9 +7742,12 @@ def setup_health_routes(application: Application) -> None:
     async def _health(_: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
 
+    async def _metrics(_: web.Request) -> web.Response:
+        return web.json_response(metrics.snapshot())
+
     router = inner_app.router
 
-    for path in ("/", "/healthz"):
+    for path, handler in (("/", _health), ("/healthz", _health), ("/metrics", _metrics)):
         already_registered = False
         for route in router.routes():
             resource = getattr(route, "resource", None)
@@ -7683,7 +7761,7 @@ def setup_health_routes(application: Application) -> None:
         if already_registered:
             continue
         try:
-            router.add_get(path, _health)
+            router.add_get(path, handler)
         except (RuntimeError, ValueError) as exc:
             logging.debug("No se pudo registrar ruta %s: %s", path, exc)
 
@@ -7702,24 +7780,24 @@ def build_application() -> Application:
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     # Comandos
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("economia", cmd_menu_economia))
-    app.add_handler(CommandHandler("dolar", cmd_dolar))
-    app.add_handler(CommandHandler("reservas", cmd_reservas))
-    app.add_handler(CommandHandler("inflacion", cmd_inflacion))
-    app.add_handler(CommandHandler("riesgo", cmd_riesgo))
-    app.add_handler(CommandHandler("noticias", cmd_noticias))
-    app.add_handler(CommandHandler("acciones", cmd_acciones_menu))
-    app.add_handler(CommandHandler("cedears", cmd_cedears_menu))
+    app.add_handler(CommandHandler("start", instrument_command("start", cmd_start)))
+    app.add_handler(CommandHandler("economia", instrument_command("economia", cmd_menu_economia)))
+    app.add_handler(CommandHandler("dolar", instrument_command("dolar", cmd_dolar)))
+    app.add_handler(CommandHandler("reservas", instrument_command("reservas", cmd_reservas)))
+    app.add_handler(CommandHandler("inflacion", instrument_command("inflacion", cmd_inflacion)))
+    app.add_handler(CommandHandler("riesgo", instrument_command("riesgo", cmd_riesgo)))
+    app.add_handler(CommandHandler("noticias", instrument_command("noticias", cmd_noticias)))
+    app.add_handler(CommandHandler("acciones", instrument_command("acciones", cmd_acciones_menu)))
+    app.add_handler(CommandHandler("cedears", instrument_command("cedears", cmd_cedears_menu)))
     app.add_handler(CallbackQueryHandler(acc_ced_cb, pattern="^(ACC:|CED:)"))
     app.add_handler(CallbackQueryHandler(econ_cb, pattern="^ECO:"))
 
     # Alertas - menú simple
-    app.add_handler(CommandHandler("alertas_menu", cmd_alertas_menu))
+    app.add_handler(CommandHandler("alertas_menu", instrument_command("alertas_menu", cmd_alertas_menu)))
     app.add_handler(CallbackQueryHandler(alertas_menu_cb, pattern="^AL:(LIST|EDIT|CLEAR|PAUSE|RESUME)$"))
     app.add_handler(CallbackQueryHandler(alertas_edit_cancel, pattern="^AL:EDIT:CANCEL$"))
     app.add_handler(CallbackQueryHandler(alertas_clear_cb, pattern="^CLR:"))
-    app.add_handler(CommandHandler("alertas_pause", cmd_alertas_pause))
+    app.add_handler(CommandHandler("alertas_pause", instrument_command("alertas_pause", cmd_alertas_pause)))
     app.add_handler(CallbackQueryHandler(alerts_pause_cb, pattern="^AP:"))
 
     # Alertas - conversación Agregar
@@ -7759,7 +7837,7 @@ def build_application() -> Application:
     # Suscripciones
     subs_conv = ConversationHandler(
         entry_points=[
-            CommandHandler("subs", cmd_subs),
+            CommandHandler("subs", instrument_command("subs", cmd_subs)),
             CallbackQueryHandler(subs_start_from_cb, pattern="^ST:SUBS$"),
         ],
         states={SUBS_SET_TIME: [CallbackQueryHandler(subs_cb, pattern="^SUBS:")]},
@@ -7771,12 +7849,12 @@ def build_application() -> Application:
     app.add_handler(subs_conv)
 
     # Portafolio
-    app.add_handler(CommandHandler("portafolio", cmd_portafolio))
+    app.add_handler(CommandHandler("portafolio", instrument_command("portafolio", cmd_portafolio)))
     app.add_handler(CallbackQueryHandler(pf_menu_cb, pattern="^PF:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pf_text_input))
 
     # Resumen diario on-demand
-    app.add_handler(CommandHandler("resumen", cmd_resumen_diario))
+    app.add_handler(CommandHandler("resumen", instrument_command("resumen", cmd_resumen_diario)))
 
     return app
 
@@ -7845,6 +7923,9 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        from main import configure_logging
+
+        configure_logging()
         asyncio.run(main())
     except KeyboardInterrupt:
         pass
