@@ -1001,7 +1001,14 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
             **kwargs,
         ) as resp:
             if 200 <= resp.status < 300:
-                return await resp.json(content_type=None)
+                try:
+                    return await resp.json(content_type=None)
+                except Exception as e:
+                    text = await resp.text()
+                    log.info(
+                        "GET %s returned non-JSON (%s), len=%s", url, e, len(text)
+                    )
+                    return None
             log.warning("GET %s -> %s", url, resp.status)
     except Exception as e:
         log.warning("fetch_json error %s: %s", url, e)
