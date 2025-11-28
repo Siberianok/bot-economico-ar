@@ -12,6 +12,8 @@ from urllib.parse import urlparse, quote, parse_qs, urljoin
 import httpx
 import certifi
 
+from bot.config import config
+
 # ====== matplotlib opcional (no rompe si no está instalado) ======
 HAS_MPL = False
 try:
