@@ -36,6 +36,27 @@ from telegram.ext import (
 # ============================ CONFIG ============================
 
 TZ = ZoneInfo("America/Argentina/Buenos_Aires")
+
+
+def _env_flag(name: str, default: str = "false") -> bool:
+    return (os.getenv(name, default) or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _env_int(name: str, default: str, *, min_value: int, max_value: Optional[int] = None) -> int:
+    try:
+        value = int(os.getenv(name, default))
+    except Exception:
+        value = int(default)
+    value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+LINK_PREVIEWS_ENABLED = _env_flag("LINK_PREVIEWS_ENABLED")
+LINK_PREVIEWS_PREFER_SMALL = _env_flag("LINK_PREVIEWS_PREFER_SMALL")
+ALERTS_PAGE_SIZE = _env_int("ALERTS_PAGE_SIZE", "10", min_value=1)
+RANK_TOP_LIMIT = _env_int("RANK_TOP_LIMIT", "3", min_value=1)
+RANK_PROJ_LIMIT = _env_int("RANK_PROJ_LIMIT", "5", min_value=1)
 TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "tgwebhook").strip().strip("/")
 PORT = int(os.getenv("PORT", "10000"))
@@ -3451,17 +3472,17 @@ async def _rank_top3(update: Update, symbols: List[str], title: str):
         mets, last_ts = await metrics_for_symbols(session, symbols)
         fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
         pairs = sorted([(sym, m["6m"]) for sym, m in mets.items() if m.get("6m") is not None], key=lambda x: x[1], reverse=True)
-        top_syms = [sym for sym, _ in pairs[:3]]
+        top_syms = [sym for sym, _ in pairs[: RANK_TOP_LIMIT]]
         msg = format_top3_table(title, fecha, top_syms, mets)
         await update.effective_message.reply_text(
             msg,
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
 
         if HAS_MPL and pairs:
             chart_rows: List[Tuple[str, List[Optional[float]]]] = []
-            for sym, _ in pairs[:3]:
+            for sym, _ in pairs[: RANK_TOP_LIMIT]:
                 metrics = mets.get(sym, {})
                 values: List[Optional[float]] = []
                 for key, _ in RET_SERIES_ORDER:
@@ -3497,12 +3518,12 @@ async def _rank_proj5(update: Update, symbols: List[str], title: str):
                 continue
             rows.append((sym, projection_3m(m), projection_6m(m)))
         rows.sort(key=lambda x: x[2], reverse=True)
-        top_rows = rows[:5]
+        top_rows = rows[: RANK_PROJ_LIMIT]
         msg = format_proj_dual(title, fecha, top_rows)
         await update.effective_message.reply_text(
             msg,
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
 
         if HAS_MPL and top_rows:
@@ -3563,7 +3584,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("🌐 Cedears Proyección", callback_data="CED:TOP5"),
-            InlineKeyboardButton("🔔 Mis alertas", callback_data="AL:LIST"),
+            InlineKeyboardButton("🔔 Mis alertas", callback_data="AL:LIST:0"),
         ],
         [
             InlineKeyboardButton("🧾 Resumen diario", callback_data="ST:SUBS"),
@@ -3575,7 +3596,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         intro,
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(kb_rows),
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        link_preview_options=build_preview_options(),
     )
 
 async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3585,7 +3606,7 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             "No pude obtener cotizaciones ahora.",
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
         return
 
@@ -3594,7 +3615,7 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             msg,
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
 
 def _extract_json_object_with_bands(text: str) -> Optional[Dict[str, Any]]:
@@ -3918,7 +3939,7 @@ async def cmd_bandas_cambiarias(update: Update, context: ContextTypes.DEFAULT_TY
         await update.effective_message.reply_text(
             "No pude obtener bandas cambiarias ahora.",
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
         return
 
@@ -3926,7 +3947,7 @@ async def cmd_bandas_cambiarias(update: Update, context: ContextTypes.DEFAULT_TY
     await update.effective_message.reply_text(
         msg,
         parse_mode=ParseMode.HTML,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        link_preview_options=build_preview_options(),
     )
 
 async def cmd_acciones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3960,6 +3981,8 @@ async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "CED:TOP5":
         await _rank_proj5(update, CEDEARS_BA, "🏁 Top 5 Cedears (Proyección)")
         await dec_and_maybe_show(update, context, "cedears", cmd_cedears_menu)
+    else:
+        await q.answer("Selección inválida.", show_alert=True)
 
 # ---------- Macro ----------
 
@@ -4031,7 +4054,7 @@ async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
         header_body,
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        link_preview_options=build_preview_options(),
     )
     for text, img in items:
         if img:
@@ -4044,7 +4067,7 @@ async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text(
                 text,
                 parse_mode=ParseMode.HTML,
-                link_preview_options=LinkPreviewOptions(prefer_small_media=True),
+                link_preview_options=build_preview_options(disable_by_default=False, prefer_small_media=True),
             )
 
 async def cmd_menu_economia(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4133,6 +4156,19 @@ def _has_duplicate_alert(
 
 def kb(rows: List[List[Tuple[str,str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=data) for text, data in r] for r in rows])
+
+
+def build_preview_options(
+    *, disable_by_default: bool = True, prefer_small_media: bool = False
+) -> Optional[LinkPreviewOptions]:
+    prefer_small = prefer_small_media or LINK_PREVIEWS_PREFER_SMALL
+    if LINK_PREVIEWS_ENABLED:
+        return LinkPreviewOptions(is_disabled=False, prefer_small_media=prefer_small)
+    if disable_by_default:
+        return LinkPreviewOptions(is_disabled=True)
+    if prefer_small:
+        return LinkPreviewOptions(prefer_small_media=True)
+    return None
 
 def kb_tickers(symbols: List[str], back_target: str, prefix: str) -> InlineKeyboardMarkup:
     rows: List[List[Tuple[str,str]]] = []; row: List[Tuple[str,str]] = []
@@ -4286,7 +4322,7 @@ async def get_top_crypto_bases(
 
 def kb_alertas_menu() -> InlineKeyboardMarkup:
     return kb([
-        [("Listar", "AL:LIST"), ("Agregar", "AL:ADD")],
+        [("Listar", "AL:LIST:0"), ("Agregar", "AL:ADD")],
         [("Modificar", "AL:EDIT"), ("Borrar", "AL:CLEAR")],
         [("Pausar", "AL:PAUSE"), ("Reanudar", "AL:RESUME")],
     ])
@@ -4310,10 +4346,7 @@ async def cmd_alertas_menu(
 async def alertas_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
-    if data == "AL:LIST":
-        await cmd_alertas_list(update, context)
-        await cmd_alertas_menu(update, context)
-    elif data == "AL:EDIT":
+    if data == "AL:EDIT":
         await cmd_alertas_edit(update, context)
     elif data == "AL:CLEAR":
         await cmd_alertas_clear(update, context)
@@ -4322,16 +4355,34 @@ async def alertas_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "AL:RESUME":
         await cmd_alertas_resume(update, context)
         await cmd_alertas_menu(update, context)
+    else:
+        await q.answer("Opción de menú inválida.", show_alert=True)
 
-async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_alertas_list(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    start_idx: int = 0,
+    *,
+    edit: bool = False,
+) -> None:
     chat_id = update.effective_chat.id
-    rules = ALERTS.get(chat_id, [])
+    rules = ALERTS.get(chat_id, []) or []
     now = datetime.now(TZ)
+
     if not rules:
         txt = "No tenés alertas configuradas.\nUsá /alertas_menu → Agregar."
+        markup = kb([[("Volver", "AL:MENU")]])
     else:
-        lines = ["<b>🔔 Alertas Configuradas</b>"]
-        for i, r in enumerate(rules, 1):
+        page_size = ALERTS_PAGE_SIZE
+        last_start = max(0, ((len(rules) - 1) // page_size) * page_size)
+        start = max(0, min(start_idx, last_start))
+        end = min(len(rules), start + page_size)
+
+        lines = [
+            "<b>🔔 Alertas Configuradas</b>",
+            f"<i>Mostrando {start + 1}-{end} de {len(rules)}</i>",
+        ]
+        for i, r in enumerate(rules[start:end], start=start + 1):
             label = _alert_rule_label(r)
             status = _alert_pause_status(r, now=now)
             if status:
@@ -4344,7 +4395,49 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             until = datetime.fromtimestamp(ALERTS_SILENT_UNTIL[chat_id], TZ)
             lines.append(f"\n<i>Alertas en pausa hasta {until.strftime('%d/%m %H:%M')}</i>")
         txt = "\n".join(lines)
-    await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
+
+        buttons: List[List[Tuple[str, str]]] = []
+        if len(rules) > page_size:
+            row: List[Tuple[str, str]] = []
+            prev_idx = max(0, start - page_size)
+            if start > 0:
+                row.append(("⬅️ Anteriores", f"AL:LIST:{prev_idx}"))
+            if end < len(rules):
+                row.append(("➡️ Siguientes", f"AL:LIST:{end}"))
+            if row:
+                buttons.append(row)
+        buttons.append([("Volver", "AL:MENU")])
+        markup = kb(buttons)
+
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(
+            txt, parse_mode=ParseMode.HTML, reply_markup=markup
+        )
+    else:
+        await update.effective_message.reply_text(
+            txt, parse_mode=ParseMode.HTML, reply_markup=markup
+        )
+
+
+async def alertas_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    parts = data.split(":", 2)
+    start_idx = 0
+    if len(parts) >= 3:
+        try:
+            start_idx = max(0, int(parts[2]))
+        except ValueError:
+            await q.answer("Página inválida.", show_alert=True)
+            return
+    await cmd_alertas_list(update, context, start_idx=start_idx, edit=True)
+
+
+async def alertas_menu_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await cmd_alertas_menu(update, context, edit=True)
 
 async def cmd_alertas_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -7621,7 +7714,11 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
         partes.append(format_news_block(news)[0])
 
     txt = "\n\n".join(partes) if partes else "Sin datos para el resumen ahora."
-    await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    await update.effective_message.reply_text(
+        txt,
+        parse_mode=ParseMode.HTML,
+        link_preview_options=build_preview_options(),
+    )
 
 # ============================ WEBHOOK / APP ============================
 
@@ -7716,7 +7813,9 @@ def build_application() -> Application:
 
     # Alertas - menú simple
     app.add_handler(CommandHandler("alertas_menu", cmd_alertas_menu))
-    app.add_handler(CallbackQueryHandler(alertas_menu_cb, pattern="^AL:(LIST|EDIT|CLEAR|PAUSE|RESUME)$"))
+    app.add_handler(CallbackQueryHandler(alertas_list_cb, pattern="^AL:LIST(:[0-9]+)?$"))
+    app.add_handler(CallbackQueryHandler(alertas_menu_back_cb, pattern="^AL:MENU$", block=False))
+    app.add_handler(CallbackQueryHandler(alertas_menu_cb, pattern="^AL:(EDIT|CLEAR|PAUSE|RESUME)$"))
     app.add_handler(CallbackQueryHandler(alertas_edit_cancel, pattern="^AL:EDIT:CANCEL$"))
     app.add_handler(CallbackQueryHandler(alertas_clear_cb, pattern="^CLR:"))
     app.add_handler(CommandHandler("alertas_pause", cmd_alertas_pause))
