@@ -3789,6 +3789,25 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
     if pct_inf is None:
         pct_inf = monthly_inf
 
+    def _normalize_upper_variation(val: Optional[float]) -> Optional[float]:
+        if val is None:
+            return None
+
+        reference_candidates: List[Optional[float]] = [
+            daily_generic,
+            daily_sup,
+            monthly_sup,
+            monthly_inf,
+            pct_inf,
+        ]
+        reference = next((r for r in reference_candidates if r is not None), None)
+
+        if reference is not None and val * reference < 0:
+            return -val
+        return val
+
+    pct_sup = _normalize_upper_variation(pct_sup)
+
     sup_txt = fmt_money_ars(banda_sup) if banda_sup is not None else "—"
     inf_txt = fmt_money_ars(banda_inf) if banda_inf is not None else "—"
     var_label = "Variación diaria" if has_daily_data else "Variación"
