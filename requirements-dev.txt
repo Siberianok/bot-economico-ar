@@ -1,0 +1,4 @@
+black==24.8.0
+ruff==0.6.9
+pytest==8.3.3
+pip-audit==2.7.3
