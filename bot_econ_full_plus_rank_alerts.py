@@ -3593,9 +3593,9 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
         if val is None:
             return "—"
         if val > 0:
-            icon = "🟢🔼" if is_upper else "🔺"
+            icon = "🟢⬆️"
         elif val < 0:
-            icon = "🔻" if is_upper else "🟢🔻"
+            icon = "🔻"
         else:
             icon = "➡️"
         return f"{icon} {pct(val, 2)}"
