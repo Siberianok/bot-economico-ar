@@ -23,8 +23,6 @@
 > Plan Free: Render puede reiniciar el worker de vez en cuando. Con Upstash configurado el estado queda fuera de Render; si no, se escribe en un JSON local (`STATE_PATH`). El archivo en `/var/tmp` suele sobrevivir a reinicios suaves, pero no a *redeploys* completos. Para persistencia “fuerte”, usá Upstash o un volumen/bucket externo.
 
 ## 4) Comandos finales
-- `/dolar` — Tipos de cambio (Blue, MEP, CCL, Cripto, Oficial, Mayorista).  
-  Fuente principal: DolarAPI (Ámbito); fallback: CriptoYa.
 - `/reservas` — Reservas BCRA (series oficiales via `apis.datos.gob.ar`).
 - `/inflacion` — Inflación (variación mensual, INDEC via `apis.datos.gob.ar`).
 - `/riesgo` — Riesgo país (Rava).

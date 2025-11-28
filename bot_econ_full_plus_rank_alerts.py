@@ -7786,7 +7786,6 @@ def setup_health_routes(application: Application) -> None:
 
 BOT_COMMANDS = [
     BotCommand("economia","Menú de economía"),
-    BotCommand("dolar","Tipos de cambio"),
     BotCommand("acciones","Menú acciones"),
     BotCommand("cedears","Menú cedears"),
     BotCommand("alertas_menu","Configurar alertas"),
@@ -7801,7 +7800,6 @@ def build_application() -> Application:
     # Comandos
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("economia", cmd_menu_economia))
-    app.add_handler(CommandHandler("dolar", cmd_dolar))
     app.add_handler(CommandHandler("reservas", cmd_reservas))
     app.add_handler(CommandHandler("inflacion", cmd_inflacion))
     app.add_handler(CommandHandler("riesgo", cmd_riesgo))
