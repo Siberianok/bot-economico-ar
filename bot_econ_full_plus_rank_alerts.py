@@ -701,10 +701,23 @@ def is_throttled(command: str, chat_id: Optional[int], user_id: Optional[int], t
 async def load_state():
     global ALERTS, SUBS, PF, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE, RIESGO_CACHE, RESERVAS_CACHE, DOLAR_CACHE
     data: Optional[Dict[str, Any]] = None
-    if USE_UPSTASH:
-        data = await _load_state_from_upstash()
-    if data is None and USE_UPSTASH_REDIS:
-        data = _load_state_from_redis()
+    try:
+        data = await STATE_STORE.load()
+    except Exception as exc:
+        log.error(
+            "No pude leer estado del store principal",
+            extra={"event": "persistence_failure", "error": str(exc)},
+        )
+
+    if data is None and FALLBACK_STATE_STORE is not None:
+        try:
+            data = await FALLBACK_STATE_STORE.load()
+        except Exception as exc:
+            log.error(
+                "No pude leer estado del store de respaldo",
+                extra={"event": "persistence_failure", "error": str(exc)},
+            )
+
     if data is None:
         path = _ensure_state_path()
         if path:
@@ -717,8 +730,10 @@ async def load_state():
                     extra={"event": "persistence_failure", "path": path, "error": str(e)},
                 )
                 data = None
+
     version = CURRENT_STATE_VERSION
     if data:
+        data = deserialize_state_payload(data)
         version = data.get("version", CURRENT_STATE_VERSION)
         ALERTS = {int(k): v for k, v in data.get("alerts", {}).items()}
         SUBS = {int(k): v for k, v in data.get("subs", {}).items()}
