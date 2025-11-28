@@ -35,6 +35,16 @@ from telegram.ext import (
 )
 from metrics import metrics
 
+from bot.persistence.state import (
+    CURRENT_STATE_VERSION,
+    JsonFileStore,
+    RedisStore,
+    StateStore,
+    deserialize_state_payload,
+    ensure_writable_path,
+    serialize_state_payload,
+)
+
 # ============================ CONFIG ============================
 
 TZ = ZoneInfo("America/Argentina/Buenos_Aires")
@@ -629,7 +639,21 @@ def _writable_path(candidate: str) -> str:
 
 USE_UPSTASH = bool(UPSTASH_URL and UPSTASH_TOKEN)
 USE_UPSTASH_REDIS = bool(UPSTASH_REDIS_URL)
-STATE_PATH = _writable_path(ENV_STATE_PATH) if not (USE_UPSTASH or USE_UPSTASH_REDIS) else None
+STATE_PATH = ensure_writable_path(ENV_STATE_PATH, log)
+STATE_STORE: StateStore
+FALLBACK_STATE_STORE: Optional[StateStore] = None
+
+if USE_UPSTASH_REST or USE_UPSTASH_REDIS:
+    STATE_STORE = RedisStore(
+        state_key=UPSTASH_STATE_KEY,
+        rest_url=UPSTASH_URL if USE_UPSTASH_REST else "",
+        rest_token=UPSTASH_TOKEN if USE_UPSTASH_REST else "",
+        redis_url=UPSTASH_REDIS_URL if USE_UPSTASH_REDIS else "",
+    )
+    FALLBACK_STATE_STORE = JsonFileStore(STATE_PATH)
+else:
+    STATE_STORE = JsonFileStore(STATE_PATH)
+
 ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 SUBS: Dict[int, Dict[str, Any]] = {}
 PF: Dict[int, Dict[str, Any]] = {}
@@ -661,140 +685,6 @@ def is_throttled(command: str, chat_id: Optional[int], user_id: Optional[int], t
         if CMD_THROTTLER.hit(bucket, ttl):
             return True
     return False
-
-_REDIS_CLIENT: Optional[Any] = None
-_REDIS_CLIENT_INITIALIZED = False
-
-
-def _ensure_state_path() -> Optional[str]:
-    global STATE_PATH
-    if STATE_PATH:
-        return STATE_PATH
-    STATE_PATH = _writable_path(ENV_STATE_PATH)
-    return STATE_PATH
-
-
-def _get_redis_client():
-    global _REDIS_CLIENT, _REDIS_CLIENT_INITIALIZED, USE_UPSTASH_REDIS
-    if not USE_UPSTASH_REDIS:
-        return None
-    if _REDIS_CLIENT_INITIALIZED:
-        return _REDIS_CLIENT
-    _REDIS_CLIENT_INITIALIZED = True
-    try:
-        import redis  # type: ignore
-    except Exception as e:
-        log.warning("Paquete redis no disponible: %s", e)
-        USE_UPSTASH_REDIS = False
-        _REDIS_CLIENT = None
-        return None
-    try:
-        _REDIS_CLIENT = redis.Redis.from_url(
-            UPSTASH_REDIS_URL,
-            decode_responses=True,
-            socket_timeout=5,
-        )
-        return _REDIS_CLIENT
-    except Exception as e:
-        log.warning("No pude inicializar cliente Redis de Upstash: %s", e)
-        USE_UPSTASH_REDIS = False
-        _REDIS_CLIENT = None
-        return None
-
-
-async def _upstash_request(
-    path: str, *, method: str = "GET", data: Optional[str] = None, session: Optional[ClientSession] = None
-) -> Dict[str, Any]:
-    if not USE_UPSTASH:
-        raise RuntimeError("Upstash no configurado")
-    url = f"{UPSTASH_URL.rstrip('/')}/{path.lstrip('/')}"
-    headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-    payload = data.encode("utf-8") if data is not None else None
-    owns_session = session is None
-    if session is None:
-        session = ClientSession(timeout=ClientTimeout(total=10))
-    try:
-        async with session.request(method, url, data=payload, headers=headers) as resp:
-            body = await resp.text()
-            if resp.status >= 400:
-                raise RuntimeError(f"Upstash HTTP {resp.status}: {body}")
-    except ClientError as e:
-        raise RuntimeError(f"Upstash connection error: {e}") from e
-    finally:
-        if owns_session:
-            await session.close()
-    try:
-        return json.loads(body)
-    except Exception as e:
-        raise RuntimeError(f"Upstash invalid response: {body}") from e
-
-
-async def _load_state_from_upstash() -> Optional[Dict[str, Any]]:
-    try:
-        resp = await _upstash_request(f"get/{UPSTASH_STATE_KEY}")
-    except Exception as e:
-        log.warning("No pude leer estado de Upstash: %s", e)
-        return None
-    raw = resp.get("result") if isinstance(resp, dict) else None
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except Exception as e:
-        log.warning("Estado Upstash inválido: %s", e)
-        return None
-
-
-async def _save_state_to_upstash(payload: Dict[str, Any]) -> None:
-    data = json.dumps(payload, ensure_ascii=False)
-    primary_error: Optional[Exception] = None
-    try:
-        encoded = quote(data, safe="")
-        await _upstash_request(f"set/{UPSTASH_STATE_KEY}/{encoded}", method="POST")
-        return
-    except Exception as e:
-        primary_error = e
-    try:
-        await _upstash_request(f"set/{UPSTASH_STATE_KEY}", method="POST", data=data)
-    except Exception as e:
-        if primary_error:
-            log.warning(
-                "No pude guardar estado en Upstash (fallback falló tras error primario %s): %s",
-                primary_error,
-                e,
-            )
-        else:
-            log.warning("No pude guardar estado en Upstash: %s", e)
-
-
-def _load_state_from_redis() -> Optional[Dict[str, Any]]:
-    client = _get_redis_client()
-    if not client:
-        return None
-    try:
-        raw = client.get(UPSTASH_STATE_KEY)
-    except Exception as e:
-        log.warning("No pude leer estado desde Redis Upstash: %s", e)
-        return None
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except Exception as e:
-        log.warning("Estado Redis Upstash inválido: %s", e)
-        return None
-
-
-def _save_state_to_redis(payload: Dict[str, Any]) -> bool:
-    client = _get_redis_client()
-    if not client:
-        return False
-    try:
-        client.set(UPSTASH_STATE_KEY, json.dumps(payload, ensure_ascii=False))
-        return True
-    except Exception as e:
-        log.warning("No pude guardar estado en Redis Upstash: %s", e)
-        return False
 
 
 async def load_state():
@@ -843,72 +733,90 @@ async def load_state():
         cache_riesgo = data.get("riesgo_cache")
         if isinstance(cache_riesgo, dict) and cache_riesgo.get("val") is not None:
             try:
-                cache_val = int(cache_riesgo.get("val"))
-                cache_fecha = str(cache_riesgo.get("fecha")) if cache_riesgo.get("fecha") is not None else None
-                cache_var = float(cache_riesgo.get("variation")) if cache_riesgo.get("variation") is not None else None
-                cache_ts_raw = cache_riesgo.get("updated_at")
-                cache_ts = float(cache_ts_raw) if cache_ts_raw is not None else None
-                RIESGO_CACHE = {
-                    "val": cache_val,
-                    "fecha": cache_fecha,
-                    "variation": cache_var,
-                    "updated_at": cache_ts,
-                }
+                stem_str = str(stem)
+                ts_val = float(ts)
             except Exception:
-                RIESGO_CACHE = {}
-        else:
+                continue
+            NEWS_HISTORY.append((stem_str, ts_val))
+    cache_date = payload.get("news_cache_date")
+    cache_items = payload.get("news_cache_items")
+    if isinstance(cache_items, list) and isinstance(cache_date, str):
+        NEWS_CACHE = {"date": cache_date, "items": cache_items}
+    else:
+        NEWS_CACHE = {"date": "", "items": []}
+    cache_riesgo = payload.get("riesgo_cache")
+    if isinstance(cache_riesgo, dict) and cache_riesgo.get("val") is not None:
+        try:
+            cache_val = int(cache_riesgo.get("val"))
+            cache_fecha = str(cache_riesgo.get("fecha")) if cache_riesgo.get("fecha") is not None else None
+            cache_var = float(cache_riesgo.get("variation")) if cache_riesgo.get("variation") is not None else None
+            cache_ts_raw = cache_riesgo.get("updated_at")
+            cache_ts = float(cache_ts_raw) if cache_ts_raw is not None else None
+            RIESGO_CACHE = {
+                "val": cache_val,
+                "fecha": cache_fecha,
+                "variation": cache_var,
+                "updated_at": cache_ts,
+            }
+        except Exception:
             RIESGO_CACHE = {}
+    else:
+        RIESGO_CACHE = {}
 
-        cache_reservas = data.get("reservas_cache")
-        if isinstance(cache_reservas, dict) and cache_reservas.get("val") is not None:
-            try:
-                cache_val = float(cache_reservas.get("val"))
-                cache_prev = cache_reservas.get("prev_val")
-                cache_prev_val = float(cache_prev) if cache_prev is not None else None
-                cache_fecha = (
-                    str(cache_reservas.get("fecha"))
-                    if cache_reservas.get("fecha") is not None
-                    else None
-                )
-                cache_ts_raw = cache_reservas.get("updated_at")
-                cache_ts = float(cache_ts_raw) if cache_ts_raw is not None else None
-                RESERVAS_CACHE = {
-                    "val": cache_val,
-                    "prev_val": cache_prev_val,
-                    "fecha": cache_fecha,
-                    "updated_at": cache_ts,
-                }
-            except Exception:
-                RESERVAS_CACHE = {}
-        else:
+    cache_reservas = payload.get("reservas_cache")
+    if isinstance(cache_reservas, dict) and cache_reservas.get("val") is not None:
+        try:
+            cache_val = float(cache_reservas.get("val"))
+            cache_prev = cache_reservas.get("prev_val")
+            cache_prev_val = float(cache_prev) if cache_prev is not None else None
+            cache_fecha = (
+                str(cache_reservas.get("fecha"))
+                if cache_reservas.get("fecha") is not None
+                else None
+            )
+            cache_ts_raw = cache_reservas.get("updated_at")
+            cache_ts = float(cache_ts_raw) if cache_ts_raw is not None else None
+            RESERVAS_CACHE = {
+                "val": cache_val,
+                "prev_val": cache_prev_val,
+                "fecha": cache_fecha,
+                "updated_at": cache_ts,
+            }
+        except Exception:
             RESERVAS_CACHE = {}
+    else:
+        RESERVAS_CACHE = {}
 
-        cache_dolar = data.get("dolar_cache")
-        if isinstance(cache_dolar, dict):
-            cached_data = cache_dolar.get("data") if isinstance(cache_dolar.get("data"), dict) else None
-            ts_raw = cache_dolar.get("updated_at")
-            try:
-                ts_val = float(ts_raw) if ts_raw is not None else None
-            except Exception:
-                ts_val = None
+    cache_dolar = payload.get("dolar_cache")
+    version = payload.get("version", CURRENT_STATE_VERSION)
+    if isinstance(cache_dolar, dict):
+        cached_data = cache_dolar.get("data") if isinstance(cache_dolar.get("data"), dict) else None
+        ts_raw = cache_dolar.get("updated_at")
+        try:
+            ts_val = float(ts_raw) if ts_raw is not None else None
+        except Exception:
+            ts_val = None
 
-            if cached_data and any(
-                isinstance(v, dict) and (v.get("compra") is not None or v.get("venta") is not None)
-                for v in cached_data.values()
-            ):
-                DOLAR_CACHE = {"data": cached_data, "updated_at": ts_val}
-            else:
-                DOLAR_CACHE = {}
+        if cached_data and any(
+            isinstance(v, dict) and (v.get("compra") is not None or v.get("venta") is not None)
+            for v in cached_data.values()
+        ):
+            DOLAR_CACHE = {"data": cached_data, "updated_at": ts_val}
         else:
             DOLAR_CACHE = {}
+    else:
+        DOLAR_CACHE = {}
+    if data:
         log.info(
-            "State loaded. alerts=%d subs=%d pf=%d",
+            "State loaded (v%s). alerts=%d subs=%d pf=%d",
+            version,
             sum(len(v) for v in ALERTS.values()),
             len(SUBS),
             len(PF),
         )
     else:
-        log.info("No previous state found.")
+        log.info("No previous state found (v%s).", version)
+
 
 def _prune_news_history(now: Optional[float] = None, window_hours: int = 72) -> None:
     global NEWS_HISTORY
@@ -919,26 +827,22 @@ def _prune_news_history(now: Optional[float] = None, window_hours: int = 72) -> 
 
 async def save_state():
     _prune_news_history()
-    payload = {
-        "alerts": ALERTS,
-        "subs": SUBS,
-        "pf": PF,
-        "alert_usage": ALERT_USAGE,
-        "news_history": NEWS_HISTORY,
-        "news_cache_date": NEWS_CACHE.get("date", ""),
-        "news_cache_items": NEWS_CACHE.get("items", []),
-        "riesgo_cache": RIESGO_CACHE,
-        "reservas_cache": RESERVAS_CACHE,
-        "dolar_cache": DOLAR_CACHE,
-    }
-    if USE_UPSTASH:
-        await _save_state_to_upstash(payload)
-        return
-    if USE_UPSTASH_REDIS and _save_state_to_redis(payload):
-        return
-    path = _ensure_state_path()
-    if not path:
-        log.warning("No tengo ruta de estado para guardar en disco.")
+    payload = serialize_state_payload(
+        {
+            "alerts": ALERTS,
+            "subs": SUBS,
+            "pf": PF,
+            "alert_usage": ALERT_USAGE,
+            "news_history": NEWS_HISTORY,
+            "news_cache_date": NEWS_CACHE.get("date", ""),
+            "news_cache_items": NEWS_CACHE.get("items", []),
+            "riesgo_cache": RIESGO_CACHE,
+            "reservas_cache": RESERVAS_CACHE,
+            "dolar_cache": DOLAR_CACHE,
+        }
+    )
+    stored = await STATE_STORE.save(payload)
+    if stored or FALLBACK_STATE_STORE is None:
         return
     try:
         with open(path, "w", encoding="utf-8") as f:
