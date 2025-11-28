@@ -13,6 +13,7 @@ import httpx
 import certifi
 
 from bot.config import config
+from bot.services.cache import RateLimiter, ShortCache
 
 # ====== matplotlib opcional (no rompe si no está instalado) ======
 HAS_MPL = False
