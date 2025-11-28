@@ -32,6 +32,7 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes, CallbackQueryHandler,
     MessageHandler, ConversationHandler, filters
 )
+from bot.services.cache import RateLimiter, ShortCache
 
 # ============================ CONFIG ============================
 
@@ -556,6 +557,28 @@ NEWS_CACHE: Dict[str, Any] = {"date": "", "items": []}
 RIESGO_CACHE: Dict[str, Any] = {}
 RESERVAS_CACHE: Dict[str, Any] = {}
 DOLAR_CACHE: Dict[str, Any] = {}
+SHORT_CACHE = ShortCache(default_ttl=45, redis_url=UPSTASH_REDIS_URL, namespace="bot-econ:short")
+CMD_THROTTLER = RateLimiter(redis_url=UPSTASH_REDIS_URL, namespace="bot-econ:throttle")
+
+
+def invalidate_rankings_cache() -> None:
+    SHORT_CACHE.invalidate_prefix("rankings:")
+
+
+def invalidate_alerts_cache() -> None:
+    SHORT_CACHE.invalidate_prefix("alerts:")
+
+
+def is_throttled(command: str, chat_id: Optional[int], user_id: Optional[int], ttl: int = 45) -> bool:
+    buckets = []
+    if chat_id is not None:
+        buckets.append(f"{command}:chat:{chat_id}")
+    if user_id is not None:
+        buckets.append(f"{command}:user:{user_id}")
+    for bucket in buckets:
+        if CMD_THROTTLER.hit(bucket, ttl):
+            return True
+    return False
 
 _REDIS_CLIENT: Optional[Any] = None
 _REDIS_CLIENT_INITIALIZED = False
@@ -1200,6 +1223,10 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
     global DOLAR_CACHE
     data: Dict[str, Dict[str, Any]] = {}
     variations: Dict[str, float] = {}
+    cache_key = "quotes:dolares"
+    cached_short = SHORT_CACHE.get(cache_key)
+    if isinstance(cached_short, dict) and _has_fx_data(cached_short):
+        return cached_short
 
     def _safe_float(val: Any) -> Optional[float]:
         try:
@@ -1400,11 +1427,14 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
     # aquí para simplificar el panel principal.
     if _has_fx_data(merged):
         _save_dolar_cache(merged)
+        SHORT_CACHE.set(cache_key, merged)
         return merged
 
     if isinstance(cached_data, dict) and _has_fx_data(cached_data):
+        SHORT_CACHE.set(cache_key, cached_data)
         return cached_data
 
+    SHORT_CACHE.set(cache_key, merged)
     return merged
 
 async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
@@ -1421,6 +1451,12 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
     fecha: Optional[str] = None
     variation: Optional[float] = None
     from_cache = False
+    cache_key = "macro:riesgo"
+    cached_short = SHORT_CACHE.get(cache_key)
+    if isinstance(cached_short, (list, tuple)):
+        cached_tuple = tuple(cached_short)
+        if len(cached_tuple) >= 3:
+            return cached_tuple  # type: ignore[return-value]
 
     value_keys = {"valor", "value", "ultimo", "last", "riesgo", "embi", "current", "close", "latest"}
     date_keys = {
@@ -1600,12 +1636,14 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
             cache_val_int = int(cache_val)
         except Exception:
             return None
-        return (
+        res = (
             cache_val_int,
             RIESGO_CACHE.get("fecha") if isinstance(RIESGO_CACHE, dict) else None,
             RIESGO_CACHE.get("variation") if isinstance(RIESGO_CACHE, dict) else None,
             True,
         )
+        SHORT_CACHE.set(cache_key, res)
+        return res
 
     try:
         rounded = int(round(val))
@@ -1613,7 +1651,9 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
         return None
 
     _save_riesgo_cache(rounded, fecha, variation)
-    return (rounded, fecha, variation, from_cache)
+    res = (rounded, fecha, variation, from_cache)
+    SHORT_CACHE.set(cache_key, res)
+    return res
 
 
 def _format_riesgo_variation(var: Optional[float]) -> str:
@@ -1794,6 +1834,10 @@ async def get_reservas_con_variacion(
 ) -> Optional[Tuple[float, Optional[str], Optional[float], bool]]:
     global RESERVAS_CACHE
     from_cache = False
+    cache_key = "macro:reservas"
+    cached_short = SHORT_CACHE.get(cache_key)
+    if isinstance(cached_short, (list, tuple)) and len(cached_short) >= 3:
+        return tuple(cached_short)  # type: ignore[return-value]
     res = await get_reservas_lamacro(session)
     if not res:
         cache_val = RESERVAS_CACHE.get("val") if isinstance(RESERVAS_CACHE, dict) else None
@@ -1837,7 +1881,9 @@ async def get_reservas_con_variacion(
         elif cached_prev_f is not None:
             prev_val = cached_prev_f
         _save_reservas_cache(cur_val, fecha, prev_val)
-    return (cur_val, fecha, prev_val, from_cache)
+    res_tuple = (cur_val, fecha, prev_val, from_cache)
+    SHORT_CACHE.set(cache_key, res_tuple)
+    return res_tuple
 
 # ============================ RAVA ============================
 
@@ -2151,6 +2197,19 @@ async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
         ts = d.get("last_ts")
         if ts: last_ts = ts if last_ts is None else max(last_ts, ts)
     return out, last_ts
+
+
+async def metrics_for_symbols_cached(session: ClientSession, symbols: List[str], ttl: int = 60) -> Tuple[Dict[str, Dict[str, Optional[float]]], Optional[int]]:
+    cache_key = f"rankings:metrics:{','.join(sorted(symbols))}"
+    cached = SHORT_CACHE.get(cache_key)
+    if isinstance(cached, (list, tuple)) and len(cached) == 2:
+        data, ts = cached
+        if isinstance(data, dict):
+            return data, ts  # type: ignore[return-value]
+    invalidate_rankings_cache()
+    res = await metrics_for_symbols(session, symbols)
+    SHORT_CACHE.set(cache_key, res, ttl=ttl)
+    return res
 
 # ============================ NOTICIAS ============================
 
@@ -3447,8 +3506,13 @@ RET_SERIES_ORDER: List[Tuple[str, str]] = [
 
 
 async def _rank_top3(update: Update, symbols: List[str], title: str):
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    user_id = update.effective_user.id if update.effective_user else None
+    if is_throttled("rankings", chat_id, user_id, ttl=35):
+        await update.effective_message.reply_text("⏳ Consultá de nuevo en unos segundos.")
+        return
     async with ClientSession() as session:
-        mets, last_ts = await metrics_for_symbols(session, symbols)
+        mets, last_ts = await metrics_for_symbols_cached(session, symbols)
         fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
         pairs = sorted([(sym, m["6m"]) for sym, m in mets.items() if m.get("6m") is not None], key=lambda x: x[1], reverse=True)
         top_syms = [sym for sym, _ in pairs[:3]]
@@ -3488,8 +3552,13 @@ async def _rank_top3(update: Update, symbols: List[str], title: str):
 
 
 async def _rank_proj5(update: Update, symbols: List[str], title: str):
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    user_id = update.effective_user.id if update.effective_user else None
+    if is_throttled("rankings", chat_id, user_id, ttl=35):
+        await update.effective_message.reply_text("⏳ Consultá de nuevo en unos segundos.")
+        return
     async with ClientSession() as session:
-        mets, last_ts = await metrics_for_symbols(session, symbols)
+        mets, last_ts = await metrics_for_symbols_cached(session, symbols)
         fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
         rows = []
         for sym, m in mets.items():
@@ -4553,13 +4622,13 @@ async def alertas_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "BACK":
         await cmd_alertas_menu(update, context, edit=True); return
     if data == "ALL":
-        cnt = len(rules); ALERTS[chat_id] = []; await save_state()
+        cnt = len(rules); ALERTS[chat_id] = []; invalidate_alerts_cache(); await save_state()
         await q.edit_message_text(f"Se eliminaron {cnt} alertas."); return
     try: idx = int(data)
     except Exception:
         await q.edit_message_text("Acción inválida."); return
     if 0 <= idx < len(rules):
-        rules.pop(idx); await save_state(); await q.edit_message_text("Alerta eliminada.")
+        rules.pop(idx); invalidate_alerts_cache(); await save_state(); await q.edit_message_text("Alerta eliminada.")
     else:
         await q.edit_message_text("Número fuera de rango.")
 
@@ -4693,11 +4762,13 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if rule.pop("pause_until", None) is not None:
                         changed = True
                 if changed:
+                    invalidate_alerts_cache()
                     await save_state()
                 await cmd_alertas_pause(update, context, prefix="🔔 Alertas reanudadas.", edit=True)
                 return
             if op == "INF":
                 ALERTS_PAUSED.add(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
+                invalidate_alerts_cache()
                 await save_state()
                 await cmd_alertas_pause(update, context, prefix="🔕 Alertas en pausa (indefinida).", edit=True)
                 return
@@ -4707,6 +4778,7 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.answer("Acción inválida.", show_alert=True); return
             until = datetime.now(TZ) + timedelta(hours=hrs)
             ALERTS_SILENT_UNTIL[chat_id] = until.timestamp(); ALERTS_PAUSED.discard(chat_id)
+            invalidate_alerts_cache()
             await save_state()
             await cmd_alertas_pause(
                 update,
@@ -4730,6 +4802,7 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 changed = True
             ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
             if changed:
+                invalidate_alerts_cache()
                 await save_state()
             await cmd_alertas_pause(update, context, prefix=f"🔔 Alerta {idx+1} reanudada.", edit=True)
             return
@@ -4737,6 +4810,7 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rule["pause_indef"] = True
             rule.pop("pause_until", None)
             ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
+            invalidate_alerts_cache()
             await save_state()
             await cmd_alertas_pause(update, context, prefix=f"🔕 Alerta {idx+1} en pausa indefinida.", edit=True)
             return
@@ -4748,6 +4822,7 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rule["pause_until"] = until.timestamp()
         rule.pop("pause_indef", None)
         ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
+        invalidate_alerts_cache()
         await save_state()
         await cmd_alertas_pause(
             update,
@@ -4769,6 +4844,7 @@ async def cmd_alertas_resume(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if rule.pop("pause_until", None) is not None:
             changed = True
     if changed:
+        invalidate_alerts_cache()
         await save_state()
     await update.effective_message.reply_text("🔔 Alertas reanudadas.")
 
@@ -5531,6 +5607,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 rules.append(candidate)
             _record_alert_usage(chat_id, al)
+            invalidate_alerts_cache()
             await save_state()
             msg = "Listo. Alerta actualizada ✅" if is_edit else "Listo. Alerta agregada ✅"
             await update.message.reply_text(msg)
@@ -5567,6 +5644,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 rules.append(candidate)
             _record_alert_usage(chat_id, al)
+            invalidate_alerts_cache()
             await save_state()
             msg = "Listo. Alerta actualizada ✅" if is_edit else "Listo. Alerta agregada ✅"
             await update.message.reply_text(msg)
@@ -5609,6 +5687,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 rules.append(candidate)
             _record_alert_usage(chat_id, al)
+            invalidate_alerts_cache()
             await save_state()
             target_s = fmt_crypto_price(thr, quote)
             direction = "sube a" if op == ">" else "baja a"
@@ -5648,6 +5727,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             rules.append(candidate)
         _record_alert_usage(chat_id, al)
+        invalidate_alerts_cache()
         await save_state()
         msg = "Listo. Alerta actualizada ✅" if is_edit else "Listo. Alerta agregada ✅"
         await update.message.reply_text(msg)
@@ -7597,6 +7677,11 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
 # ============================ RESUMEN DIARIO ============================
 
 async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    user_id = update.effective_user.id if update.effective_user else None
+    if is_throttled("resumen", chat_id, user_id, ttl=45):
+        await update.effective_message.reply_text("⏳ Esperá unos segundos antes de pedir otro resumen.")
+        return
     async with ClientSession() as session:
         fx = await get_dolares(session)
         rp = await get_riesgo_pais(session)
