@@ -3268,12 +3268,17 @@ async def _rank_proj5(update: Update, symbols: List[str], title: str):
 
 def set_menu_counter(context: ContextTypes.DEFAULT_TYPE, name: str, n: int):
     context.user_data.setdefault("menu_counts", {})[name] = n
-def dec_and_maybe_show(update: Update, context: ContextTypes.DEFAULT_TYPE, name: str, show_func):
+async def dec_and_maybe_show(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    name: str,
+    show_func,
+):
     cnt = context.user_data.get("menu_counts", {}).get(name, 0)
-    cnt = max(0, cnt-1)
+    cnt = max(0, cnt - 1)
     context.user_data["menu_counts"][name] = cnt
     if cnt > 0:
-        return show_func(update, context)
+        return await show_func(update, context)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     intro = (
