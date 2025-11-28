@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable, Iterable
 from urllib.parse import urlparse, quote, parse_qs, urljoin
 import httpx
+import certifi
 
 from bot.config import config
 
@@ -34,19 +35,59 @@ from telegram.ext import (
     Application, CommandHandler, ContextTypes, CallbackQueryHandler,
     MessageHandler, ConversationHandler, filters
 )
+from metrics import metrics
+
+from bot.persistence.state import (
+    CURRENT_STATE_VERSION,
+    JsonFileStore,
+    RedisStore,
+    StateStore,
+    deserialize_state_payload,
+    ensure_writable_path,
+    serialize_state_payload,
+)
 
 # ============================ CONFIG ============================
 
 TZ = ZoneInfo("America/Argentina/Buenos_Aires")
-TELEGRAM_TOKEN = config.telegram_token
-WEBHOOK_SECRET = config.webhook_secret
-PORT = config.port
-BASE_URL = config.base_url
-ENV_STATE_PATH = str(config.state_path)
-UPSTASH_URL = config.upstash.rest_url
-UPSTASH_TOKEN = config.upstash.rest_token
-UPSTASH_REDIS_URL = config.upstash.redis_url
-UPSTASH_STATE_KEY = config.upstash.state_key
+
+
+def _env_flag(name: str, default: str = "false") -> bool:
+    return (os.getenv(name, default) or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _env_int(name: str, default: str, *, min_value: int, max_value: Optional[int] = None) -> int:
+    try:
+        value = int(os.getenv(name, default))
+    except Exception:
+        value = int(default)
+    value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+LINK_PREVIEWS_ENABLED = _env_flag("LINK_PREVIEWS_ENABLED")
+LINK_PREVIEWS_PREFER_SMALL = _env_flag("LINK_PREVIEWS_PREFER_SMALL")
+ALERTS_PAGE_SIZE = _env_int("ALERTS_PAGE_SIZE", "10", min_value=1)
+RANK_TOP_LIMIT = _env_int("RANK_TOP_LIMIT", "3", min_value=1)
+RANK_PROJ_LIMIT = _env_int("RANK_PROJ_LIMIT", "5", min_value=1)
+TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "tgwebhook").strip().strip("/")
+PORT = int(os.getenv("PORT", "10000"))
+BASE_URL = os.getenv("BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "http://localhost")).rstrip("/")
+ENV_STATE_PATH = os.getenv("STATE_PATH", "state.json")
+UPSTASH_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("UPSTASH_URL") or "").strip()
+UPSTASH_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("UPSTASH_TOKEN") or "").strip()
+UPSTASH_REDIS_URL = (
+    os.getenv("UPSTASH_REDIS_URL")
+    or os.getenv("REDIS_URL")
+    or os.getenv("redis-url")
+    or ""
+).strip()
+UPSTASH_STATE_KEY = os.getenv("UPSTASH_STATE_KEY", "bot-econ-state").strip()
+
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("TELEGRAM_TOKEN/BOT_TOKEN no configurado.")
 
 WEBHOOK_PATH = f"/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
@@ -75,7 +116,13 @@ YF_URLS = [
     "https://query2.finance.yahoo.com/v8/finance/chart/{symbol}",
 ]
 YF_HEADERS = {"User-Agent": "Mozilla/5.0"}
-REQ_HEADERS = {"User-Agent":"Mozilla/5.0", "Accept":"*/*"}
+REQ_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
+    "Cache-Control": "no-cache",
+}
 
 # ============================ LISTADOS ============================
 
@@ -515,8 +562,56 @@ def metric_last_price(metrics: Dict[str, Any]) -> Optional[float]:
 
 # ============================ LOGGING ============================
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
-log = logging.getLogger("bot-econ-ar")
+log = logging.getLogger(__name__)
+
+
+def instrument_command(name: str, handler: Callable[..., Awaitable[Any]]):
+    async def _wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        metrics.increment(f"command.{name}.total")
+        started = time()
+        try:
+            return await handler(update, context)
+        except Exception:
+            metrics.increment(f"command.{name}.errors")
+            raise
+        finally:
+            metrics.observe_latency_ms(f"command.{name}.latency_ms", (time() - started) * 1000)
+
+    return _wrapper
+
+
+def _record_http_metrics(host: str, duration_ms: float, *, success: bool, timeout: bool = False) -> None:
+    base_key = f"http.{host}" if host else "http.unknown"
+    metrics.observe_latency_ms(f"{base_key}.latency_ms", duration_ms)
+    metrics.increment(f"{base_key}.success" if success else f"{base_key}.errors")
+    if timeout:
+        metrics.increment(f"{base_key}.timeouts")
+
+
+# ============================ ERRORES ============================
+
+async def handle_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    error = context.error
+
+    if isinstance(error, asyncio.CancelledError):
+        return
+
+    try:
+        update_repr = repr(update)
+    except Exception:
+        update_repr = "<update no serializable>"
+
+    log.error("Excepción no manejada (update=%s)", update_repr, exc_info=error)
+
+    try:
+        chat = getattr(update, "effective_chat", None)
+        if chat:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="Ocurrió un error inesperado. Intentalo de nuevo en unos minutos.",
+            )
+    except Exception as notify_error:
+        log.debug("No se pudo notificar el error al chat: %s", notify_error)
 
 # ============================ PERSISTENCIA ============================
 
@@ -532,15 +627,35 @@ def _writable_path(candidate: str) -> str:
         fallback = "./state.json"
         try:
             with open(fallback, "a", encoding="utf-8"): pass
-            log.warning("STATE_PATH no escribible (%s). Usando fallback: %s", candidate, fallback)
+            log.error(
+                "STATE_PATH no escribible, usando fallback.",
+                extra={"event": "persistence_failure", "candidate": candidate, "fallback": fallback},
+            )
             return fallback
         except Exception as e:
-            log.warning("No puedo escribir estado: %s", e)
+            log.error(
+                "No puedo escribir estado",
+                extra={"event": "persistence_failure", "candidate": candidate, "error": str(e)},
+            )
             return fallback
 
 USE_UPSTASH = bool(UPSTASH_URL and UPSTASH_TOKEN)
 USE_UPSTASH_REDIS = bool(UPSTASH_REDIS_URL)
-STATE_PATH = _writable_path(ENV_STATE_PATH) if not (USE_UPSTASH or USE_UPSTASH_REDIS) else None
+STATE_PATH = ensure_writable_path(ENV_STATE_PATH, log)
+STATE_STORE: StateStore
+FALLBACK_STATE_STORE: Optional[StateStore] = None
+
+if USE_UPSTASH_REST or USE_UPSTASH_REDIS:
+    STATE_STORE = RedisStore(
+        state_key=UPSTASH_STATE_KEY,
+        rest_url=UPSTASH_URL if USE_UPSTASH_REST else "",
+        rest_token=UPSTASH_TOKEN if USE_UPSTASH_REST else "",
+        redis_url=UPSTASH_REDIS_URL if USE_UPSTASH_REDIS else "",
+    )
+    FALLBACK_STATE_STORE = JsonFileStore(STATE_PATH)
+else:
+    STATE_STORE = JsonFileStore(STATE_PATH)
+
 ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 SUBS: Dict[int, Dict[str, Any]] = {}
 PF: Dict[int, Dict[str, Any]] = {}
@@ -550,140 +665,28 @@ NEWS_CACHE: Dict[str, Any] = {"date": "", "items": []}
 RIESGO_CACHE: Dict[str, Any] = {}
 RESERVAS_CACHE: Dict[str, Any] = {}
 DOLAR_CACHE: Dict[str, Any] = {}
-
-_REDIS_CLIENT: Optional[Any] = None
-_REDIS_CLIENT_INITIALIZED = False
-
-
-def _ensure_state_path() -> Optional[str]:
-    global STATE_PATH
-    if STATE_PATH:
-        return STATE_PATH
-    STATE_PATH = _writable_path(ENV_STATE_PATH)
-    return STATE_PATH
+SHORT_CACHE = ShortCache(default_ttl=45, redis_url=UPSTASH_REDIS_URL, namespace="bot-econ:short")
+CMD_THROTTLER = RateLimiter(redis_url=UPSTASH_REDIS_URL, namespace="bot-econ:throttle")
 
 
-def _get_redis_client():
-    global _REDIS_CLIENT, _REDIS_CLIENT_INITIALIZED, USE_UPSTASH_REDIS
-    if not USE_UPSTASH_REDIS:
-        return None
-    if _REDIS_CLIENT_INITIALIZED:
-        return _REDIS_CLIENT
-    _REDIS_CLIENT_INITIALIZED = True
-    try:
-        import redis  # type: ignore
-    except Exception as e:
-        log.warning("Paquete redis no disponible: %s", e)
-        USE_UPSTASH_REDIS = False
-        _REDIS_CLIENT = None
-        return None
-    try:
-        _REDIS_CLIENT = redis.Redis.from_url(
-            UPSTASH_REDIS_URL,
-            decode_responses=True,
-            socket_timeout=5,
-        )
-        return _REDIS_CLIENT
-    except Exception as e:
-        log.warning("No pude inicializar cliente Redis de Upstash: %s", e)
-        USE_UPSTASH_REDIS = False
-        _REDIS_CLIENT = None
-        return None
+def invalidate_rankings_cache() -> None:
+    SHORT_CACHE.invalidate_prefix("rankings:")
 
 
-async def _upstash_request(
-    path: str, *, method: str = "GET", data: Optional[str] = None, session: Optional[ClientSession] = None
-) -> Dict[str, Any]:
-    if not USE_UPSTASH:
-        raise RuntimeError("Upstash no configurado")
-    url = f"{UPSTASH_URL.rstrip('/')}/{path.lstrip('/')}"
-    headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-    payload = data.encode("utf-8") if data is not None else None
-    owns_session = session is None
-    if session is None:
-        session = ClientSession(timeout=ClientTimeout(total=10))
-    try:
-        async with session.request(method, url, data=payload, headers=headers) as resp:
-            body = await resp.text()
-            if resp.status >= 400:
-                raise RuntimeError(f"Upstash HTTP {resp.status}: {body}")
-    except ClientError as e:
-        raise RuntimeError(f"Upstash connection error: {e}") from e
-    finally:
-        if owns_session:
-            await session.close()
-    try:
-        return json.loads(body)
-    except Exception as e:
-        raise RuntimeError(f"Upstash invalid response: {body}") from e
+def invalidate_alerts_cache() -> None:
+    SHORT_CACHE.invalidate_prefix("alerts:")
 
 
-async def _load_state_from_upstash() -> Optional[Dict[str, Any]]:
-    try:
-        resp = await _upstash_request(f"get/{UPSTASH_STATE_KEY}")
-    except Exception as e:
-        log.warning("No pude leer estado de Upstash: %s", e)
-        return None
-    raw = resp.get("result") if isinstance(resp, dict) else None
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except Exception as e:
-        log.warning("Estado Upstash inválido: %s", e)
-        return None
-
-
-async def _save_state_to_upstash(payload: Dict[str, Any]) -> None:
-    data = json.dumps(payload, ensure_ascii=False)
-    primary_error: Optional[Exception] = None
-    try:
-        encoded = quote(data, safe="")
-        await _upstash_request(f"set/{UPSTASH_STATE_KEY}/{encoded}", method="POST")
-        return
-    except Exception as e:
-        primary_error = e
-    try:
-        await _upstash_request(f"set/{UPSTASH_STATE_KEY}", method="POST", data=data)
-    except Exception as e:
-        if primary_error:
-            log.warning(
-                "No pude guardar estado en Upstash (fallback falló tras error primario %s): %s",
-                primary_error,
-                e,
-            )
-        else:
-            log.warning("No pude guardar estado en Upstash: %s", e)
-
-
-def _load_state_from_redis() -> Optional[Dict[str, Any]]:
-    client = _get_redis_client()
-    if not client:
-        return None
-    try:
-        raw = client.get(UPSTASH_STATE_KEY)
-    except Exception as e:
-        log.warning("No pude leer estado desde Redis Upstash: %s", e)
-        return None
-    if not raw:
-        return None
-    try:
-        return json.loads(raw)
-    except Exception as e:
-        log.warning("Estado Redis Upstash inválido: %s", e)
-        return None
-
-
-def _save_state_to_redis(payload: Dict[str, Any]) -> bool:
-    client = _get_redis_client()
-    if not client:
-        return False
-    try:
-        client.set(UPSTASH_STATE_KEY, json.dumps(payload, ensure_ascii=False))
-        return True
-    except Exception as e:
-        log.warning("No pude guardar estado en Redis Upstash: %s", e)
-        return False
+def is_throttled(command: str, chat_id: Optional[int], user_id: Optional[int], ttl: int = 45) -> bool:
+    buckets = []
+    if chat_id is not None:
+        buckets.append(f"{command}:chat:{chat_id}")
+    if user_id is not None:
+        buckets.append(f"{command}:user:{user_id}")
+    for bucket in buckets:
+        if CMD_THROTTLER.hit(bucket, ttl):
+            return True
+    return False
 
 
 async def load_state():
@@ -699,7 +702,11 @@ async def load_state():
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-            except Exception:
+            except Exception as e:
+                log.error(
+                    "No pude leer estado local",
+                    extra={"event": "persistence_failure", "path": path, "error": str(e)},
+                )
                 data = None
     if data:
         ALERTS = {int(k): v for k, v in data.get("alerts", {}).items()}
@@ -728,72 +735,90 @@ async def load_state():
         cache_riesgo = data.get("riesgo_cache")
         if isinstance(cache_riesgo, dict) and cache_riesgo.get("val") is not None:
             try:
-                cache_val = int(cache_riesgo.get("val"))
-                cache_fecha = str(cache_riesgo.get("fecha")) if cache_riesgo.get("fecha") is not None else None
-                cache_var = float(cache_riesgo.get("variation")) if cache_riesgo.get("variation") is not None else None
-                cache_ts_raw = cache_riesgo.get("updated_at")
-                cache_ts = float(cache_ts_raw) if cache_ts_raw is not None else None
-                RIESGO_CACHE = {
-                    "val": cache_val,
-                    "fecha": cache_fecha,
-                    "variation": cache_var,
-                    "updated_at": cache_ts,
-                }
+                stem_str = str(stem)
+                ts_val = float(ts)
             except Exception:
-                RIESGO_CACHE = {}
-        else:
+                continue
+            NEWS_HISTORY.append((stem_str, ts_val))
+    cache_date = payload.get("news_cache_date")
+    cache_items = payload.get("news_cache_items")
+    if isinstance(cache_items, list) and isinstance(cache_date, str):
+        NEWS_CACHE = {"date": cache_date, "items": cache_items}
+    else:
+        NEWS_CACHE = {"date": "", "items": []}
+    cache_riesgo = payload.get("riesgo_cache")
+    if isinstance(cache_riesgo, dict) and cache_riesgo.get("val") is not None:
+        try:
+            cache_val = int(cache_riesgo.get("val"))
+            cache_fecha = str(cache_riesgo.get("fecha")) if cache_riesgo.get("fecha") is not None else None
+            cache_var = float(cache_riesgo.get("variation")) if cache_riesgo.get("variation") is not None else None
+            cache_ts_raw = cache_riesgo.get("updated_at")
+            cache_ts = float(cache_ts_raw) if cache_ts_raw is not None else None
+            RIESGO_CACHE = {
+                "val": cache_val,
+                "fecha": cache_fecha,
+                "variation": cache_var,
+                "updated_at": cache_ts,
+            }
+        except Exception:
             RIESGO_CACHE = {}
+    else:
+        RIESGO_CACHE = {}
 
-        cache_reservas = data.get("reservas_cache")
-        if isinstance(cache_reservas, dict) and cache_reservas.get("val") is not None:
-            try:
-                cache_val = float(cache_reservas.get("val"))
-                cache_prev = cache_reservas.get("prev_val")
-                cache_prev_val = float(cache_prev) if cache_prev is not None else None
-                cache_fecha = (
-                    str(cache_reservas.get("fecha"))
-                    if cache_reservas.get("fecha") is not None
-                    else None
-                )
-                cache_ts_raw = cache_reservas.get("updated_at")
-                cache_ts = float(cache_ts_raw) if cache_ts_raw is not None else None
-                RESERVAS_CACHE = {
-                    "val": cache_val,
-                    "prev_val": cache_prev_val,
-                    "fecha": cache_fecha,
-                    "updated_at": cache_ts,
-                }
-            except Exception:
-                RESERVAS_CACHE = {}
-        else:
+    cache_reservas = payload.get("reservas_cache")
+    if isinstance(cache_reservas, dict) and cache_reservas.get("val") is not None:
+        try:
+            cache_val = float(cache_reservas.get("val"))
+            cache_prev = cache_reservas.get("prev_val")
+            cache_prev_val = float(cache_prev) if cache_prev is not None else None
+            cache_fecha = (
+                str(cache_reservas.get("fecha"))
+                if cache_reservas.get("fecha") is not None
+                else None
+            )
+            cache_ts_raw = cache_reservas.get("updated_at")
+            cache_ts = float(cache_ts_raw) if cache_ts_raw is not None else None
+            RESERVAS_CACHE = {
+                "val": cache_val,
+                "prev_val": cache_prev_val,
+                "fecha": cache_fecha,
+                "updated_at": cache_ts,
+            }
+        except Exception:
             RESERVAS_CACHE = {}
+    else:
+        RESERVAS_CACHE = {}
 
-        cache_dolar = data.get("dolar_cache")
-        if isinstance(cache_dolar, dict):
-            cached_data = cache_dolar.get("data") if isinstance(cache_dolar.get("data"), dict) else None
-            ts_raw = cache_dolar.get("updated_at")
-            try:
-                ts_val = float(ts_raw) if ts_raw is not None else None
-            except Exception:
-                ts_val = None
+    cache_dolar = payload.get("dolar_cache")
+    version = payload.get("version", CURRENT_STATE_VERSION)
+    if isinstance(cache_dolar, dict):
+        cached_data = cache_dolar.get("data") if isinstance(cache_dolar.get("data"), dict) else None
+        ts_raw = cache_dolar.get("updated_at")
+        try:
+            ts_val = float(ts_raw) if ts_raw is not None else None
+        except Exception:
+            ts_val = None
 
-            if cached_data and any(
-                isinstance(v, dict) and (v.get("compra") is not None or v.get("venta") is not None)
-                for v in cached_data.values()
-            ):
-                DOLAR_CACHE = {"data": cached_data, "updated_at": ts_val}
-            else:
-                DOLAR_CACHE = {}
+        if cached_data and any(
+            isinstance(v, dict) and (v.get("compra") is not None or v.get("venta") is not None)
+            for v in cached_data.values()
+        ):
+            DOLAR_CACHE = {"data": cached_data, "updated_at": ts_val}
         else:
             DOLAR_CACHE = {}
+    else:
+        DOLAR_CACHE = {}
+    if data:
         log.info(
-            "State loaded. alerts=%d subs=%d pf=%d",
+            "State loaded (v%s). alerts=%d subs=%d pf=%d",
+            version,
             sum(len(v) for v in ALERTS.values()),
             len(SUBS),
             len(PF),
         )
     else:
-        log.info("No previous state found.")
+        log.info("No previous state found (v%s).", version)
+
 
 def _prune_news_history(now: Optional[float] = None, window_hours: int = 72) -> None:
     global NEWS_HISTORY
@@ -804,32 +829,31 @@ def _prune_news_history(now: Optional[float] = None, window_hours: int = 72) -> 
 
 async def save_state():
     _prune_news_history()
-    payload = {
-        "alerts": ALERTS,
-        "subs": SUBS,
-        "pf": PF,
-        "alert_usage": ALERT_USAGE,
-        "news_history": NEWS_HISTORY,
-        "news_cache_date": NEWS_CACHE.get("date", ""),
-        "news_cache_items": NEWS_CACHE.get("items", []),
-        "riesgo_cache": RIESGO_CACHE,
-        "reservas_cache": RESERVAS_CACHE,
-        "dolar_cache": DOLAR_CACHE,
-    }
-    if USE_UPSTASH:
-        await _save_state_to_upstash(payload)
-        return
-    if USE_UPSTASH_REDIS and _save_state_to_redis(payload):
-        return
-    path = _ensure_state_path()
-    if not path:
-        log.warning("No tengo ruta de estado para guardar en disco.")
+    payload = serialize_state_payload(
+        {
+            "alerts": ALERTS,
+            "subs": SUBS,
+            "pf": PF,
+            "alert_usage": ALERT_USAGE,
+            "news_history": NEWS_HISTORY,
+            "news_cache_date": NEWS_CACHE.get("date", ""),
+            "news_cache_items": NEWS_CACHE.get("items", []),
+            "riesgo_cache": RIESGO_CACHE,
+            "reservas_cache": RESERVAS_CACHE,
+            "dolar_cache": DOLAR_CACHE,
+        }
+    )
+    stored = await STATE_STORE.save(payload)
+    if stored or FALLBACK_STATE_STORE is None:
         return
     try:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
     except Exception as e:
-        log.warning("save_state error: %s", e)
+        log.error(
+            "save_state error",
+            extra={"event": "persistence_failure", "path": path, "error": str(e)},
+        )
 
 # ============================ UTILS ============================
 
@@ -931,24 +955,41 @@ def parse_iso_ddmmyyyy(s: Optional[str]) -> Optional[str]:
 # ============================ HTTP HELPERS ============================
 
 async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dict[str, Any]]:
+    started = time()
+    host = urlparse(url).netloc
     try:
-        timeout = kwargs.pop("timeout", ClientTimeout(total=15))
-        headers = kwargs.pop("headers", {})
-        async with session.get(
+        return await http_service.get_json(url, source=source, headers=headers, **kwargs)
+    except SourceSuspendedError as exc:
+        log.warning(
+            "source_suspended source=%s resume_at=%s url=%s",
+            exc.source,
+            exc.resume_at,
             url,
             timeout=timeout,
             headers={**REQ_HEADERS, **headers},
             **kwargs,
         ) as resp:
             if 200 <= resp.status < 300:
-                return await resp.json(content_type=None)
+                payload = await resp.json(content_type=None)
+                _record_http_metrics(host, (time() - started) * 1000, success=True)
+                return payload
             log.warning("GET %s -> %s", url, resp.status)
+    except asyncio.TimeoutError:
+        duration_ms = (time() - started) * 1000
+        _record_http_metrics(host, duration_ms, success=False, timeout=True)
+        log.error("fetch_json timeout", extra={"url": url, "event": "api_timeout", "duration_ms": duration_ms})
+        return None
     except Exception as e:
+        _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning("fetch_json error %s: %s", url, e)
+        return None
+    _record_http_metrics(host, (time() - started) * 1000, success=False)
     return None
 
 
 async def fetch_json_httpx(url: str, **kwargs) -> Optional[Dict[str, Any]]:
+    started = time()
+    host = urlparse(url).netloc
     try:
         timeout = kwargs.pop("timeout", 15)
         headers = kwargs.pop("headers", {})
@@ -956,25 +997,48 @@ async def fetch_json_httpx(url: str, **kwargs) -> Optional[Dict[str, Any]]:
             timeout=timeout,
             headers={**REQ_HEADERS, **headers},
             follow_redirects=True,
+            verify=certifi.where(),
         ) as client:
             resp = await client.get(url, **kwargs)
             if 200 <= resp.status_code < 300:
-                return resp.json()
+                payload = resp.json()
+                _record_http_metrics(host, (time() - started) * 1000, success=True)
+                return payload
             log.warning("httpx GET %s -> %s", url, resp.status_code)
+    except httpx.TimeoutException:
+        duration_ms = (time() - started) * 1000
+        _record_http_metrics(host, duration_ms, success=False, timeout=True)
+        log.error("fetch_json_httpx timeout", extra={"url": url, "event": "api_timeout", "duration_ms": duration_ms})
+        return None
     except Exception as e:
+        _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning("fetch_json_httpx error %s: %s", url, e)
+        return None
+    _record_http_metrics(host, (time() - started) * 1000, success=False)
     return None
 
 async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str]:
+    started = time()
+    host = urlparse(url).netloc
     try:
         timeout = kwargs.pop("timeout", ClientTimeout(total=15))
         headers = kwargs.pop("headers", {})
         async with session.get(url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs) as resp:
             if resp.status == 200:
-                return await resp.text()
+                body = await resp.text()
+                _record_http_metrics(host, (time() - started) * 1000, success=True)
+                return body
             log.warning("GET %s -> %s", url, resp.status)
+    except asyncio.TimeoutError:
+        duration_ms = (time() - started) * 1000
+        _record_http_metrics(host, duration_ms, success=False, timeout=True)
+        log.error("fetch_text timeout", extra={"url": url, "event": "api_timeout", "duration_ms": duration_ms})
+        return None
     except Exception as e:
+        _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning("fetch_text error %s: %s", url, e)
+        return None
+    _record_http_metrics(host, (time() - started) * 1000, success=False)
     return None
 
 
@@ -1194,6 +1258,10 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
     global DOLAR_CACHE
     data: Dict[str, Dict[str, Any]] = {}
     variations: Dict[str, float] = {}
+    cache_key = "quotes:dolares"
+    cached_short = SHORT_CACHE.get(cache_key)
+    if isinstance(cached_short, dict) and _has_fx_data(cached_short):
+        return cached_short
 
     def _safe_float(val: Any) -> Optional[float]:
         try:
@@ -1235,20 +1303,25 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
         except Exception:
             return (None, None, var if isinstance(var, float) else None)
 
-    cj = await fetch_json(session, CRYPTOYA_DOLAR_URL)
-    if cj:
-        for k in ["oficial", "mayorista", "blue", "mep", "ccl", "cripto", "tarjeta", "ahorro"]:
-            c, v, var = _safe(cj.get(k, {}))
-            if c is not None or v is not None:
-                data[k] = {"compra": c, "venta": v, "fuente": "CriptoYa"}
-            if var is not None:
-                variations[k] = var
+    if not http_service.is_suspended("criptoya"):
+        cj = await fetch_json(session, CRYPTOYA_DOLAR_URL, source="criptoya")
+        if cj:
+            for k in ["oficial", "mayorista", "blue", "mep", "ccl", "cripto", "tarjeta", "ahorro"]:
+                c, v, var = _safe(cj.get(k, {}))
+                if c is not None or v is not None:
+                    data[k] = {"compra": c, "venta": v, "fuente": "CriptoYa"}
+                if var is not None:
+                    variations[k] = var
+        else:
+            log.warning("fallback_to_dolarapi source=criptoya")
+    else:
+        log.info("source_skip_due_to_suspension source=criptoya")
 
     async def dolarapi(path: str, date: Optional[str] = None):
         url = f"{DOLARAPI_BASE}{path}"
         if date:
             url = f"{url}?fecha={date}"
-        j = await fetch_json(session, url)
+        j = await fetch_json(session, url, source="dolarapi")
         if not j:
             return (None, None, None)
         c, v, fecha = j.get("compra"), j.get("venta"), j.get("fechaActualizacion") or j.get("fecha")
@@ -1394,11 +1467,14 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
     # aquí para simplificar el panel principal.
     if _has_fx_data(merged):
         _save_dolar_cache(merged)
+        SHORT_CACHE.set(cache_key, merged)
         return merged
 
     if isinstance(cached_data, dict) and _has_fx_data(cached_data):
+        SHORT_CACHE.set(cache_key, cached_data)
         return cached_data
 
+    SHORT_CACHE.set(cache_key, merged)
     return merged
 
 async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
@@ -1415,6 +1491,12 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
     fecha: Optional[str] = None
     variation: Optional[float] = None
     from_cache = False
+    cache_key = "macro:riesgo"
+    cached_short = SHORT_CACHE.get(cache_key)
+    if isinstance(cached_short, (list, tuple)):
+        cached_tuple = tuple(cached_short)
+        if len(cached_tuple) >= 3:
+            return cached_tuple  # type: ignore[return-value]
 
     value_keys = {"valor", "value", "ultimo", "last", "riesgo", "embi", "current", "close", "latest"}
     date_keys = {
@@ -1594,12 +1676,14 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
             cache_val_int = int(cache_val)
         except Exception:
             return None
-        return (
+        res = (
             cache_val_int,
             RIESGO_CACHE.get("fecha") if isinstance(RIESGO_CACHE, dict) else None,
             RIESGO_CACHE.get("variation") if isinstance(RIESGO_CACHE, dict) else None,
             True,
         )
+        SHORT_CACHE.set(cache_key, res)
+        return res
 
     try:
         rounded = int(round(val))
@@ -1607,7 +1691,9 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
         return None
 
     _save_riesgo_cache(rounded, fecha, variation)
-    return (rounded, fecha, variation, from_cache)
+    res = (rounded, fecha, variation, from_cache)
+    SHORT_CACHE.set(cache_key, res)
+    return res
 
 
 def _format_riesgo_variation(var: Optional[float]) -> str:
@@ -1788,6 +1874,10 @@ async def get_reservas_con_variacion(
 ) -> Optional[Tuple[float, Optional[str], Optional[float], bool]]:
     global RESERVAS_CACHE
     from_cache = False
+    cache_key = "macro:reservas"
+    cached_short = SHORT_CACHE.get(cache_key)
+    if isinstance(cached_short, (list, tuple)) and len(cached_short) >= 3:
+        return tuple(cached_short)  # type: ignore[return-value]
     res = await get_reservas_lamacro(session)
     if not res:
         cache_val = RESERVAS_CACHE.get("val") if isinstance(RESERVAS_CACHE, dict) else None
@@ -1831,7 +1921,9 @@ async def get_reservas_con_variacion(
         elif cached_prev_f is not None:
             prev_val = cached_prev_f
         _save_reservas_cache(cur_val, fecha, prev_val)
-    return (cur_val, fecha, prev_val, from_cache)
+    res_tuple = (cur_val, fecha, prev_val, from_cache)
+    SHORT_CACHE.set(cache_key, res_tuple)
+    return res_tuple
 
 # ============================ RAVA ============================
 
@@ -2049,7 +2141,18 @@ async def _rava_metrics(session: ClientSession, symbol: str) -> Dict[str, Option
 async def _yf_chart_1y(session: ClientSession, symbol: str, interval: str) -> Optional[Dict[str, Any]]:
     for base in YF_URLS:
         params = {"range": "1y", "interval": interval, "events": "div,split"}
-        j = await fetch_json(session, base.format(symbol=symbol), headers=YF_HEADERS, params=params)
+        base_url = base.format(symbol=symbol)
+        suspended_until = http_service.is_suspended(urlparse(base_url).netloc or "yahoo")
+        if suspended_until:
+            log.info("skip_yahoo_source_suspended host=%s resume_at=%s", urlparse(base_url).netloc, suspended_until)
+            continue
+        j = await fetch_json(
+            session,
+            base_url,
+            headers=YF_HEADERS,
+            params=params,
+            source=urlparse(base_url).netloc or "yahoo",
+        )
         try:
             res = j.get("chart", {}).get("result", [])[0]
             return res
@@ -2145,6 +2248,19 @@ async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
         ts = d.get("last_ts")
         if ts: last_ts = ts if last_ts is None else max(last_ts, ts)
     return out, last_ts
+
+
+async def metrics_for_symbols_cached(session: ClientSession, symbols: List[str], ttl: int = 60) -> Tuple[Dict[str, Dict[str, Optional[float]]], Optional[int]]:
+    cache_key = f"rankings:metrics:{','.join(sorted(symbols))}"
+    cached = SHORT_CACHE.get(cache_key)
+    if isinstance(cached, (list, tuple)) and len(cached) == 2:
+        data, ts = cached
+        if isinstance(data, dict):
+            return data, ts  # type: ignore[return-value]
+    invalidate_rankings_cache()
+    res = await metrics_for_symbols(session, symbols)
+    SHORT_CACHE.set(cache_key, res, ttl=ttl)
+    return res
 
 # ============================ NOTICIAS ============================
 
@@ -2870,7 +2986,10 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[News
             try:
                 collected.extend(_parse_feed_entries(xml))
             except Exception as e:
-                log.warning("RSS parse %s: %s", url, e)
+                log.error(
+                    "RSS parse error",
+                    extra={"url": url, "event": "rss_parse_error", "error": str(e)},
+                )
         return collected
 
     raw_entries.extend(await _collect_feed_entries(RSS_FEEDS))
@@ -3441,21 +3560,26 @@ RET_SERIES_ORDER: List[Tuple[str, str]] = [
 
 
 async def _rank_top3(update: Update, symbols: List[str], title: str):
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    user_id = update.effective_user.id if update.effective_user else None
+    if is_throttled("rankings", chat_id, user_id, ttl=35):
+        await update.effective_message.reply_text("⏳ Consultá de nuevo en unos segundos.")
+        return
     async with ClientSession() as session:
-        mets, last_ts = await metrics_for_symbols(session, symbols)
+        mets, last_ts = await metrics_for_symbols_cached(session, symbols)
         fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
         pairs = sorted([(sym, m["6m"]) for sym, m in mets.items() if m.get("6m") is not None], key=lambda x: x[1], reverse=True)
-        top_syms = [sym for sym, _ in pairs[:3]]
+        top_syms = [sym for sym, _ in pairs[: RANK_TOP_LIMIT]]
         msg = format_top3_table(title, fecha, top_syms, mets)
         await update.effective_message.reply_text(
             msg,
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
 
         if HAS_MPL and pairs:
             chart_rows: List[Tuple[str, List[Optional[float]]]] = []
-            for sym, _ in pairs[:3]:
+            for sym, _ in pairs[: RANK_TOP_LIMIT]:
                 metrics = mets.get(sym, {})
                 values: List[Optional[float]] = []
                 for key, _ in RET_SERIES_ORDER:
@@ -3482,8 +3606,13 @@ async def _rank_top3(update: Update, symbols: List[str], title: str):
 
 
 async def _rank_proj5(update: Update, symbols: List[str], title: str):
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    user_id = update.effective_user.id if update.effective_user else None
+    if is_throttled("rankings", chat_id, user_id, ttl=35):
+        await update.effective_message.reply_text("⏳ Consultá de nuevo en unos segundos.")
+        return
     async with ClientSession() as session:
-        mets, last_ts = await metrics_for_symbols(session, symbols)
+        mets, last_ts = await metrics_for_symbols_cached(session, symbols)
         fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
         rows = []
         for sym, m in mets.items():
@@ -3491,12 +3620,12 @@ async def _rank_proj5(update: Update, symbols: List[str], title: str):
                 continue
             rows.append((sym, projection_3m(m), projection_6m(m)))
         rows.sort(key=lambda x: x[2], reverse=True)
-        top_rows = rows[:5]
+        top_rows = rows[: RANK_PROJ_LIMIT]
         msg = format_proj_dual(title, fecha, top_rows)
         await update.effective_message.reply_text(
             msg,
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
 
         if HAS_MPL and top_rows:
@@ -3557,7 +3686,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("🌐 Cedears Proyección", callback_data="CED:TOP5"),
-            InlineKeyboardButton("🔔 Mis alertas", callback_data="AL:LIST"),
+            InlineKeyboardButton("🔔 Mis alertas", callback_data="AL:LIST:0"),
         ],
         [
             InlineKeyboardButton("🧾 Resumen diario", callback_data="ST:SUBS"),
@@ -3569,7 +3698,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         intro,
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(kb_rows),
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        link_preview_options=build_preview_options(),
     )
 
 async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3579,7 +3708,7 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             "No pude obtener cotizaciones ahora.",
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
         return
 
@@ -3588,7 +3717,7 @@ async def cmd_dolar(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text(
             msg,
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
 
 def _extract_json_object_with_bands(text: str) -> Optional[Dict[str, Any]]:
@@ -3912,7 +4041,7 @@ async def cmd_bandas_cambiarias(update: Update, context: ContextTypes.DEFAULT_TY
         await update.effective_message.reply_text(
             "No pude obtener bandas cambiarias ahora.",
             parse_mode=ParseMode.HTML,
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
+            link_preview_options=build_preview_options(),
         )
         return
 
@@ -3920,7 +4049,7 @@ async def cmd_bandas_cambiarias(update: Update, context: ContextTypes.DEFAULT_TY
     await update.effective_message.reply_text(
         msg,
         parse_mode=ParseMode.HTML,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        link_preview_options=build_preview_options(),
     )
 
 async def cmd_acciones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3954,6 +4083,8 @@ async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "CED:TOP5":
         await _rank_proj5(update, CEDEARS_BA, "🏁 Top 5 Cedears (Proyección)")
         await dec_and_maybe_show(update, context, "cedears", cmd_cedears_menu)
+    else:
+        await q.answer("Selección inválida.", show_alert=True)
 
 # ---------- Macro ----------
 
@@ -4025,7 +4156,7 @@ async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
         header_body,
         parse_mode=ParseMode.HTML,
         reply_markup=kb,
-        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        link_preview_options=build_preview_options(),
     )
     for text, img in items:
         if img:
@@ -4038,7 +4169,7 @@ async def cmd_noticias(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.effective_message.reply_text(
                 text,
                 parse_mode=ParseMode.HTML,
-                link_preview_options=LinkPreviewOptions(prefer_small_media=True),
+                link_preview_options=build_preview_options(disable_by_default=False, prefer_small_media=True),
             )
 
 async def cmd_menu_economia(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4127,6 +4258,19 @@ def _has_duplicate_alert(
 
 def kb(rows: List[List[Tuple[str,str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(text, callback_data=data) for text, data in r] for r in rows])
+
+
+def build_preview_options(
+    *, disable_by_default: bool = True, prefer_small_media: bool = False
+) -> Optional[LinkPreviewOptions]:
+    prefer_small = prefer_small_media or LINK_PREVIEWS_PREFER_SMALL
+    if LINK_PREVIEWS_ENABLED:
+        return LinkPreviewOptions(is_disabled=False, prefer_small_media=prefer_small)
+    if disable_by_default:
+        return LinkPreviewOptions(is_disabled=True)
+    if prefer_small:
+        return LinkPreviewOptions(prefer_small_media=True)
+    return None
 
 def kb_tickers(symbols: List[str], back_target: str, prefix: str) -> InlineKeyboardMarkup:
     rows: List[List[Tuple[str,str]]] = []; row: List[Tuple[str,str]] = []
@@ -4280,7 +4424,7 @@ async def get_top_crypto_bases(
 
 def kb_alertas_menu() -> InlineKeyboardMarkup:
     return kb([
-        [("Listar", "AL:LIST"), ("Agregar", "AL:ADD")],
+        [("Listar", "AL:LIST:0"), ("Agregar", "AL:ADD")],
         [("Modificar", "AL:EDIT"), ("Borrar", "AL:CLEAR")],
         [("Pausar", "AL:PAUSE"), ("Reanudar", "AL:RESUME")],
     ])
@@ -4304,10 +4448,7 @@ async def cmd_alertas_menu(
 async def alertas_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
-    if data == "AL:LIST":
-        await cmd_alertas_list(update, context)
-        await cmd_alertas_menu(update, context)
-    elif data == "AL:EDIT":
+    if data == "AL:EDIT":
         await cmd_alertas_edit(update, context)
     elif data == "AL:CLEAR":
         await cmd_alertas_clear(update, context)
@@ -4316,16 +4457,34 @@ async def alertas_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "AL:RESUME":
         await cmd_alertas_resume(update, context)
         await cmd_alertas_menu(update, context)
+    else:
+        await q.answer("Opción de menú inválida.", show_alert=True)
 
-async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_alertas_list(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    start_idx: int = 0,
+    *,
+    edit: bool = False,
+) -> None:
     chat_id = update.effective_chat.id
-    rules = ALERTS.get(chat_id, [])
+    rules = ALERTS.get(chat_id, []) or []
     now = datetime.now(TZ)
+
     if not rules:
         txt = "No tenés alertas configuradas.\nUsá /alertas_menu → Agregar."
+        markup = kb([[("Volver", "AL:MENU")]])
     else:
-        lines = ["<b>🔔 Alertas Configuradas</b>"]
-        for i, r in enumerate(rules, 1):
+        page_size = ALERTS_PAGE_SIZE
+        last_start = max(0, ((len(rules) - 1) // page_size) * page_size)
+        start = max(0, min(start_idx, last_start))
+        end = min(len(rules), start + page_size)
+
+        lines = [
+            "<b>🔔 Alertas Configuradas</b>",
+            f"<i>Mostrando {start + 1}-{end} de {len(rules)}</i>",
+        ]
+        for i, r in enumerate(rules[start:end], start=start + 1):
             label = _alert_rule_label(r)
             status = _alert_pause_status(r, now=now)
             if status:
@@ -4338,7 +4497,49 @@ async def cmd_alertas_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
             until = datetime.fromtimestamp(ALERTS_SILENT_UNTIL[chat_id], TZ)
             lines.append(f"\n<i>Alertas en pausa hasta {until.strftime('%d/%m %H:%M')}</i>")
         txt = "\n".join(lines)
-    await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
+
+        buttons: List[List[Tuple[str, str]]] = []
+        if len(rules) > page_size:
+            row: List[Tuple[str, str]] = []
+            prev_idx = max(0, start - page_size)
+            if start > 0:
+                row.append(("⬅️ Anteriores", f"AL:LIST:{prev_idx}"))
+            if end < len(rules):
+                row.append(("➡️ Siguientes", f"AL:LIST:{end}"))
+            if row:
+                buttons.append(row)
+        buttons.append([("Volver", "AL:MENU")])
+        markup = kb(buttons)
+
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(
+            txt, parse_mode=ParseMode.HTML, reply_markup=markup
+        )
+    else:
+        await update.effective_message.reply_text(
+            txt, parse_mode=ParseMode.HTML, reply_markup=markup
+        )
+
+
+async def alertas_list_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data or ""
+    parts = data.split(":", 2)
+    start_idx = 0
+    if len(parts) >= 3:
+        try:
+            start_idx = max(0, int(parts[2]))
+        except ValueError:
+            await q.answer("Página inválida.", show_alert=True)
+            return
+    await cmd_alertas_list(update, context, start_idx=start_idx, edit=True)
+
+
+async def alertas_menu_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await cmd_alertas_menu(update, context, edit=True)
 
 async def cmd_alertas_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -4547,13 +4748,13 @@ async def alertas_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "BACK":
         await cmd_alertas_menu(update, context, edit=True); return
     if data == "ALL":
-        cnt = len(rules); ALERTS[chat_id] = []; await save_state()
+        cnt = len(rules); ALERTS[chat_id] = []; invalidate_alerts_cache(); await save_state()
         await q.edit_message_text(f"Se eliminaron {cnt} alertas."); return
     try: idx = int(data)
     except Exception:
         await q.edit_message_text("Acción inválida."); return
     if 0 <= idx < len(rules):
-        rules.pop(idx); await save_state(); await q.edit_message_text("Alerta eliminada.")
+        rules.pop(idx); invalidate_alerts_cache(); await save_state(); await q.edit_message_text("Alerta eliminada.")
     else:
         await q.edit_message_text("Número fuera de rango.")
 
@@ -4687,11 +4888,13 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if rule.pop("pause_until", None) is not None:
                         changed = True
                 if changed:
+                    invalidate_alerts_cache()
                     await save_state()
                 await cmd_alertas_pause(update, context, prefix="🔔 Alertas reanudadas.", edit=True)
                 return
             if op == "INF":
                 ALERTS_PAUSED.add(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
+                invalidate_alerts_cache()
                 await save_state()
                 await cmd_alertas_pause(update, context, prefix="🔕 Alertas en pausa (indefinida).", edit=True)
                 return
@@ -4701,6 +4904,7 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.answer("Acción inválida.", show_alert=True); return
             until = datetime.now(TZ) + timedelta(hours=hrs)
             ALERTS_SILENT_UNTIL[chat_id] = until.timestamp(); ALERTS_PAUSED.discard(chat_id)
+            invalidate_alerts_cache()
             await save_state()
             await cmd_alertas_pause(
                 update,
@@ -4724,6 +4928,7 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 changed = True
             ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
             if changed:
+                invalidate_alerts_cache()
                 await save_state()
             await cmd_alertas_pause(update, context, prefix=f"🔔 Alerta {idx+1} reanudada.", edit=True)
             return
@@ -4731,6 +4936,7 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rule["pause_indef"] = True
             rule.pop("pause_until", None)
             ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
+            invalidate_alerts_cache()
             await save_state()
             await cmd_alertas_pause(update, context, prefix=f"🔕 Alerta {idx+1} en pausa indefinida.", edit=True)
             return
@@ -4742,6 +4948,7 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rule["pause_until"] = until.timestamp()
         rule.pop("pause_indef", None)
         ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
+        invalidate_alerts_cache()
         await save_state()
         await cmd_alertas_pause(
             update,
@@ -4763,6 +4970,7 @@ async def cmd_alertas_resume(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if rule.pop("pause_until", None) is not None:
             changed = True
     if changed:
+        invalidate_alerts_cache()
         await save_state()
     await update.effective_message.reply_text("🔔 Alertas reanudadas.")
 
@@ -5525,6 +5733,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 rules.append(candidate)
             _record_alert_usage(chat_id, al)
+            invalidate_alerts_cache()
             await save_state()
             msg = "Listo. Alerta actualizada ✅" if is_edit else "Listo. Alerta agregada ✅"
             await update.message.reply_text(msg)
@@ -5561,6 +5770,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 rules.append(candidate)
             _record_alert_usage(chat_id, al)
+            invalidate_alerts_cache()
             await save_state()
             msg = "Listo. Alerta actualizada ✅" if is_edit else "Listo. Alerta agregada ✅"
             await update.message.reply_text(msg)
@@ -5603,6 +5813,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 rules.append(candidate)
             _record_alert_usage(chat_id, al)
+            invalidate_alerts_cache()
             await save_state()
             target_s = fmt_crypto_price(thr, quote)
             direction = "sube a" if op == ">" else "baja a"
@@ -5642,6 +5853,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             rules.append(candidate)
         _record_alert_usage(chat_id, al)
+        invalidate_alerts_cache()
         await save_state()
         msg = "Listo. Alerta actualizada ✅" if is_edit else "Listo. Alerta agregada ✅"
         await update.message.reply_text(msg)
@@ -7591,6 +7803,11 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
 # ============================ RESUMEN DIARIO ============================
 
 async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    user_id = update.effective_user.id if update.effective_user else None
+    if is_throttled("resumen", chat_id, user_id, ttl=45):
+        await update.effective_message.reply_text("⏳ Esperá unos segundos antes de pedir otro resumen.")
+        return
     async with ClientSession() as session:
         fx = await get_dolares(session)
         rp = await get_riesgo_pais(session)
@@ -7615,7 +7832,11 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
         partes.append(format_news_block(news)[0])
 
     txt = "\n\n".join(partes) if partes else "Sin datos para el resumen ahora."
-    await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    await update.effective_message.reply_text(
+        txt,
+        parse_mode=ParseMode.HTML,
+        link_preview_options=build_preview_options(),
+    )
 
 # ============================ WEBHOOK / APP ============================
 
@@ -7661,9 +7882,12 @@ def setup_health_routes(application: Application) -> None:
     async def _health(_: web.Request) -> web.Response:
         return web.json_response({"status": "ok"})
 
+    async def _metrics(_: web.Request) -> web.Response:
+        return web.json_response(metrics.snapshot())
+
     router = inner_app.router
 
-    for path in ("/", "/healthz"):
+    for path, handler in (("/", _health), ("/healthz", _health), ("/metrics", _metrics)):
         already_registered = False
         for route in router.routes():
             resource = getattr(route, "resource", None)
@@ -7677,13 +7901,12 @@ def setup_health_routes(application: Application) -> None:
         if already_registered:
             continue
         try:
-            router.add_get(path, _health)
+            router.add_get(path, handler)
         except (RuntimeError, ValueError) as exc:
             logging.debug("No se pudo registrar ruta %s: %s", path, exc)
 
 BOT_COMMANDS = [
     BotCommand("economia","Menú de economía"),
-    BotCommand("dolar","Tipos de cambio"),
     BotCommand("acciones","Menú acciones"),
     BotCommand("cedears","Menú cedears"),
     BotCommand("alertas_menu","Configurar alertas"),
@@ -7698,7 +7921,6 @@ def build_application() -> Application:
     # Comandos
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("economia", cmd_menu_economia))
-    app.add_handler(CommandHandler("dolar", cmd_dolar))
     app.add_handler(CommandHandler("reservas", cmd_reservas))
     app.add_handler(CommandHandler("inflacion", cmd_inflacion))
     app.add_handler(CommandHandler("riesgo", cmd_riesgo))
@@ -7710,10 +7932,12 @@ def build_application() -> Application:
 
     # Alertas - menú simple
     app.add_handler(CommandHandler("alertas_menu", cmd_alertas_menu))
-    app.add_handler(CallbackQueryHandler(alertas_menu_cb, pattern="^AL:(LIST|EDIT|CLEAR|PAUSE|RESUME)$"))
+    app.add_handler(CallbackQueryHandler(alertas_list_cb, pattern="^AL:LIST(:[0-9]+)?$"))
+    app.add_handler(CallbackQueryHandler(alertas_menu_back_cb, pattern="^AL:MENU$", block=False))
+    app.add_handler(CallbackQueryHandler(alertas_menu_cb, pattern="^AL:(EDIT|CLEAR|PAUSE|RESUME)$"))
     app.add_handler(CallbackQueryHandler(alertas_edit_cancel, pattern="^AL:EDIT:CANCEL$"))
     app.add_handler(CallbackQueryHandler(alertas_clear_cb, pattern="^CLR:"))
-    app.add_handler(CommandHandler("alertas_pause", cmd_alertas_pause))
+    app.add_handler(CommandHandler("alertas_pause", instrument_command("alertas_pause", cmd_alertas_pause)))
     app.add_handler(CallbackQueryHandler(alerts_pause_cb, pattern="^AP:"))
 
     # Alertas - conversación Agregar
@@ -7753,7 +7977,7 @@ def build_application() -> Application:
     # Suscripciones
     subs_conv = ConversationHandler(
         entry_points=[
-            CommandHandler("subs", cmd_subs),
+            CommandHandler("subs", instrument_command("subs", cmd_subs)),
             CallbackQueryHandler(subs_start_from_cb, pattern="^ST:SUBS$"),
         ],
         states={SUBS_SET_TIME: [CallbackQueryHandler(subs_cb, pattern="^SUBS:")]},
@@ -7765,12 +7989,14 @@ def build_application() -> Application:
     app.add_handler(subs_conv)
 
     # Portafolio
-    app.add_handler(CommandHandler("portafolio", cmd_portafolio))
+    app.add_handler(CommandHandler("portafolio", instrument_command("portafolio", cmd_portafolio)))
     app.add_handler(CallbackQueryHandler(pf_menu_cb, pattern="^PF:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pf_text_input))
 
     # Resumen diario on-demand
-    app.add_handler(CommandHandler("resumen", cmd_resumen_diario))
+    app.add_handler(CommandHandler("resumen", instrument_command("resumen", cmd_resumen_diario)))
+
+    app.add_error_handler(handle_error)
 
     return app
 
@@ -7839,6 +8065,9 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        from main import configure_logging
+
+        configure_logging()
         asyncio.run(main())
     except KeyboardInterrupt:
         pass

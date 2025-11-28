@@ -4,7 +4,7 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot_econ_full_plus_rank_alerts.py
+    startCommand: python main.py
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false          # cargalo en Render → Environment
