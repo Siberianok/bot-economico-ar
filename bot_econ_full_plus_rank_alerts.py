@@ -12,7 +12,7 @@ from urllib.parse import urlparse, quote, parse_qs, urljoin
 import httpx
 import certifi
 
-from bot.config import config
+from bot.config import build_dependencies, config
 from bot.services.cache import RateLimiter, ShortCache
 
 # ====== matplotlib opcional (no rompe si no está instalado) ======
@@ -72,26 +72,20 @@ LINK_PREVIEWS_PREFER_SMALL = _env_flag("LINK_PREVIEWS_PREFER_SMALL")
 ALERTS_PAGE_SIZE = _env_int("ALERTS_PAGE_SIZE", "10", min_value=1)
 RANK_TOP_LIMIT = _env_int("RANK_TOP_LIMIT", "3", min_value=1)
 RANK_PROJ_LIMIT = _env_int("RANK_PROJ_LIMIT", "5", min_value=1)
-TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "tgwebhook").strip().strip("/")
-PORT = int(os.getenv("PORT", "10000"))
-BASE_URL = os.getenv("BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "http://localhost")).rstrip("/")
-ENV_STATE_PATH = os.getenv("STATE_PATH", "state.json")
-UPSTASH_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("UPSTASH_URL") or "").strip()
-UPSTASH_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("UPSTASH_TOKEN") or "").strip()
-UPSTASH_REDIS_URL = (
-    os.getenv("UPSTASH_REDIS_URL")
-    or os.getenv("REDIS_URL")
-    or os.getenv("redis-url")
-    or ""
-).strip()
-UPSTASH_STATE_KEY = os.getenv("UPSTASH_STATE_KEY", "bot-econ-state").strip()
+BOT_DEPENDENCIES = build_dependencies(config)
 
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN/BOT_TOKEN no configurado.")
-
-WEBHOOK_PATH = f"/{WEBHOOK_SECRET}"
-WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
+TELEGRAM_TOKEN = BOT_DEPENDENCIES.telegram_token
+WEBHOOK_SECRET = BOT_DEPENDENCIES.webhook_secret
+WEBHOOK_PATH = BOT_DEPENDENCIES.webhook_path
+WEBHOOK_URL = BOT_DEPENDENCIES.webhook_url
+PORT = BOT_DEPENDENCIES.port
+BASE_URL = BOT_DEPENDENCIES.base_url
+STATE_PATH_CFG = BOT_DEPENDENCIES.state_path
+UPSTASH_CONFIG = BOT_DEPENDENCIES.upstash
+UPSTASH_URL = UPSTASH_CONFIG.rest_url
+UPSTASH_TOKEN = UPSTASH_CONFIG.rest_token
+UPSTASH_REDIS_URL = UPSTASH_CONFIG.redis_url
+UPSTASH_STATE_KEY = UPSTASH_CONFIG.state_key
 
 CRYPTOYA_DOLAR_URL = "https://criptoya.com/api/dolar"
 DOLARAPI_BASE = "https://dolarapi.com/v1"
@@ -650,7 +644,7 @@ def _ensure_state_path() -> Optional[str]:
 USE_UPSTASH = bool(UPSTASH_URL and UPSTASH_TOKEN)
 USE_UPSTASH_REST = USE_UPSTASH
 USE_UPSTASH_REDIS = bool(UPSTASH_REDIS_URL)
-STATE_PATH = ensure_writable_path(ENV_STATE_PATH, log)
+STATE_PATH = ensure_writable_path(str(STATE_PATH_CFG), log)
 STATE_STORE: StateStore
 FALLBACK_STATE_STORE: Optional[StateStore] = None
 

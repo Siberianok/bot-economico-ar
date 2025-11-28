@@ -36,6 +36,20 @@ class BotConfig:
     upstash: UpstashConfig
 
 
+@dataclass(frozen=True)
+class BotDependencies:
+    """Dependencias derivadas de la configuración del bot."""
+
+    telegram_token: str
+    webhook_secret: str
+    webhook_path: str
+    webhook_url: str
+    port: int
+    base_url: str
+    state_path: Path
+    upstash: UpstashConfig
+
+
 def _get_first(keys: Iterable[str], default: str = "") -> str:
     for key in keys:
         val = os.getenv(key)
@@ -98,3 +112,22 @@ def load_config() -> BotConfig:
 
 
 config = load_config()
+
+
+def build_dependencies(cfg: BotConfig | None = None) -> BotDependencies:
+    """Crea las dependencias derivadas de la configuración base."""
+
+    cfg = cfg or config
+    webhook_path = f"/{cfg.webhook_secret}"
+    webhook_url = f"{cfg.base_url}{webhook_path}"
+
+    return BotDependencies(
+        telegram_token=cfg.telegram_token,
+        webhook_secret=cfg.webhook_secret,
+        webhook_path=webhook_path,
+        webhook_url=webhook_url,
+        port=cfg.port,
+        base_url=cfg.base_url,
+        state_path=cfg.state_path,
+        upstash=cfg.upstash,
+    )
