@@ -1059,9 +1059,6 @@ async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str
             exc.resume_at,
             url,
         )
-    except Exception as exc:
-        _record_http_metrics(host, (time() - started) * 1000, success=False)
-        log.warning("fetch_text http_service error %s: %s", url, exc)
     try:
         async with session.get(url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs) as resp:
             if resp.status == 200:
