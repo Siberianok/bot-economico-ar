@@ -4533,14 +4533,13 @@ async def alertas_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
     if data == "AL:EDIT":
-        await cmd_alertas_edit(update, context)
+        await cmd_alertas_edit(update, context, edit=True)
     elif data == "AL:CLEAR":
-        await cmd_alertas_clear(update, context)
+        await cmd_alertas_clear(update, context, edit=True)
     elif data == "AL:PAUSE":
-        await cmd_alertas_pause(update, context)
+        await cmd_alertas_pause(update, context, edit=True)
     elif data == "AL:RESUME":
-        await cmd_alertas_resume(update, context)
-        await cmd_alertas_menu(update, context)
+        await cmd_alertas_resume(update, context, edit=True)
     else:
         await q.answer("Opción de menú inválida.", show_alert=True)
 
@@ -4625,12 +4624,21 @@ async def alertas_menu_back_cb(update: Update, context: ContextTypes.DEFAULT_TYP
     await q.answer()
     await cmd_alertas_menu(update, context, edit=True)
 
-async def cmd_alertas_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_alertas_edit(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    edit: bool = False,
+):
     chat_id = update.effective_chat.id
     rules = ALERTS.get(chat_id, [])
     if not rules:
-        await update.effective_message.reply_text("No tenés alertas guardadas.")
-        await cmd_alertas_menu(update, context)
+        await cmd_alertas_menu(
+            update,
+            context,
+            prefix="No tenés alertas guardadas.",
+            edit=edit or bool(update.callback_query),
+        )
         return
     buttons: List[List[Tuple[str, str]]] = []
     for i, r in enumerate(rules, 1):
@@ -4640,7 +4648,12 @@ async def cmd_alertas_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb_markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton(text, callback_data=data) for text, data in row] for row in buttons]
     )
-    await update.effective_message.reply_text("Elegí qué alerta modificar:", reply_markup=kb_markup)
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text(
+            "Elegí qué alerta modificar:", reply_markup=kb_markup
+        )
+    else:
+        await update.effective_message.reply_text("Elegí qué alerta modificar:", reply_markup=kb_markup)
 
 
 async def alertas_edit_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4795,12 +4808,21 @@ async def alertas_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await cmd_alertas_menu(update, context, edit=True)
     return ConversationHandler.END
 
-async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_alertas_clear(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    edit: bool = False,
+):
     chat_id = update.effective_chat.id
     rules = ALERTS.get(chat_id, [])
     if not rules:
-        await update.effective_message.reply_text("No tenés alertas guardadas.")
-        await cmd_alertas_menu(update, context)
+        await cmd_alertas_menu(
+            update,
+            context,
+            prefix="No tenés alertas guardadas.",
+            edit=edit or bool(update.callback_query),
+        )
         return
     buttons: List[List[Tuple[str,str]]] = []
     for i, r in enumerate(rules, 1):
@@ -4818,9 +4840,13 @@ async def cmd_alertas_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons.append([(label, f"CLR:{i-1}")])
     buttons.append([("Borrar Todas","CLR:ALL")])
     buttons.append([("Volver","CLR:BACK"), ("Cancelar","CLR:CANCEL")])
-    await update.effective_message.reply_text("Elegí qué alerta borrar:", reply_markup=InlineKeyboardMarkup(
+    markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton(t, callback_data=d) for t,d in row] for row in buttons]
-    ))
+    )
+    if edit and update.callback_query:
+        await update.callback_query.edit_message_text("Elegí qué alerta borrar:", reply_markup=markup)
+    else:
+        await update.effective_message.reply_text("Elegí qué alerta borrar:", reply_markup=markup)
 
 async def alertas_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -4899,11 +4925,12 @@ async def cmd_alertas_pause(
         msg = "No tenés alertas guardadas."
         if prefix:
             msg = f"{prefix}\n\n{msg}"
-        if edit and update.callback_query:
-            await update.callback_query.edit_message_text(msg)
-        else:
-            await update.effective_message.reply_text(msg)
-        await cmd_alertas_menu(update, context)
+        await cmd_alertas_menu(
+            update,
+            context,
+            prefix=msg,
+            edit=edit or bool(update.callback_query),
+        )
         return
     text = "Elegí qué alertas pausar:"
     if prefix:
@@ -5043,7 +5070,12 @@ async def alerts_pause_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await q.answer("Acción inválida.", show_alert=True)
 
-async def cmd_alertas_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_alertas_resume(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    edit: bool = False,
+):
     chat_id = update.effective_chat.id
     ALERTS_PAUSED.discard(chat_id); ALERTS_SILENT_UNTIL.pop(chat_id, None)
     rules = ALERTS.get(chat_id, []) or []
@@ -5056,7 +5088,12 @@ async def cmd_alertas_resume(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if changed:
         invalidate_alerts_cache()
         await save_state()
-    await update.effective_message.reply_text("🔔 Alertas reanudadas.")
+    await cmd_alertas_menu(
+        update,
+        context,
+        prefix="🔔 Alertas reanudadas.",
+        edit=edit or bool(update.callback_query),
+    )
 
 # ---- Conversación Agregar Alerta ----
 
