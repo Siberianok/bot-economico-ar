@@ -6181,18 +6181,27 @@ def pf_get(chat_id: int) -> Dict[str, Any]:
         pf["items"] = []
     return pf
 
-def kb_pf_main() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+def kb_pf_main(chat_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    pf = pf_get(chat_id) if chat_id is not None else None
+    has_instruments = bool(pf and pf.get("items"))
+
+    rows = [
         [InlineKeyboardButton("Ayuda", callback_data="PF:HELP")],
         [InlineKeyboardButton("Fijar base", callback_data="PF:SETBASE"), InlineKeyboardButton("Fijar monto", callback_data="PF:SETMONTO")],
         [InlineKeyboardButton("Agregar instrumento", callback_data="PF:ADD")],
-        [InlineKeyboardButton("Ver composición", callback_data="PF:LIST"), InlineKeyboardButton("Editar instrumento", callback_data="PF:EDIT")],
-        # El botón «Proyección» muestra las gráficas de proyección vs. rendimiento
-        # (barras vs. línea) calculadas en pf_show_projection_below.
-        [InlineKeyboardButton("Rendimiento", callback_data="PF:RET"), InlineKeyboardButton("Proyección", callback_data="PF:PROJ")],
-        [InlineKeyboardButton("Exportar", callback_data="PF:EXPORT")],
-        [InlineKeyboardButton("Eliminar portafolio", callback_data="PF:CLEAR")],
-    ])
+    ]
+
+    if has_instruments:
+        rows.extend([
+            [InlineKeyboardButton("Ver composición", callback_data="PF:LIST"), InlineKeyboardButton("Editar instrumento", callback_data="PF:EDIT")],
+            # El botón «Proyección» muestra las gráficas de proyección vs. rendimiento
+            # (barras vs. línea) calculadas en pf_show_projection_below.
+            [InlineKeyboardButton("Rendimiento", callback_data="PF:RET"), InlineKeyboardButton("Proyección", callback_data="PF:PROJ")],
+            [InlineKeyboardButton("Exportar", callback_data="PF:EXPORT")],
+            [InlineKeyboardButton("Eliminar portafolio", callback_data="PF:CLEAR")],
+        ])
+
+    return InlineKeyboardMarkup(rows)
 
 def kb_pf_add_methods() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -6233,7 +6242,7 @@ async def pf_refresh_menu(
     force_new: bool = False,
 ):
     text = await pf_main_menu_text(chat_id)
-    kb_main = kb_pf_main()
+    kb_main = kb_pf_main(chat_id)
     msg_id = (
         context.user_data.get("pf_menu_msg_id")
         if isinstance(context.user_data, dict)
@@ -6277,7 +6286,7 @@ async def cmd_portafolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = await pf_main_menu_text(chat_id)
     msg = await update.effective_message.reply_text(
         text,
-        reply_markup=kb_pf_main(),
+        reply_markup=kb_pf_main(chat_id),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
