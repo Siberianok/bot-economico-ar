@@ -7670,19 +7670,19 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Usá «Agregar instrumento»."); return
     snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-    header = f"<b>Portafolio</b> — Base: {pf['base']['moneda'].upper()}/{pf['base']['tc'].upper()}"
+    header = f"<b>🎨 Portafolio</b> — Base: {pf['base']['moneda'].upper()}/{pf['base']['tc'].upper()}"
     if fecha:
         header += f" <i>Datos al {fecha}</i>"
-    lines = [header, f"Monto objetivo: {f_money(pf['monto'])}"]
-    lines.append(f"Valor invertido: {f_money(total_invertido)}")
-    lines.append(f"Valor actual estimado: {f_money(total_actual)}")
+    lines = [header, f"🎯 Monto objetivo: {f_money(pf['monto'])}"]
+    lines.append(f"💵 Valor invertido: {f_money(total_invertido)}")
+    lines.append(f"🧮 Valor actual estimado: {f_money(total_actual)}")
     delta = total_actual - total_invertido
     if total_invertido > 0:
-        lines.append(f"Variación estimada: {f_money(delta)} ({pct(delta/total_invertido*100.0,2)})")
+        lines.append(f"📊 Variación estimada: {f_money(delta)} ({pct(delta/total_invertido*100.0,2)})")
     restante = max(0.0, pf['monto'] - total_invertido)
-    lines.append(f"Restante del objetivo: {f_money(restante)}")
+    lines.append(f"🪙 Restante del objetivo: {f_money(restante)}")
     if tc_val is not None:
-        tc_line = f"Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
+        tc_line = f"💱 Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
         if tc_ts:
             tc_line += f" (al {datetime.fromtimestamp(tc_ts, TZ).strftime('%d/%m/%Y %H:%M')})"
         lines.append(tc_line)
@@ -7691,18 +7691,18 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         if i > 1:
             lines.append("")
         linea = f"{i}. {entry['label']}"
-        linea += f" · Valor: {f_money(entry['valor_actual'])}"
+        linea += f" · 💰 Valor: {f_money(entry['valor_actual'])}"
         if entry['invertido'] > 0:
             r_ind = (entry['valor_actual']/entry['invertido']-1.0)*100.0
             linea += f" ({pct(r_ind,2)} vs {f_money(entry['invertido'])})"
         qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
         if qty_txt:
-            linea += f" · Cant: {qty_txt}"
+            linea += f" · 📦 Cant: {qty_txt}"
         if entry.get('peso'):
-            linea += f" · Peso: {pct_plain(entry['peso']*100.0,1)}"
+            linea += f" · ⚖️ Peso: {pct_plain(entry['peso']*100.0,1)}"
         added_str = format_added_date(entry.get('added_ts'))
         if added_str:
-            linea += f" · Desde: {added_str}"
+            linea += f" · ⏳ Desde: {added_str}"
         lines.append(linea)
     if not HAS_MPL:
         lines.append("")
@@ -7729,7 +7729,7 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         header += f" <i>Datos al {fecha}</i>"
     lines = [header]
     if tc_val is not None:
-        tc_line = f"Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
+        tc_line = f"💱 Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
         if tc_ts:
             tc_line += f" (al {datetime.fromtimestamp(tc_ts, TZ).strftime('%d/%m/%Y %H:%M')})"
         lines.append(tc_line)
@@ -7738,7 +7738,7 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
     daily_sum: Optional[float] = None
     if port_daily_vals:
         daily_sum = sum(port_daily_vals)
-        lines.append(f"Variación diaria estimada: {pct(daily_sum,2)}")
+        lines.append(f"⚡ Variación diaria estimada: {pct(daily_sum,2)}")
 
     has_daily_data = any(entry.get('daily_change') is not None for entry in snapshot)
     return_points: List[Tuple[str, Optional[float]]] = []
@@ -7758,17 +7758,17 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
             detail += f" (Δ {f_money(delta)})"
         qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
         if qty_txt:
-            detail += f" · Cant: {qty_txt}"
+            detail += f" · 📦 Cant: {qty_txt}"
         if entry.get('precio_base') is not None:
-            detail += f" · Px: {f_money(entry['precio_base'])}"
+            detail += f" · 💵 Px: {f_money(entry['precio_base'])}"
         daily = entry.get('daily_change')
         if daily is not None:
-            detail += f" · Día: {pct(daily,2)}"
+            detail += f" · 🌅 Día: {pct(daily,2)}"
         if entry.get('peso'):
-            detail += f" · Peso: {pct_plain(entry['peso']*100.0,1)}"
+            detail += f" · ⚖️ Peso: {pct_plain(entry['peso']*100.0,1)}"
         added_str = format_added_date(entry.get('added_ts'))
         if added_str:
-            detail += f" · Desde: {added_str}"
+            detail += f" · ⏳ Desde: {added_str}"
         lines.append(detail)
 
         short_label = _label_short(entry['symbol']) if entry.get('symbol') else label
@@ -7779,12 +7779,12 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
 
     delta_t = total_actual - total_invertido
     lines.append("")
-    lines.append(f"Invertido: {f_money(total_invertido)}")
-    lines.append(f"Valor actual estimado: {f_money(total_actual)}")
+    lines.append(f"💸 Invertido: {f_money(total_invertido)}")
+    lines.append(f"🧮 Valor actual estimado: {f_money(total_actual)}")
     if total_invertido > 0:
-        lines.append(f"Variación total: {f_money(delta_t)} ({pct((delta_t/total_invertido)*100.0,2)})")
+        lines.append(f"📊 Variación total: {f_money(delta_t)} ({pct((delta_t/total_invertido)*100.0,2)})")
     else:
-        lines.append(f"Variación total: {f_money(delta_t)}")
+        lines.append(f"📊 Variación total: {f_money(delta_t)}")
 
     sin_datos = [entry['label'] for entry in snapshot if not entry.get('metrics')]
     if sin_datos:
@@ -7882,11 +7882,11 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     header = "<b>🔮 Proyección del Portafolio</b>"
     if fecha:
         header += f" <i>Datos al {fecha}</i>"
-    lines = [header, f"Valor actual estimado: {f_money(total_actual)}"]
-    lines.append(f"Proyección 3M: {pct(w3,2)} → {f_money(forecast3)}")
-    lines.append(f"Proyección 6M: {pct(w6,2)} → {f_money(forecast6)}")
+    lines = [header, f"🧮 Valor actual estimado: {f_money(total_actual)}"]
+    lines.append(f"✨ Proyección 3M: {pct(w3,2)} → {f_money(forecast3)}")
+    lines.append(f"🌟 Proyección 6M: {pct(w6,2)} → {f_money(forecast6)}")
     if tc_val is not None:
-        tc_line = f"Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
+        tc_line = f"💱 Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
         if tc_ts:
             tc_line += f" (al {datetime.fromtimestamp(tc_ts, TZ).strftime('%d/%m/%Y %H:%M')})"
         lines.append(tc_line)
