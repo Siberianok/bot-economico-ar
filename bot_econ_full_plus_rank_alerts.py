@@ -3449,9 +3449,8 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
         if val is None:
             return f"{'—':>12}"
         arrow = "↑" if val > 0 else "↓" if val < 0 else "→"
-        color = "#d7263d" if val > 0 else "#0abf53" if val < 0 else "#888"
         num = f"{val:+.2f}%"
-        return f"<span style='color:{color}'>{arrow} {num:>8}</span>"
+        return f"{arrow} {num:>8}"
 
     compra_lines = [
         header,
