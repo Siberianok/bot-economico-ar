@@ -1755,6 +1755,14 @@ def _variation_arrow(var: float) -> str:
     return "➡️"
 
 
+def _circle_indicator(val: float, *, up_icon: str, down_icon: str) -> str:
+    if val > 0:
+        return up_icon
+    if val < 0:
+        return down_icon
+    return "🟡"
+
+
 def _format_riesgo_variation(var: Optional[float]) -> str:
     if not isinstance(var, (int, float)):
         return ""
