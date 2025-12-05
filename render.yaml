@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: bot-economico-ar
     env: python
     plan: free
