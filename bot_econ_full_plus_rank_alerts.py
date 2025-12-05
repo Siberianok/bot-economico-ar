@@ -6220,13 +6220,13 @@ async def pf_main_menu_text(chat_id: int) -> str:
     _, _, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
     restante = max(0.0, monto - total_invertido)
     lines = ["<b>📦 Menú Portafolio</b>"]
-    lines.append(f"Base: {base} / {tc}")
-    lines.append(f"Monto objetivo: {f_money(monto)}")
-    lines.append(f"Valor invertido: {f_money(total_invertido)}")
-    lines.append(f"Restante: {f_money(restante)}")
+    lines.append(f"💱 Base: {base} / {tc}")
+    lines.append(f"🎯 Monto objetivo: {f_money(monto)}")
+    lines.append(f"💸 Valor invertido: {f_money(total_invertido)}")
+    lines.append(f"🪙 Restante: {f_money(restante)}")
     if pf.get("items"):
-        lines.append(f"Valor actual estimado: {f_money(total_actual)}")
-    lines.append(f"Instrumentos cargados: {len(pf.get('items', []))}")
+        lines.append(f"📊 Valor actual estimado: {f_money(total_actual)}")
+    lines.append(f"🧾 Instrumentos cargados: {len(pf.get('items', []))}")
     if tc_val is not None:
         tc_line = f"Tipo de cambio ref. ({tc}): {fmt_money_ars(tc_val)} por USD"
         if tc_ts:
@@ -7863,23 +7863,23 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
 
         if detail:
             detail.append("")
-        extras = [f"peso {pct_plain(weight * 100.0, 1)}"]
+        extras = [f"⚖️ Peso {pct_plain(weight * 100.0, 1)}"]
         added_str = format_added_date(entry.get("added_ts"))
         if added_str:
-            extras.append(f"desde {added_str}")
+            extras.append(f"⏳ Desde {added_str}")
 
         invertido = float(entry.get("invertido") or 0.0)
         valor_actual = float(entry.get("valor_actual") or 0.0)
         delta = valor_actual - invertido
         actual_pct = (delta / invertido) * 100.0 if invertido > 0 else None
         actual_txt = pct(actual_pct, 2)
-        proj_txt = f"3M {pct(p3, 2)} | 6M {pct(p6, 2)}"
-        delta_txt = f"Δ {f_money(delta)}"
+        proj_txt = f"🔭 3M {pct(p3, 2)} | 6M {pct(p6, 2)}"
+        delta_txt = f"📈 Δ {f_money(delta)}"
 
         detail.append(
             "• "
             + short_label
-            + f" → Rend. actual {actual_txt} ({delta_txt}) | Proyección {proj_txt} ("
+            + f" → Rend. actual 📊 {actual_txt} ({delta_txt}) | Proyección {proj_txt} ("
             + " · ".join(extras)
             + ")"
         )
