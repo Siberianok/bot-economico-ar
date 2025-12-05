@@ -970,6 +970,9 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
             exc.resume_at,
             url,
         )
+    except Exception as exc:
+        _record_http_metrics(host, (time() - started) * 1000, success=False)
+        log.warning("fetch_json http_service error %s: %s", url, exc)
     try:
         async with session.get(
             url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs
