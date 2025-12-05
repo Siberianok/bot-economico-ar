@@ -964,12 +964,14 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
             url, source=source, headers={**REQ_HEADERS, **headers}, timeout=http_timeout, **kwargs
         )
     except SourceSuspendedError as exc:
+        _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning(
             "source_suspended source=%s resume_at=%s url=%s",
             exc.source,
             exc.resume_at,
             url,
         )
+        return None
     except Exception as exc:
         _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning("fetch_json http_service error %s: %s", url, exc)
@@ -1053,12 +1055,14 @@ async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str
             **kwargs,
         )
     except SourceSuspendedError as exc:
+        _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning(
             "source_suspended source=%s resume_at=%s url=%s",
             exc.source,
             exc.resume_at,
             url,
         )
+        return None
     try:
         async with session.get(url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs) as resp:
             if resp.status == 200:
