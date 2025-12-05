@@ -124,6 +124,7 @@ REQ_HEADERS = {
     "Connection": "keep-alive",
     "Cache-Control": "no-cache",
 }
+HTTPX_CLIENT_KEY = "httpx_client"
 
 # ============================ LISTADOS ============================
 
@@ -1014,24 +1015,37 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
     return None
 
 
-async def fetch_json_httpx(url: str, **kwargs) -> Optional[Dict[str, Any]]:
+def build_httpx_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=15,
+        headers=REQ_HEADERS,
+        follow_redirects=True,
+        verify=certifi.where(),
+    )
+
+
+def get_httpx_client(bot_data: Dict[str, Any]) -> Optional[httpx.AsyncClient]:
+    client = bot_data.get(HTTPX_CLIENT_KEY)
+    return client if isinstance(client, httpx.AsyncClient) else None
+
+
+async def fetch_json_httpx(client: httpx.AsyncClient, url: str, **kwargs) -> Optional[Dict[str, Any]]:
     started = time()
     host = urlparse(url).netloc
     try:
-        timeout = kwargs.pop("timeout", 15)
+        timeout = kwargs.pop("timeout", None)
         headers = kwargs.pop("headers", {})
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            headers={**REQ_HEADERS, **headers},
-            follow_redirects=True,
-            verify=certifi.where(),
-        ) as client:
-            resp = await client.get(url, **kwargs)
-            if 200 <= resp.status_code < 300:
-                payload = resp.json()
-                _record_http_metrics(host, (time() - started) * 1000, success=True)
-                return payload
-            log.warning("httpx GET %s -> %s", url, resp.status_code)
+        request_kwargs = kwargs
+        if timeout is not None:
+            request_kwargs["timeout"] = timeout
+        if headers:
+            request_kwargs["headers"] = {**dict(client.headers), **headers}
+        resp = await client.get(url, **request_kwargs)
+        if 200 <= resp.status_code < 300:
+            payload = resp.json()
+            _record_http_metrics(host, (time() - started) * 1000, success=True)
+            return payload
+        log.warning("httpx GET %s -> %s", url, resp.status_code)
     except httpx.TimeoutException:
         duration_ms = (time() - started) * 1000
         _record_http_metrics(host, duration_ms, success=False, timeout=True)
@@ -1512,7 +1526,9 @@ async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Option
     try: return float(v) if v is not None else None
     except: return None
 
-async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optional[str], Optional[float], bool]]:
+async def get_riesgo_pais(
+    session: ClientSession, httpx_client: Optional[httpx.AsyncClient] = None
+) -> Optional[Tuple[int, Optional[str], Optional[float], bool]]:
     global RIESGO_CACHE
     val: Optional[float] = None
     fecha: Optional[str] = None
@@ -1615,7 +1631,7 @@ async def get_riesgo_pais(session: ClientSession) -> Optional[Tuple[int, Optiona
 
     async def _parse_argdatos() -> None:
         nonlocal val, fecha, variation
-        data = await fetch_json_httpx(ARG_DATOS_RIESGO_URL)
+        data = await fetch_json_httpx(httpx_client, ARG_DATOS_RIESGO_URL) if httpx_client else None
         if not data:
             data = await fetch_json(session, ARG_DATOS_RIESGO_URL)
         series = None
@@ -1753,7 +1769,9 @@ def _format_reservas_variation(prev_val: Optional[float], cur_val: Optional[floa
     sign = "+" if var > 0 else ""
     return f" <span style='color:{color}'>{arrow} {sign}{var:.2f}%</span>"
 
-async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float, Optional[str], Optional[float]]]:
+async def get_inflacion_mensual(
+    session: ClientSession, httpx_client: Optional[httpx.AsyncClient] = None
+) -> Optional[Tuple[float, Optional[str], Optional[float]]]:
     def _parse_period(raw: Optional[str]) -> Optional[datetime]:
         if not raw:
             return None
@@ -1786,7 +1804,7 @@ async def get_inflacion_mensual(session: ClientSession) -> Optional[Tuple[float,
     prev_val: Optional[float] = None
 
     for url in candidates:
-        j: Any = await fetch_json_httpx(url, follow_redirects=True)
+        j: Any = await fetch_json_httpx(httpx_client, url, follow_redirects=True) if httpx_client else None
         if not j:
             j = await fetch_json(session, url)
         if not j:
@@ -4129,8 +4147,9 @@ async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    httpx_client = get_httpx_client(context.application.bot_data) if context and context.application else None
     async with ClientSession() as session:
-        tup = await get_inflacion_mensual(session)
+        tup = await get_inflacion_mensual(session, httpx_client=httpx_client)
     if tup is None:
         txt = "No pude obtener inflación ahora."
     else:
@@ -4141,8 +4160,9 @@ async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    httpx_client = get_httpx_client(context.application.bot_data) if context and context.application else None
     async with ClientSession() as session:
-        tup = await get_riesgo_pais(session)
+        tup = await get_riesgo_pais(session, httpx_client=httpx_client)
     if tup is None:
         txt = "No pude obtener riesgo país ahora."
     else:
@@ -5675,6 +5695,7 @@ async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["al"]["mode"] = mode
     al = context.user_data.get("al", {})
     op_text = "↑ Sube" if al.get("op")==">" else "↓ Baja"
+    httpx_client = get_httpx_client(context.application.bot_data) if context and context.application else None
     async with ClientSession() as session:
         if al.get("kind") == "fx":
             fx = await get_dolares(session); row = fx.get(al.get("type",""), {}) or {}
@@ -5688,7 +5709,7 @@ async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
                        f"Ahora: {cur_s}\n\nIngresá el <b>importe</b> AR$ (solo número). Ej: 1580 | 25500")
             await q.edit_message_text(msg, parse_mode=ParseMode.HTML); return AL_VALUE
         if al.get("kind") == "metric":
-            rp = await get_riesgo_pais(session); infl = await get_inflacion_mensual(session); rv = await get_reservas_lamacro(session)
+            rp = await get_riesgo_pais(session, httpx_client=httpx_client); infl = await get_inflacion_mensual(session, httpx_client=httpx_client); rv = await get_reservas_lamacro(session)
             curmap = {"riesgo": (f"{rp[0]:.0f} pb" if rp else "—", rp[0] if rp else None, "pb"),
                       "inflacion": ((str(round(infl[0],1)).replace('.',','))+"%" if infl else "—", infl[0] if infl else None, "%"),
                       "reservas": (f"{fmt_number(rv[0],0)} MUS$" if rv else "—", rv[0] if rv else None, "MUS$")}
@@ -5729,6 +5750,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         edit_idx = None
     is_edit = isinstance(edit_idx, int) and 0 <= edit_idx < len(rules)
     prev_rule = rules[edit_idx] if is_edit else None
+    httpx_client = get_httpx_client(context.application.bot_data) if context and context.application else None
     async with ClientSession() as session:
         if al.get("kind") == "fx":
             fx = await get_dolares(session); row = fx.get(al["type"], {}) or {}
@@ -5768,7 +5790,7 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
 
         if al.get("kind") == "metric":
-            rp = await get_riesgo_pais(session); infl = await get_inflacion_mensual(session); rv = await get_reservas_lamacro(session)
+            rp = await get_riesgo_pais(session, httpx_client=httpx_client); infl = await get_inflacion_mensual(session, httpx_client=httpx_client); rv = await get_reservas_lamacro(session)
             curmap = {"riesgo": float(rp[0]) if rp else None, "inflacion": float(infl[0]) if infl else None, "reservas": rv[0] if rv else None}
             cur = curmap.get(al["type"])
             if cur is None:
@@ -5893,6 +5915,7 @@ async def alerts_loop(app: Application):
     try:
         await asyncio.sleep(5)
         timeout = ClientTimeout(total=12)
+        httpx_client = get_httpx_client(app.bot_data)
         while True:
             try:
                 now_ts = datetime.now(TZ).timestamp()
@@ -5906,8 +5929,8 @@ async def alerts_loop(app: Application):
                 if active_chats:
                     async with ClientSession(timeout=timeout) as session:
                         fx = await get_dolares(session)
-                        rp = await get_riesgo_pais(session)
-                        infl = await get_inflacion_mensual(session)
+                        rp = await get_riesgo_pais(session, httpx_client=httpx_client)
+                        infl = await get_inflacion_mensual(session, httpx_client=httpx_client)
                         rv = await get_reservas_lamacro(session)
                         vals = {"riesgo": float(rp[0]) if rp else None,
                                 "inflacion": float(infl[0]) if infl else None,
@@ -7835,10 +7858,11 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if is_throttled("resumen", chat_id, user_id, ttl=45):
         await update.effective_message.reply_text("⏳ Esperá unos segundos antes de pedir otro resumen.")
         return
+    httpx_client = get_httpx_client(context.application.bot_data) if context and context.application else None
     async with ClientSession() as session:
         fx = await get_dolares(session)
-        rp = await get_riesgo_pais(session)
-        infl = await get_inflacion_mensual(session)
+        rp = await get_riesgo_pais(session, httpx_client=httpx_client)
+        infl = await get_inflacion_mensual(session, httpx_client=httpx_client)
         rv = await get_reservas_lamacro(session)
         news = await fetch_rss_entries(session, limit=3)
 
@@ -7942,8 +7966,21 @@ BOT_COMMANDS = [
 ]
 
 
+async def _shutdown_httpx_client(app: Application) -> None:
+    client = app.bot_data.get(HTTPX_CLIENT_KEY)
+    if isinstance(client, httpx.AsyncClient):
+        await client.aclose()
+
+
 def build_application() -> Application:
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    httpx_client = build_httpx_client()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_shutdown(_shutdown_httpx_client)
+        .build()
+    )
+    app.bot_data[HTTPX_CLIENT_KEY] = httpx_client
 
     # Comandos
     app.add_handler(CommandHandler("start", cmd_start))
