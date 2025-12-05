@@ -1743,7 +1743,7 @@ def _variation_arrow(var: float) -> str:
     if var < 0:
         return "🔻"
     if var > 0:
-        return "🟢⬆️"
+        return "🔼"
     return "➡️"
 
 
