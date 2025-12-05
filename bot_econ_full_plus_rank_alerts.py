@@ -6136,6 +6136,7 @@ def _schedule_all_subs(app: Application):
 
 def kb_times_full() -> InlineKeyboardMarkup:
     rows, row = [], []
+    rows.append([("📃 Ver resumen ahora", "SUBS:NOW")])
     for h in range(24):
         label = f"{h:02d}:00"; row.append((label, f"SUBS:T:{label}"))
         if len(row) == 4: rows.append(row); row = []
@@ -6146,7 +6147,11 @@ def kb_times_full() -> InlineKeyboardMarkup:
 async def cmd_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     cur = SUBS.get(chat_id, {}).get("daily")
-    txt = f"<b>📬 Suscripción</b>\nResumen Diario: {'ON ('+cur+')' if cur else 'OFF'}\nElegí un horario (hora AR):"
+    txt = (
+        "<b>📬 Suscripción</b>\n"
+        f"Resumen Diario: {'ON ('+cur+')' if cur else 'OFF'}\n"
+        "Podés verlo ahora o elegir un horario (hora AR):"
+    )
     await update.effective_message.reply_text(txt, reply_markup=kb_times_full(), parse_mode=ParseMode.HTML)
     return SUBS_SET_TIME
 
@@ -6165,6 +6170,9 @@ async def subs_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             SUBS[chat_id]["daily"] = None; await save_state()
             for j in context.application.job_queue.get_jobs_by_name(_job_name_daily(chat_id)): j.schedule_removal()
         await q.edit_message_text("Suscripción cancelada."); return ConversationHandler.END
+    if data == "SUBS:NOW":
+        await cmd_resumen_diario(update, context)
+        return SUBS_SET_TIME
     if data.startswith("SUBS:T:"):
         hhmm = data.split(":",2)[2]
         SUBS.setdefault(chat_id, {})["daily"] = hhmm; await save_state()
