@@ -3,7 +3,7 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,11 @@ class BotConfig:
     base_url: str
     state_path: Path
     upstash: UpstashConfig
+    link_previews_enabled: bool
+    link_previews_prefer_small: bool
+    alerts_page_size: int
+    rank_top_limit: int
+    rank_proj_limit: int
 
 
 def _get_first(keys: Iterable[str], default: str = "") -> str:
@@ -53,6 +58,24 @@ def _get_int(key: str, default: int) -> int:
         return int(raw)
     except ValueError as exc:
         raise RuntimeError(f"Valor inválido para {key}: {raw}") from exc
+
+
+def _get_bounded_int(
+    key: str, default: int, *, min_value: Optional[int] = None, max_value: Optional[int] = None
+) -> int:
+    value = _get_int(key, default)
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+def _get_bool(key: str, default: bool = False) -> bool:
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y"}
 
 
 def load_config() -> BotConfig:
@@ -87,6 +110,12 @@ def load_config() -> BotConfig:
         state_key=upstash_state_key,
     )
 
+    link_previews_enabled = _get_bool("LINK_PREVIEWS_ENABLED", False)
+    link_previews_prefer_small = _get_bool("LINK_PREVIEWS_PREFER_SMALL", False)
+    alerts_page_size = _get_bounded_int("ALERTS_PAGE_SIZE", 10, min_value=1)
+    rank_top_limit = _get_bounded_int("RANK_TOP_LIMIT", 3, min_value=1)
+    rank_proj_limit = _get_bounded_int("RANK_PROJ_LIMIT", 5, min_value=1)
+
     return BotConfig(
         telegram_token=telegram_token,
         webhook_secret=webhook_secret,
@@ -94,6 +123,11 @@ def load_config() -> BotConfig:
         base_url=base_url,
         state_path=state_path,
         upstash=upstash,
+        link_previews_enabled=link_previews_enabled,
+        link_previews_prefer_small=link_previews_prefer_small,
+        alerts_page_size=alerts_page_size,
+        rank_top_limit=rank_top_limit,
+        rank_proj_limit=rank_proj_limit,
     )
 
 

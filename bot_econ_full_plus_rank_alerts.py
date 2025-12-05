@@ -52,43 +52,19 @@ from bot.persistence.state import (
 
 TZ = ZoneInfo("America/Argentina/Buenos_Aires")
 
-
-def _env_flag(name: str, default: str = "false") -> bool:
-    return (os.getenv(name, default) or "").strip().lower() in {"1", "true", "yes", "y"}
-
-
-def _env_int(name: str, default: str, *, min_value: int, max_value: Optional[int] = None) -> int:
-    try:
-        value = int(os.getenv(name, default))
-    except Exception:
-        value = int(default)
-    value = max(min_value, value)
-    if max_value is not None:
-        value = min(max_value, value)
-    return value
-
-LINK_PREVIEWS_ENABLED = _env_flag("LINK_PREVIEWS_ENABLED")
-LINK_PREVIEWS_PREFER_SMALL = _env_flag("LINK_PREVIEWS_PREFER_SMALL")
-ALERTS_PAGE_SIZE = _env_int("ALERTS_PAGE_SIZE", "10", min_value=1)
-RANK_TOP_LIMIT = _env_int("RANK_TOP_LIMIT", "3", min_value=1)
-RANK_PROJ_LIMIT = _env_int("RANK_PROJ_LIMIT", "5", min_value=1)
-TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "tgwebhook").strip().strip("/")
-PORT = int(os.getenv("PORT", "10000"))
-BASE_URL = os.getenv("BASE_URL", os.getenv("RENDER_EXTERNAL_URL", "http://localhost")).rstrip("/")
-ENV_STATE_PATH = os.getenv("STATE_PATH", "state.json")
-UPSTASH_URL = (os.getenv("UPSTASH_REDIS_REST_URL") or os.getenv("UPSTASH_URL") or "").strip()
-UPSTASH_TOKEN = (os.getenv("UPSTASH_REDIS_REST_TOKEN") or os.getenv("UPSTASH_TOKEN") or "").strip()
-UPSTASH_REDIS_URL = (
-    os.getenv("UPSTASH_REDIS_URL")
-    or os.getenv("REDIS_URL")
-    or os.getenv("redis-url")
-    or ""
-).strip()
-UPSTASH_STATE_KEY = os.getenv("UPSTASH_STATE_KEY", "bot-econ-state").strip()
-
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("TELEGRAM_TOKEN/BOT_TOKEN no configurado.")
+LINK_PREVIEWS_ENABLED = config.link_previews_enabled
+LINK_PREVIEWS_PREFER_SMALL = config.link_previews_prefer_small
+ALERTS_PAGE_SIZE = config.alerts_page_size
+RANK_TOP_LIMIT = config.rank_top_limit
+RANK_PROJ_LIMIT = config.rank_proj_limit
+TELEGRAM_TOKEN = config.telegram_token
+WEBHOOK_SECRET = config.webhook_secret
+PORT = config.port
+BASE_URL = config.base_url
+UPSTASH_URL = config.upstash.rest_url
+UPSTASH_TOKEN = config.upstash.rest_token
+UPSTASH_REDIS_URL = config.upstash.redis_url
+UPSTASH_STATE_KEY = config.upstash.state_key
 
 WEBHOOK_PATH = f"/{WEBHOOK_SECRET}"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
@@ -647,10 +623,10 @@ def _ensure_state_path() -> Optional[str]:
     except Exception:
         return None
 
-USE_UPSTASH = bool(UPSTASH_URL and UPSTASH_TOKEN)
-USE_UPSTASH_REST = USE_UPSTASH
-USE_UPSTASH_REDIS = bool(UPSTASH_REDIS_URL)
-STATE_PATH = ensure_writable_path(ENV_STATE_PATH, log)
+USE_UPSTASH_REST = config.upstash.use_rest
+USE_UPSTASH_REDIS = config.upstash.use_redis
+USE_UPSTASH = USE_UPSTASH_REST or USE_UPSTASH_REDIS
+STATE_PATH = ensure_writable_path(str(config.state_path), log)
 STATE_STORE: StateStore
 FALLBACK_STATE_STORE: Optional[StateStore] = None
 
