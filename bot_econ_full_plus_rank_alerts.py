@@ -1739,17 +1739,15 @@ def _format_riesgo_variation(var: Optional[float]) -> str:
     if not isinstance(var, (int, float)):
         return ""
     arrow = "🔻" if var < 0 else "🔺" if var > 0 else "➡️"
-    color = "#0abf53" if var < 0 else "#d7263d" if var > 0 else "#888"
     sign = "" if var < 0 else "+" if var > 0 else ""
-    return f" <span style='color:{color}'>{arrow} {sign}{var:.2f}%</span>"
+    return f" {arrow} {sign}{var:.2f}%"
 
 def _format_inflacion_variation(var: Optional[float]) -> str:
     if not isinstance(var, (int, float)):
         return " —"
     arrow = "↑" if var > 0 else "↓" if var < 0 else "→"
-    color = "#d7263d" if var > 0 else "#0abf53" if var < 0 else "#888"
     sign = "+" if var > 0 else ""
-    return f" <span style='color:{color}'>{arrow} {sign}{var:.1f}%</span>"
+    return f" {arrow} {sign}{var:.1f}%"
 
 def _format_reservas_variation(prev_val: Optional[float], cur_val: Optional[float]) -> str:
     if not isinstance(prev_val, (int, float)) or not isinstance(cur_val, (int, float)):
@@ -1761,9 +1759,8 @@ def _format_reservas_variation(prev_val: Optional[float], cur_val: Optional[floa
     except Exception:
         return ""
     arrow = "↑" if var > 0 else "↓" if var < 0 else "→"
-    color = "#0abf53" if var > 0 else "#d7263d" if var < 0 else "#888"
     sign = "+" if var > 0 else ""
-    return f" <span style='color:{color}'>{arrow} {sign}{var:.2f}%</span>"
+    return f" {arrow} {sign}{var:.2f}%"
 
 async def get_inflacion_mensual(
     session: ClientSession, httpx_client: Optional[httpx.AsyncClient] = None
