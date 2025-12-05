@@ -14,6 +14,7 @@ import certifi
 
 from bot.config import config
 from bot.services.cache import RateLimiter, ShortCache
+from bot.services.http import SourceSuspendedError, http_service
 
 # ====== matplotlib opcional (no rompe si no está instalado) ======
 HAS_MPL = False
@@ -969,6 +970,9 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
             exc.resume_at,
             url,
         )
+    except Exception as exc:
+        _record_http_metrics(host, (time() - started) * 1000, success=False)
+        log.warning("fetch_json http_service error %s: %s", url, exc)
     try:
         async with session.get(
             url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs
@@ -1037,9 +1041,28 @@ async def fetch_json_httpx(client: httpx.AsyncClient, url: str, **kwargs) -> Opt
 async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str]:
     started = time()
     host = urlparse(url).netloc
+    timeout = kwargs.pop("timeout", ClientTimeout(total=15))
+    headers = kwargs.pop("headers", {})
+
     try:
-        timeout = kwargs.pop("timeout", ClientTimeout(total=15))
-        headers = kwargs.pop("headers", {})
+        http_timeout = timeout.total if isinstance(timeout, ClientTimeout) else timeout
+        return await http_service.get_text(
+            url,
+            headers={**REQ_HEADERS, **headers},
+            timeout=http_timeout,
+            **kwargs,
+        )
+    except SourceSuspendedError as exc:
+        log.warning(
+            "source_suspended source=%s resume_at=%s url=%s",
+            exc.source,
+            exc.resume_at,
+            url,
+        )
+    except Exception as exc:
+        _record_http_metrics(host, (time() - started) * 1000, success=False)
+        log.warning("fetch_text http_service error %s: %s", url, exc)
+    try:
         async with session.get(url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs) as resp:
             if resp.status == 200:
                 body = await resp.text()
