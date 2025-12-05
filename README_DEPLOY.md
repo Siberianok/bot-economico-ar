@@ -2,9 +2,9 @@
 # Bot Económico AR — Deploy en Render (plan Free)
 
 ## 1) Archivos
-- `bot_econ_full_plus_rank_alerts.py` — script principal del bot (worker).
+- `bot_econ_full_plus_rank_alerts.py` — script principal del bot (webhook + healthchecks).
 - `requirements.txt` — dependencias.
-- `render.yaml` — blueprint de Render (servicio tipo Worker).
+- `render.yaml` — blueprint de Render (servicio tipo Web con puerto en `PORT`).
 
 ## 2) Variables de entorno
 - `BOT_TOKEN` — el token del bot de Telegram (NO hardcodear).
@@ -16,11 +16,14 @@
 ## 3) Deploy rápido (desde un repo)
 1. Subí estos 3 archivos a un repositorio (GitHub/GitLab).
 2. En Render: **New +** → **Blueprint** → conectá el repo.
-3. Aceptá el servicio **worker** sugerido por `render.yaml`.
+3. Aceptá el servicio **web** sugerido por `render.yaml`.
 4. En *Environment variables*, agregá `BOT_TOKEN` con tu token real.
 5. Deploy.
 
-> Plan Free: Render puede reiniciar el worker de vez en cuando. Con Upstash configurado el estado queda fuera de Render; si no, se escribe en un JSON local (`STATE_PATH`). El archivo en `/var/tmp` suele sobrevivir a reinicios suaves, pero no a *redeploys* completos. Para persistencia “fuerte”, usá Upstash o un volumen/bucket externo.
+> Render expone el puerto indicado en la variable `PORT` (ver [docs](https://render.com/docs/web-services#port-binding)). El bot ya
+> escucha en `0.0.0.0:$PORT`, y Render inyecta automáticamente `RENDER_EXTERNAL_URL`, usada para registrar el webhook con Telegram.
+
+> Plan Free: Render puede reiniciar el servicio de vez en cuando. Con Upstash configurado el estado queda fuera de Render; si no, se escribe en un JSON local (`STATE_PATH`). El archivo en `/var/tmp` suele sobrevivir a reinicios suaves, pero no a *redeploys* completos. Para persistencia “fuerte”, usá Upstash o un volumen/bucket externo.
 
 ## 4) Comandos finales
 - `/reservas` — Reservas BCRA (series oficiales via `apis.datos.gob.ar`).
