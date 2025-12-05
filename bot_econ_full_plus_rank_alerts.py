@@ -134,8 +134,12 @@ CRIPTO_TOP_NAMES = [
 ]
 def _crypto_to_symbol(cname: str) -> str: return f"{cname}-USD"
 
-BINANCE_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"
+BINANCE_EXCHANGE_INFO_URLS = [
+    "https://data-api.binance.vision/api/v3/exchangeInfo",
+    "https://api.binance.com/api/v3/exchangeInfo",
+]
 BINANCE_TICKER_PRICE_URLS = [
+    "https://data-api.binance.vision/api/v3/ticker/price",
     "https://api.binance.com/api/v3/ticker/price",
     "https://api1.binance.com/api/v3/ticker/price",
     "https://api2.binance.com/api/v3/ticker/price",
@@ -1088,7 +1092,11 @@ async def get_binance_symbols(session: ClientSession) -> Dict[str, Dict[str, str
     now = time()
     if _binance_symbols_cache and (now - _binance_symbols_ts) < 3600:
         return _binance_symbols_cache
-    data = await fetch_json(session, BINANCE_EXCHANGE_INFO_URL)
+    data = None
+    for url in BINANCE_EXCHANGE_INFO_URLS:
+        data = await fetch_json(session, url)
+        if data:
+            break
     if not data:
         if not _binance_symbols_cache:
             _binance_symbols_cache = _binance_build_fallback()
