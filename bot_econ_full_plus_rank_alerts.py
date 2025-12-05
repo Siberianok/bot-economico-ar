@@ -3511,6 +3511,13 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
 
     return compra_msg, venta_msg
 
+
+def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
+    """Build a compact FX block combining purchase and sale tables."""
+
+    compra_msg, venta_msg = format_dolar_panels(d)
+    return "\n\n".join([compra_msg, venta_msg])
+
 def format_top3_table(title: str, fecha: Optional[str], rows_syms: List[str], retmap: Dict[str, Dict[str, Optional[float]]]) -> str:
     head = f"<b>{title}</b>" + (f" <i>Últ. Dato: {fecha}</i>" if fecha else "")
     lines = [head, "<pre>Rank Empresa (Ticker)             6M        3M        1M</pre>"]
@@ -7952,6 +7959,7 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     httpx_client = get_httpx_client(context.application.bot_data) if context and context.application else None
     async with ClientSession() as session:
         fx = await get_dolares(session)
+        bandas = await get_bandas_cambiarias(session)
         rp = await get_riesgo_pais(session, httpx_client=httpx_client)
         infl = await get_inflacion_mensual(session, httpx_client=httpx_client)
         rv = await get_reservas_lamacro(session)
@@ -7960,6 +7968,8 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     partes = []
     if fx:
         partes.append(format_dolar_message(fx))
+    if bandas:
+        partes.append(format_bandas_cambiarias(bandas))
     if rp:
         change_txt = _format_riesgo_variation(rp[2])
         partes.append(
