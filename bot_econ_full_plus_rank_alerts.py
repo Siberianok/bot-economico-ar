@@ -1735,17 +1735,25 @@ async def get_riesgo_pais(
     return res
 
 
+def _variation_arrow(var: float) -> str:
+    if var < 0:
+        return "🔻"
+    if var > 0:
+        return "🟢⬆️"
+    return "➡️"
+
+
 def _format_riesgo_variation(var: Optional[float]) -> str:
     if not isinstance(var, (int, float)):
         return ""
-    arrow = "🔻" if var < 0 else "🔺" if var > 0 else "➡️"
+    arrow = _variation_arrow(var)
     sign = "" if var < 0 else "+" if var > 0 else ""
     return f" {arrow} {sign}{var:.2f}%"
 
 def _format_inflacion_variation(var: Optional[float]) -> str:
     if not isinstance(var, (int, float)):
         return " —"
-    arrow = "↑" if var > 0 else "↓" if var < 0 else "→"
+    arrow = _variation_arrow(var)
     sign = "+" if var > 0 else ""
     return f" {arrow} {sign}{var:.1f}%"
 
@@ -1758,7 +1766,7 @@ def _format_reservas_variation(prev_val: Optional[float], cur_val: Optional[floa
         var = ((cur_val - prev_val) / prev_val) * 100.0
     except Exception:
         return ""
-    arrow = "↑" if var > 0 else "↓" if var < 0 else "→"
+    arrow = _variation_arrow(var)
     sign = "+" if var > 0 else ""
     return f" {arrow} {sign}{var:.2f}%"
 
@@ -3445,7 +3453,7 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     def _fmt_var(val: Optional[float]) -> str:
         if val is None:
             return f"{'—':>12}"
-        arrow = "↑" if val > 0 else "↓" if val < 0 else "→"
+        arrow = _variation_arrow(val)
         num = f"{val:+.2f}%"
         return f"{arrow} {num:>8}"
 
@@ -4036,12 +4044,7 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
     def _fmt_var(val: Optional[float], is_upper: bool) -> str:
         if val is None:
             return "—"
-        if val > 0:
-            icon = "🟢⬆️"
-        elif val < 0:
-            icon = "🔻"
-        else:
-            icon = "➡️"
+        icon = _variation_arrow(val)
         return f"{icon} {pct(val, 2)}"
 
     pct_sup_txt = _fmt_var(pct_sup, True)
