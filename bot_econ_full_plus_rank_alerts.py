@@ -1740,14 +1740,14 @@ def _format_riesgo_variation(var: Optional[float]) -> str:
         return ""
     arrow = "🔻" if var < 0 else "🔺" if var > 0 else "➡️"
     sign = "" if var < 0 else "+" if var > 0 else ""
-    return f" <b>{arrow} {sign}{var:.2f}%</b>"
+    return f" {arrow} {sign}{var:.2f}%"
 
 def _format_inflacion_variation(var: Optional[float]) -> str:
     if not isinstance(var, (int, float)):
         return " —"
     arrow = "↑" if var > 0 else "↓" if var < 0 else "→"
     sign = "+" if var > 0 else ""
-    return f" <b>{arrow} {sign}{var:.1f}%</b>"
+    return f" {arrow} {sign}{var:.1f}%"
 
 def _format_reservas_variation(prev_val: Optional[float], cur_val: Optional[float]) -> str:
     if not isinstance(prev_val, (int, float)) or not isinstance(cur_val, (int, float)):
@@ -1760,7 +1760,7 @@ def _format_reservas_variation(prev_val: Optional[float], cur_val: Optional[floa
         return ""
     arrow = "↑" if var > 0 else "↓" if var < 0 else "→"
     sign = "+" if var > 0 else ""
-    return f" <b>{arrow} {sign}{var:.2f}%</b>"
+    return f" {arrow} {sign}{var:.2f}%"
 
 async def get_inflacion_mensual(
     session: ClientSession, httpx_client: Optional[httpx.AsyncClient] = None
@@ -3446,9 +3446,8 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
         if val is None:
             return f"{'—':>12}"
         arrow = "↑" if val > 0 else "↓" if val < 0 else "→"
-        color = "#d7263d" if val > 0 else "#0abf53" if val < 0 else "#888"
         num = f"{val:+.2f}%"
-        return f"<span style='color:{color}'>{arrow} {num:>8}</span>"
+        return f"{arrow} {num:>8}"
 
     compra_lines = [
         header,
