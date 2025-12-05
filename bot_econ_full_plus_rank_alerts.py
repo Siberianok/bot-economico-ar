@@ -3616,10 +3616,15 @@ RET_SERIES_ORDER: List[Tuple[str, str]] = [
 ]
 
 
-async def _rank_top3(update: Update, symbols: List[str], title: str):
+async def _rank_top3(
+    update: Update,
+    symbols: List[str],
+    title: str,
+    throttle_key: Optional[str] = "rankings:top3",
+):
     chat_id = update.effective_chat.id if update.effective_chat else None
     user_id = update.effective_user.id if update.effective_user else None
-    if is_throttled("rankings", chat_id, user_id, ttl=35):
+    if throttle_key and is_throttled(throttle_key, chat_id, user_id, ttl=35):
         await update.effective_message.reply_text("⏳ Consultá de nuevo en unos segundos.")
         return
     async with ClientSession() as session:
@@ -3662,10 +3667,15 @@ async def _rank_top3(update: Update, symbols: List[str], title: str):
                 await update.effective_message.reply_photo(photo=img)
 
 
-async def _rank_proj5(update: Update, symbols: List[str], title: str):
+async def _rank_proj5(
+    update: Update,
+    symbols: List[str],
+    title: str,
+    throttle_key: Optional[str] = "rankings:top5",
+):
     chat_id = update.effective_chat.id if update.effective_chat else None
     user_id = update.effective_user.id if update.effective_user else None
-    if is_throttled("rankings", chat_id, user_id, ttl=35):
+    if throttle_key and is_throttled(throttle_key, chat_id, user_id, ttl=35):
         await update.effective_message.reply_text("⏳ Consultá de nuevo en unos segundos.")
         return
     async with ClientSession() as session:
@@ -4124,16 +4134,36 @@ async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     data = q.data
     if data == "ACC:TOP3":
-        await _rank_top3(update, ACCIONES_BA, "📈 Top 3 Acciones (Rendimiento)")
+        await _rank_top3(
+            update,
+            ACCIONES_BA,
+            "📈 Top 3 Acciones (Rendimiento)",
+            throttle_key="rankings:acciones:top3",
+        )
         await dec_and_maybe_show(update, context, "acciones", cmd_acciones_menu)
     elif data == "ACC:TOP5":
-        await _rank_proj5(update, ACCIONES_BA, "🏁 Top 5 Acciones (Proyección)")
+        await _rank_proj5(
+            update,
+            ACCIONES_BA,
+            "🏁 Top 5 Acciones (Proyección)",
+            throttle_key="rankings:acciones:top5",
+        )
         await dec_and_maybe_show(update, context, "acciones", cmd_acciones_menu)
     elif data == "CED:TOP3":
-        await _rank_top3(update, CEDEARS_BA, "🌎 Top 3 Cedears (Rendimiento)")
+        await _rank_top3(
+            update,
+            CEDEARS_BA,
+            "🌎 Top 3 Cedears (Rendimiento)",
+            throttle_key=None,
+        )
         await dec_and_maybe_show(update, context, "cedears", cmd_cedears_menu)
     elif data == "CED:TOP5":
-        await _rank_proj5(update, CEDEARS_BA, "🏁 Top 5 Cedears (Proyección)")
+        await _rank_proj5(
+            update,
+            CEDEARS_BA,
+            "🏁 Top 5 Cedears (Proyección)",
+            throttle_key=None,
+        )
         await dec_and_maybe_show(update, context, "cedears", cmd_cedears_menu)
     else:
         await q.answer("Selección inválida.", show_alert=True)
