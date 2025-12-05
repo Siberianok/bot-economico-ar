@@ -1747,25 +1747,25 @@ async def get_riesgo_pais(
     return res
 
 
-def _variation_arrow(var: float) -> str:
-    if var < 0:
-        return "🔴🔽"
+def _circle_indicator(var: float, up_icon: str, down_icon: str, neutral_icon: str = "⚪️") -> str:
     if var > 0:
-        return "🟢🔼"
-    return "➡️"
+        return up_icon
+    if var < 0:
+        return down_icon
+    return neutral_icon
 
 
 def _format_riesgo_variation(var: Optional[float]) -> str:
     if not isinstance(var, (int, float)):
         return ""
-    arrow = _variation_arrow(var)
+    arrow = _circle_indicator(var, up_icon="🔴", down_icon="🟢")
     sign = "" if var < 0 else "+" if var > 0 else ""
     return f" {arrow} {sign}{var:.2f}%"
 
 def _format_inflacion_variation(var: Optional[float]) -> str:
     if not isinstance(var, (int, float)):
         return " —"
-    arrow = _variation_arrow(var)
+    arrow = _circle_indicator(var, up_icon="🔴", down_icon="🟢")
     sign = "+" if var > 0 else ""
     return f" {arrow} {sign}{var:.1f}%"
 
@@ -1778,7 +1778,7 @@ def _format_reservas_variation(prev_val: Optional[float], cur_val: Optional[floa
         var = ((cur_val - prev_val) / prev_val) * 100.0
     except Exception:
         return ""
-    arrow = _variation_arrow(var)
+    arrow = _circle_indicator(var, up_icon="🟢", down_icon="🔴")
     sign = "+" if var > 0 else ""
     return f" {arrow} {sign}{var:.2f}%"
 
@@ -3465,7 +3465,7 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
     def _fmt_var(val: Optional[float]) -> str:
         if val is None:
             return f"{'—':>12}"
-        arrow = _variation_arrow(val)
+        arrow = _circle_indicator(val, up_icon="🔴", down_icon="🟢")
         num = f"{val:+.2f}%"
         return f"{arrow} {num:>8}"
 
@@ -4066,7 +4066,7 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
     def _fmt_var(val: Optional[float], is_upper: bool) -> str:
         if val is None:
             return "—"
-        icon = _variation_arrow(val)
+        icon = "🟢" if is_upper else "🔴"
         return f"{icon} {pct(val, 2)}"
 
     pct_sup_txt = _fmt_var(pct_sup, True)
@@ -4075,7 +4075,7 @@ def format_bandas_cambiarias(data: Dict[str, Any]) -> str:
     header = "<b>📊 Bandas cambiarias" + (" (solo diaria)" if not has_daily_data else "") + "</b>"
     header += f" <i>Actualizado: {fecha}</i>" if fecha else ""
 
-    col1 = ["Banda superior", "Banda inferior"]
+    col1 = ["🟢 Banda superior", "🔴 Banda inferior"]
     col2 = [sup_txt, inf_txt]
     col3 = [pct_sup_txt, pct_inf_txt]
 
