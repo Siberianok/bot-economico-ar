@@ -7786,6 +7786,7 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
     has_daily_data = any(entry.get('daily_change') is not None for entry in snapshot)
     return_points: List[Tuple[str, Optional[float]]] = []
     daily_points: List[Tuple[str, Optional[float]]] = []
+    lines.append("")
     for idx, entry in enumerate(snapshot):
         label = entry['label']
         valor_actual = entry['valor_actual']
