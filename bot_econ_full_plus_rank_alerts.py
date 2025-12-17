@@ -195,6 +195,7 @@ CUSTOM_CRYPTO_ENTRIES: Dict[str, Dict[str, Any]] = {
 
 FCI_DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "fci_data.json")
 _fci_series_cache: Optional[Dict[str, List[Tuple[int, float]]]] = None
+FONDOSONLINE_FUNDS_URL = "https://fondosonline.com/Operations/Funds/GetFundsProducts"
 
 
 def _load_fci_series() -> Dict[str, List[Tuple[int, float]]]:
@@ -245,7 +246,7 @@ def _load_fci_series() -> Dict[str, List[Tuple[int, float]]]:
     return _fci_series_cache
 
 
-def _fci_metrics(symbol: str) -> Dict[str, Optional[float]]:
+def _fci_metrics_from_series(symbol: str) -> Dict[str, Optional[float]]:
     base = {
         "6m": None,
         "3m": None,
@@ -336,6 +337,135 @@ def _fci_metrics(symbol: str) -> Dict[str, Optional[float]]:
             base["trend_flag"] = 1.0 if last_val > sma_long else (-1.0 if last_val < sma_long else 0.0)
 
     return base
+
+
+FCI_KEYWORDS = {
+    "FCI-MoneyMarket": ["money market", "cash management", "liquidez", "money"],
+    "FCI-BonosUSD": ["dólar", "usd", "dolar"],
+    "FCI-AccionesArg": ["acciones argentinas"],
+    "FCI-Corporativos": ["corporativo", "corporativa"],
+    "FCI-Liquidez": ["liquidez"],
+    "FCI-Balanceado": ["balanceado"],
+    "FCI-RentaMixta": ["renta mixta"],
+    "FCI-RealEstate": ["real estate", "inmobiliario"],
+    "FCI-Commodity": ["commodity"],
+    "FCI-Tech": ["tecnología", "technology", "tech"],
+    "FCI-BonosCER": ["cer", "uva"],
+    "FCI-DurationCorta": ["corto", "short"],
+    "FCI-DurationMedia": ["mediano", "medio"],
+    "FCI-DurationLarga": ["largo"],
+    "FCI-HighYield": ["high yield", "alto retorno"],
+    "FCI-BlueChips": ["blue chip", "bluechips"],
+    "FCI-Growth": ["growth", "crecimiento"],
+    "FCI-Value": ["value", "valor"],
+    "FCI-Latam": ["latam", "latino"],
+    "FCI-Global": ["global"],
+}
+
+
+def _matches_keyword(record: Dict[str, Any], keyword: str) -> bool:
+    haystack = " ".join(
+        str(part or "")
+        for part in (
+            record.get("fundName"),
+            record.get("fundStrategy"),
+            record.get("fundFocus"),
+        )
+    ).lower()
+    return keyword.lower() in haystack
+
+
+def _pick_fci_record(symbol: str, records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    keywords = FCI_KEYWORDS.get(symbol, [])
+    for kw in keywords:
+        for rec in records:
+            if _matches_keyword(rec, kw):
+                return rec
+
+    currency_pref = "USD" if "USD" in symbol.upper() else "ARS"
+    for rec in records:
+        if str(rec.get("fundCurrency", "")).upper() == currency_pref:
+            return rec
+    return records[0] if records else None
+
+
+def _fci_metrics_from_record(record: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    base = {
+        "6m": None,
+        "3m": None,
+        "1m": None,
+        "last_ts": None,
+        "vol_ann": None,
+        "dd6m": None,
+        "hi52": None,
+        "slope50": None,
+        "trend_flag": None,
+        "last_px": None,
+        "prev_px": None,
+        "last_chg": None,
+    }
+
+    try:
+        base["last_px"] = float(record.get("lastPrice"))
+    except (TypeError, ValueError):
+        base["last_px"] = None
+
+    try:
+        base["last_chg"] = float(record.get("dayPercent"))
+    except (TypeError, ValueError):
+        base["last_chg"] = None
+
+    try:
+        base["1m"] = float(record.get("monthPercent"))
+    except (TypeError, ValueError):
+        base["1m"] = None
+
+    try:
+        base["6m"] = float(record.get("yearPercent"))
+    except (TypeError, ValueError):
+        base["6m"] = None
+
+    last_ts_raw = record.get("lastPriceDate")
+    if isinstance(last_ts_raw, str):
+        try:
+            dt = datetime.fromisoformat(last_ts_raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=TZ)
+            base["last_ts"] = int(dt.timestamp())
+        except Exception:
+            pass
+
+    base["currency"] = "USD" if str(record.get("fundCurrency", "")).upper() == "USD" else "ARS"
+    return base
+
+
+async def _fondosonline_records(session: ClientSession) -> List[Dict[str, Any]]:
+    cache_key = "fondosonline:funds:records"
+    cached = SHORT_CACHE.get(cache_key)
+    if isinstance(cached, list):
+        return cached  # type: ignore[return-value]
+
+    payload = await fetch_json(
+        session,
+        FONDOSONLINE_FUNDS_URL,
+        params={"PageSize": 500, "sortColumn": "FundName", "isAscending": True},
+        timeout=ClientTimeout(total=12),
+        source=urlparse(FONDOSONLINE_FUNDS_URL).netloc,
+    )
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if isinstance(records, list):
+        SHORT_CACHE.set(cache_key, records, ttl=300)
+        return records  # type: ignore[return-value]
+    return []
+
+
+async def _fci_metrics(session: ClientSession, symbol: str) -> Dict[str, Optional[float]]:
+    records = await _fondosonline_records(session)
+    if records:
+        picked = _pick_fci_record(symbol, records)
+        if picked:
+            return _fci_metrics_from_record(picked)
+    return _fci_metrics_from_series(symbol)
 
 
 def _build_custom_crypto_map(entries: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
@@ -2387,7 +2517,7 @@ async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
     async def work(sym: str):
         async with sem:
             if sym.startswith("FCI-"):
-                out[sym] = _fci_metrics(sym)
+                out[sym] = await _fci_metrics(session, sym)
             elif sym in BONOS_AR:
                 out[sym] = await _rava_metrics(session, sym)
             else:
