@@ -3,6 +3,8 @@
 
 import os, asyncio, logging, re, html as _html, json, math, io, signal, csv, unicodedata
 import copy
+import urllib.request
+import urllib.error
 from time import time
 from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime
@@ -1995,13 +1997,29 @@ async def get_reservas_con_variacion(
 
 async def _fetch_rava_profile(session: ClientSession, symbol: str) -> Optional[Dict[str, Any]]:
     url = RAVA_PERFIL_URL.format(symbol=quote(symbol))
+    html: Optional[str] = None
     try:
         async with session.get(url, headers=REQ_HEADERS, timeout=ClientTimeout(total=12)) as resp:
-            if resp.status != 200:
+            if resp.status == 200:
+                html = await resp.text()
+    except Exception as exc:
+        log.info("rava_fetch_primary_failed url=%s err=%s", url, exc)
+
+    if html is None:
+        def _blocking_fetch() -> Optional[str]:
+            try:
+                req = urllib.request.Request(url, headers=REQ_HEADERS)
+                with urllib.request.urlopen(req, timeout=12) as resp:  # type: ignore[arg-type]
+                    if getattr(resp, "status", None) not in (None, 200):
+                        return None
+                    return resp.read().decode()
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:  # type: ignore[attr-defined]
+                log.info("rava_fetch_fallback_failed url=%s err=%s", url, exc)
                 return None
-            html = await resp.text()
-    except Exception:
-        return None
+
+        html = await asyncio.to_thread(_blocking_fetch)
+        if html is None:
+            return None
 
     match = re.search(r':res="(\{.*?\})"', html, flags=re.S)
     if not match:
