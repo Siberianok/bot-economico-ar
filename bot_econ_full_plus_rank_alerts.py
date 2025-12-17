@@ -3,6 +3,8 @@
 
 import os, asyncio, logging, re, html as _html, json, math, io, signal, csv, unicodedata
 import copy
+import urllib.request
+import urllib.error
 from time import time
 from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime
@@ -177,6 +179,7 @@ _binance_symbols_cache: Dict[str, Dict[str, str]] = {}
 _binance_symbols_ts: float = 0.0
 
 RAVA_PERFIL_URL = "https://www.rava.com/perfil/{symbol}"
+SCREENERMATIC_BONDS_URL = "https://www.screenermatic.com/bondsdescriptive.php"
 
 
 CUSTOM_CRYPTO_ENTRIES: Dict[str, Dict[str, Any]] = {
@@ -192,6 +195,7 @@ CUSTOM_CRYPTO_ENTRIES: Dict[str, Dict[str, Any]] = {
 
 FCI_DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "fci_data.json")
 _fci_series_cache: Optional[Dict[str, List[Tuple[int, float]]]] = None
+FONDOSONLINE_FUNDS_URL = "https://fondosonline.com/Operations/Funds/GetFundsProducts"
 
 
 def _load_fci_series() -> Dict[str, List[Tuple[int, float]]]:
@@ -242,7 +246,7 @@ def _load_fci_series() -> Dict[str, List[Tuple[int, float]]]:
     return _fci_series_cache
 
 
-def _fci_metrics(symbol: str) -> Dict[str, Optional[float]]:
+def _fci_metrics_from_series(symbol: str) -> Dict[str, Optional[float]]:
     base = {
         "6m": None,
         "3m": None,
@@ -333,6 +337,135 @@ def _fci_metrics(symbol: str) -> Dict[str, Optional[float]]:
             base["trend_flag"] = 1.0 if last_val > sma_long else (-1.0 if last_val < sma_long else 0.0)
 
     return base
+
+
+FCI_KEYWORDS = {
+    "FCI-MoneyMarket": ["money market", "cash management", "liquidez", "money"],
+    "FCI-BonosUSD": ["dólar", "usd", "dolar"],
+    "FCI-AccionesArg": ["acciones argentinas"],
+    "FCI-Corporativos": ["corporativo", "corporativa"],
+    "FCI-Liquidez": ["liquidez"],
+    "FCI-Balanceado": ["balanceado"],
+    "FCI-RentaMixta": ["renta mixta"],
+    "FCI-RealEstate": ["real estate", "inmobiliario"],
+    "FCI-Commodity": ["commodity"],
+    "FCI-Tech": ["tecnología", "technology", "tech"],
+    "FCI-BonosCER": ["cer", "uva"],
+    "FCI-DurationCorta": ["corto", "short"],
+    "FCI-DurationMedia": ["mediano", "medio"],
+    "FCI-DurationLarga": ["largo"],
+    "FCI-HighYield": ["high yield", "alto retorno"],
+    "FCI-BlueChips": ["blue chip", "bluechips"],
+    "FCI-Growth": ["growth", "crecimiento"],
+    "FCI-Value": ["value", "valor"],
+    "FCI-Latam": ["latam", "latino"],
+    "FCI-Global": ["global"],
+}
+
+
+def _matches_keyword(record: Dict[str, Any], keyword: str) -> bool:
+    haystack = " ".join(
+        str(part or "")
+        for part in (
+            record.get("fundName"),
+            record.get("fundStrategy"),
+            record.get("fundFocus"),
+        )
+    ).lower()
+    return keyword.lower() in haystack
+
+
+def _pick_fci_record(symbol: str, records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    keywords = FCI_KEYWORDS.get(symbol, [])
+    for kw in keywords:
+        for rec in records:
+            if _matches_keyword(rec, kw):
+                return rec
+
+    currency_pref = "USD" if "USD" in symbol.upper() else "ARS"
+    for rec in records:
+        if str(rec.get("fundCurrency", "")).upper() == currency_pref:
+            return rec
+    return records[0] if records else None
+
+
+def _fci_metrics_from_record(record: Dict[str, Any]) -> Dict[str, Optional[float]]:
+    base = {
+        "6m": None,
+        "3m": None,
+        "1m": None,
+        "last_ts": None,
+        "vol_ann": None,
+        "dd6m": None,
+        "hi52": None,
+        "slope50": None,
+        "trend_flag": None,
+        "last_px": None,
+        "prev_px": None,
+        "last_chg": None,
+    }
+
+    try:
+        base["last_px"] = float(record.get("lastPrice"))
+    except (TypeError, ValueError):
+        base["last_px"] = None
+
+    try:
+        base["last_chg"] = float(record.get("dayPercent"))
+    except (TypeError, ValueError):
+        base["last_chg"] = None
+
+    try:
+        base["1m"] = float(record.get("monthPercent"))
+    except (TypeError, ValueError):
+        base["1m"] = None
+
+    try:
+        base["6m"] = float(record.get("yearPercent"))
+    except (TypeError, ValueError):
+        base["6m"] = None
+
+    last_ts_raw = record.get("lastPriceDate")
+    if isinstance(last_ts_raw, str):
+        try:
+            dt = datetime.fromisoformat(last_ts_raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=TZ)
+            base["last_ts"] = int(dt.timestamp())
+        except Exception:
+            pass
+
+    base["currency"] = "USD" if str(record.get("fundCurrency", "")).upper() == "USD" else "ARS"
+    return base
+
+
+async def _fondosonline_records(session: ClientSession) -> List[Dict[str, Any]]:
+    cache_key = "fondosonline:funds:records"
+    cached = SHORT_CACHE.get(cache_key)
+    if isinstance(cached, list):
+        return cached  # type: ignore[return-value]
+
+    payload = await fetch_json(
+        session,
+        FONDOSONLINE_FUNDS_URL,
+        params={"PageSize": 500, "sortColumn": "FundName", "isAscending": True},
+        timeout=ClientTimeout(total=12),
+        source=urlparse(FONDOSONLINE_FUNDS_URL).netloc,
+    )
+    records = payload.get("records") if isinstance(payload, dict) else None
+    if isinstance(records, list):
+        SHORT_CACHE.set(cache_key, records, ttl=300)
+        return records  # type: ignore[return-value]
+    return []
+
+
+async def _fci_metrics(session: ClientSession, symbol: str) -> Dict[str, Optional[float]]:
+    records = await _fondosonline_records(session)
+    if records:
+        picked = _pick_fci_record(symbol, records)
+        if picked:
+            return _fci_metrics_from_record(picked)
+    return _fci_metrics_from_series(symbol)
 
 
 def _build_custom_crypto_map(entries: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
@@ -1995,13 +2128,29 @@ async def get_reservas_con_variacion(
 
 async def _fetch_rava_profile(session: ClientSession, symbol: str) -> Optional[Dict[str, Any]]:
     url = RAVA_PERFIL_URL.format(symbol=quote(symbol))
+    html: Optional[str] = None
     try:
         async with session.get(url, headers=REQ_HEADERS, timeout=ClientTimeout(total=12)) as resp:
-            if resp.status != 200:
+            if resp.status == 200:
+                html = await resp.text()
+    except Exception as exc:
+        log.info("rava_fetch_primary_failed url=%s err=%s", url, exc)
+
+    if html is None:
+        def _blocking_fetch() -> Optional[str]:
+            try:
+                req = urllib.request.Request(url, headers=REQ_HEADERS)
+                with urllib.request.urlopen(req, timeout=12) as resp:  # type: ignore[arg-type]
+                    if getattr(resp, "status", None) not in (None, 200):
+                        return None
+                    return resp.read().decode()
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as exc:  # type: ignore[attr-defined]
+                log.info("rava_fetch_fallback_failed url=%s err=%s", url, exc)
                 return None
-            html = await resp.text()
-    except Exception:
-        return None
+
+        html = await asyncio.to_thread(_blocking_fetch)
+        if html is None:
+            return None
 
     match = re.search(r':res="(\{.*?\})"', html, flags=re.S)
     if not match:
@@ -2011,6 +2160,59 @@ async def _fetch_rava_profile(session: ClientSession, symbol: str) -> Optional[D
     except Exception:
         return None
     return data
+
+
+async def _screenermatic_bonds(session: ClientSession) -> Dict[str, Dict[str, Optional[float]]]:
+    cache_key = "screenermatic:bonds"
+    cached = SHORT_CACHE.get(cache_key)
+    if isinstance(cached, dict):
+        return cached  # type: ignore[return-value]
+
+    html: Optional[str] = None
+    try:
+        async with session.get(SCREENERMATIC_BONDS_URL, headers=REQ_HEADERS, timeout=ClientTimeout(total=12)) as resp:
+            if resp.status == 200:
+                html = await resp.text()
+    except Exception as exc:
+        log.info("screenermatic_fetch_failed url=%s err=%s", SCREENERMATIC_BONDS_URL, exc)
+        return {}
+
+    if not html:
+        return {}
+
+    entries: Dict[str, Dict[str, Optional[float]]] = {}
+    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.S)
+    for row in rows:
+        if "<td" not in row and "<th" not in row:
+            continue
+        cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", row, flags=re.S)
+        if len(cells) < 12:
+            continue
+        clean = [re.sub("<[^<]+?>", "", c).strip() for c in cells]
+        symbol = clean[0]
+        if symbol not in BONOS_AR:
+            continue
+        last_px = None
+        last_chg = None
+        last_ts: Optional[int] = None
+        try:
+            last_px = float(clean[11].replace(".", "").replace(",", ".")) if clean[11] else None
+        except Exception:
+            last_px = None
+        try:
+            last_chg = float(clean[12].replace("%", "")) if len(clean) > 12 and clean[12] else None
+        except Exception:
+            last_chg = None
+        try:
+            if clean[9]:
+                dt = datetime.strptime(clean[9], "%Y-%m-%d").replace(tzinfo=TZ)
+                last_ts = int(dt.timestamp())
+        except Exception:
+            last_ts = None
+        entries[symbol] = {"last_px": last_px, "last_chg": last_chg, "last_ts": last_ts}
+
+    SHORT_CACHE.set(cache_key, entries, ttl=120)
+    return entries
 
 def _rava_history_points(entries: List[Dict[str, Any]]) -> List[Tuple[int, float]]:
     points: List[Tuple[int, float]] = []
@@ -2162,8 +2364,11 @@ async def _rava_metrics(session: ClientSession, symbol: str) -> Dict[str, Option
     base = {"6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None,
             "dd6m": None, "hi52": None, "slope50": None, "trend_flag": None,
             "last_px": None, "prev_px": None, "last_chg": None}
+    screenermatic = await _screenermatic_bonds(session)
     data = await _fetch_rava_profile(session, symbol)
     if not data:
+        if symbol in screenermatic:
+            base.update(screenermatic[symbol])
         return base
 
     quotes = data.get("cotizaciones") or []
@@ -2198,6 +2403,15 @@ async def _rava_metrics(session: ClientSession, symbol: str) -> Dict[str, Option
                 base["last_ts"] = int(dt.timestamp())
             except Exception:
                 pass
+
+    if symbol in screenermatic:
+        fallback = screenermatic[symbol]
+        if base["last_px"] is None and fallback.get("last_px") is not None:
+            base["last_px"] = fallback.get("last_px")
+        if base["last_chg"] is None and fallback.get("last_chg") is not None:
+            base["last_chg"] = fallback.get("last_chg")
+        if base["last_ts"] is None and fallback.get("last_ts") is not None:
+            base["last_ts"] = fallback.get("last_ts")
 
     base["currency"] = bono_moneda(symbol)
     return base
@@ -2303,7 +2517,7 @@ async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
     async def work(sym: str):
         async with sem:
             if sym.startswith("FCI-"):
-                out[sym] = _fci_metrics(sym)
+                out[sym] = await _fci_metrics(session, sym)
             elif sym in BONOS_AR:
                 out[sym] = await _rava_metrics(session, sym)
             else:
