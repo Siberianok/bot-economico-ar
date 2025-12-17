@@ -4299,6 +4299,8 @@ async def econ_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 AL_KIND, AL_FX_TYPE, AL_FX_SIDE, AL_OP, AL_MODE, AL_VALUE, AL_METRIC_TYPE, AL_TICKER, AL_CRYPTO = range(9)
 ALERTS_SILENT_UNTIL: Dict[int, float] = {}
 ALERTS_PAUSED: Set[int] = set()
+ALERT_PRICE_TOLERANCE_PCT = 0.002  # 0.2% de margen alrededor del umbral
+ALERT_PRICE_TOLERANCE_ABS = 0.0005  # margen mínimo absoluto para precios muy bajos
 
 
 def _float_equals(a: Any, b: Any, abs_tol: float = 1e-6) -> bool:
@@ -4306,6 +4308,23 @@ def _float_equals(a: Any, b: Any, abs_tol: float = 1e-6) -> bool:
         return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=abs_tol)
     except Exception:
         return False
+
+
+def _matches_with_tolerance(cur: Any, target: Any, op: str) -> bool:
+    """Evalúa si se cumplió la condición de alerta con un margen flexible."""
+
+    try:
+        cur_f = float(cur)
+        target_f = float(target)
+    except Exception:
+        return False
+
+    margin = max(abs(target_f) * ALERT_PRICE_TOLERANCE_PCT, ALERT_PRICE_TOLERANCE_ABS)
+    if op == ">":
+        return cur_f >= target_f - margin
+    if op == "<":
+        return cur_f <= target_f + margin
+    return False
 
 
 def _alerts_match(existing: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
@@ -6055,23 +6074,23 @@ async def alerts_loop(app: Application):
                                     row = fx.get(r["type"], {}) or {}
                                     cur = _fx_display_value(row, r["side"])
                                     if cur is None: continue
-                                    ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
+                                    ok = _matches_with_tolerance(cur, r["value"], r["op"])
                                     if ok: trig.append(("fx", r["type"], r["side"], r["op"], r["value"], cur))
                                 elif r.get("kind") == "metric":
                                     cur = vals.get(r["type"])
                                     if cur is None: continue
-                                    ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
+                                    ok = _matches_with_tolerance(cur, r["value"], r["op"])
                                     if ok: trig.append(("metric", r["type"], r["op"], r["value"], cur))
                                 elif r.get("kind") == "ticker":
                                     sym = r["symbol"]; m = metmap.get(sym, {}); cur = m.get("last_px")
                                     if cur is None: continue
-                                    ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
+                                    ok = _matches_with_tolerance(cur, r["value"], r["op"])
                                     if ok: trig.append(("ticker_px", sym, r["op"], r["value"], cur))
                                 elif r.get("kind") == "crypto":
                                     sym = (r.get("symbol") or "").upper()
                                     cur = crypto_prices.get(sym)
                                     if cur is None: continue
-                                    ok = (cur > r["value"]) if r["op"] == ">" else (cur < r["value"])
+                                    ok = _matches_with_tolerance(cur, r["value"], r["op"])
                                     if ok:
                                         trig.append(("crypto_px", sym, r.get("op"), r.get("value"), cur, r.get("base"), r.get("quote")))
                             if trig:
