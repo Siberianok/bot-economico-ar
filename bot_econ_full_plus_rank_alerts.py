@@ -1,7 +1,7 @@
 # bot_econ_full_plus_rank_alerts.py
 # -*- coding: utf-8 -*-
 
-import os, asyncio, logging, re, html as _html, json, math, io, signal, csv, unicodedata
+import os, asyncio, logging, re, html as _html, json, math, io, signal, csv, unicodedata, textwrap
 import copy
 import urllib.request
 import urllib.error
@@ -8566,8 +8566,9 @@ def _projection_bar_image(
     values = [val for _, val, _ in cleaned]
     value_labels = [val_label for _, _, val_label in cleaned]
     max_val = max(values)
+    label_wrap = 26
 
-    fig, ax = plt.subplots(figsize=(6, 4), dpi=160)
+    fig, ax = plt.subplots(figsize=(6.6, 4.6), dpi=160)
     palette = ["#3478bc", "#34a853", "#fbbc04", "#a142f4", "#f26f5e"]
     bars = ax.bar(range(len(values)), values, color=palette[: len(values)])
 
@@ -8576,15 +8577,16 @@ def _projection_bar_image(
     top_margin = max_display * 0.08
     for bar, val, value_label in zip(bars, values, value_labels):
         label = formatter(val, value_label)
+        wrapped_label = textwrap.fill(label, width=label_wrap)
         text_x = bar.get_x() + bar.get_width() / 2
         height = bar.get_height()
-        rotation = 90 if len(label) > 12 else 0
+        rotation = 90 if len(label) > 20 else 0
 
         if height <= 0:
             ax.text(
                 text_x,
                 height + top_margin,
-                label,
+                wrapped_label,
                 ha="center",
                 va="bottom",
                 fontsize=8,
@@ -8605,7 +8607,7 @@ def _projection_bar_image(
         ax.text(
             text_x,
             text_y,
-            label,
+            wrapped_label,
             ha="center",
             va=va,
             fontsize=8,
@@ -8614,7 +8616,7 @@ def _projection_bar_image(
         )
 
     ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels)
+    ax.set_xticklabels(labels, rotation=0)
     ax.set_ylabel("Monto estimado")
     ax.set_title(title + (f"\n{subtitle}" if subtitle else ""))
     ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
@@ -8674,8 +8676,9 @@ def _projection_by_instrument_image(
         max_abs = 1.0
 
     x = np.arange(len(labels))
-    width = 0.28
-    gap = 0.09
+    width = 0.26
+    gap = 0.12
+    label_wrap = 12
 
     def _color(val: float, missing: bool, is_longer: bool) -> str:
         if missing:
@@ -8686,7 +8689,7 @@ def _projection_by_instrument_image(
             return "#f28b82" if not is_longer else "#c5221f"
         return "#c3c7cf" if not is_longer else "#a1a6ad"
 
-    fig, ax = plt.subplots(figsize=(7.2, 4.2), dpi=160)
+    fig, ax = plt.subplots(figsize=(7.8, 4.8), dpi=160)
     bars_3m = ax.bar(
         x - (width / 2 + gap / 2),
         values_3m,
@@ -8706,36 +8709,44 @@ def _projection_by_instrument_image(
         label="6M",
     )
 
-    outer_offset = max_abs * 0.08
-    inner_offset = max_abs * 0.06
+    outer_offset = max_abs * 0.09
+    inner_offset = max_abs * 0.07
+    label_offsets_3m = [outer_offset * 0.35 if idx % 2 == 0 else -outer_offset * 0.35 for idx in range(len(labels))]
+    label_offsets_6m = [-outer_offset * 0.35 if idx % 2 == 0 else outer_offset * 0.35 for idx in range(len(labels))]
 
-    def _annotate_bar(bar, val: float, missing: bool, text_override: str) -> None:
+    def _annotate_bar(
+        bar,
+        val: float,
+        missing: bool,
+        text_override: str,
+        offset_jitter: float,
+    ) -> None:
         height = bar.get_height()
         text = "N/D" if missing else text_override
         if missing:
-            y = height + outer_offset
+            y = height + outer_offset + offset_jitter
             va = "bottom"
             color = "#1a1a1a"
         elif val > 0:
             if height > max_abs * 0.18:
-                y = height - inner_offset
+                y = height - inner_offset + offset_jitter
                 va = "top"
                 color = "#ffffff"
             else:
-                y = height + outer_offset
+                y = height + outer_offset + offset_jitter
                 va = "bottom"
                 color = "#1a1a1a"
         elif val < 0:
             if abs(height) > max_abs * 0.18:
-                y = height + inner_offset
+                y = height + inner_offset + offset_jitter
                 va = "bottom"
                 color = "#ffffff"
             else:
-                y = height - outer_offset
+                y = height - outer_offset + offset_jitter
                 va = "top"
                 color = "#1a1a1a"
         else:
-            y = height + outer_offset
+            y = height + outer_offset + offset_jitter
             va = "bottom"
             color = "#1a1a1a"
 
@@ -8749,13 +8760,13 @@ def _projection_by_instrument_image(
             color=color,
         )
 
-    for bar, val, miss, text in zip(bars_3m, values_3m, missing_3m, labels_3m):
-        _annotate_bar(bar, val, miss, text)
-    for bar, val, miss, text in zip(bars_6m, values_6m, missing_6m, labels_6m):
-        _annotate_bar(bar, val, miss, text)
+    for idx, (bar, val, miss, text) in enumerate(zip(bars_3m, values_3m, missing_3m, labels_3m)):
+        _annotate_bar(bar, val, miss, text, label_offsets_3m[idx])
+    for idx, (bar, val, miss, text) in enumerate(zip(bars_6m, values_6m, missing_6m, labels_6m)):
+        _annotate_bar(bar, val, miss, text, label_offsets_6m[idx])
 
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, rotation=15, ha="right")
+    ax.set_xticklabels([textwrap.fill(lbl, width=label_wrap) for lbl in labels], rotation=0, ha="center")
     ax.axhline(0, color="#4a4a4a", linewidth=0.8)
     ax.set_ylabel("Variación %")
     ax.set_title(title + (f"\n{subtitle}" if subtitle else ""))
