@@ -7,7 +7,6 @@ import urllib.request
 import urllib.error
 from time import time
 from math import sqrt, floor
-from bisect import bisect_left
 from datetime import datetime, timedelta, time as dtime, date
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable, Iterable
@@ -2755,22 +2754,22 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         prev = closes[idx_last-1] if idx_last >= 1 else None
         last_chg = ((last/prev - 1.0)*100.0) if (prev is not None and prev > 0) else None
 
+        # Retornos close-to-close por ruedas desde el último cierre.
         window_1m = 21
         window_3m = 63
         window_6m = 126
 
-        def _window_base(window: int) -> Optional[float]:
-            if len(closes) >= window:
-                return closes[-window]
-            return closes[0] if closes else None
+        def _window_base(values: List[float], window: int) -> Optional[float]:
+            if len(values) >= window:
+                return values[-window]
+            return None
 
-        # Retornos close-to-close usando cierres válidos (ruedas).
-        base1 = _window_base(window_1m)
-        base3 = _window_base(window_3m)
-        base6 = _window_base(window_6m)
-        ret1 = (last/base1 - 1.0)*100.0 if base1 else None
-        ret3 = (last/base3 - 1.0)*100.0 if base3 else None
-        ret6 = (last/base6 - 1.0)*100.0 if base6 else None
+        base1 = _window_base(closes, window_1m)
+        base3 = _window_base(closes, window_3m)
+        base6 = _window_base(closes, window_6m)
+        ret1 = (last / base1 - 1.0) * 100.0 if base1 else None
+        ret3 = (last / base3 - 1.0) * 100.0 if base3 else None
+        ret6 = (last / base6 - 1.0) * 100.0 if base6 else None
 
         rets_d = []
         for i in range(1, len(closes)):
@@ -2783,8 +2782,8 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
             var = sum((r-mu)**2 for r in rets_d[-look:])/(len(rets_d[-look:])-1) if len(rets_d[-look:])>1 else 0.0
             sd = sqrt(var); vol_ann = sd*sqrt(252)*100.0
 
-        t6 = t_last - 180*24*3600
-        idx_cut = next((i for i,t in enumerate(ts) if t >= t6), 0)
+        t6 = t_last - 180 * 24 * 3600
+        idx_cut = next((i for i, t in enumerate(ts) if t >= t6), 0)
         peak = closes[idx_cut]; dd_min = 0.0
         for v in closes[idx_cut:]:
             if v > peak: peak = v
