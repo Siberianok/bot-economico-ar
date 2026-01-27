@@ -4094,6 +4094,9 @@ def format_top3_table(title: str, fecha: Optional[str], rows_syms: List[str], re
     return "\n".join([lines[0], lines[1]] + out)
 
 ProjectionRange = Tuple[Optional[float], Optional[float], Optional[float]]
+PROJ_RANGE_SHRINK = 0.6
+PROJ_RANGE_LIMITS = {63: (-50.0, 80.0), 126: (-70.0, 120.0)}
+PROJ_RANGE_PCTL = 0.674
 
 def _format_projection_range(proj: ProjectionRange, nd: int = 1) -> str:
     center, low, high = proj
@@ -4112,33 +4115,107 @@ def _projection_bounds(proj: ProjectionRange) -> Tuple[Optional[float], Optional
         return center, center, center
     return center, low, high
 
+def _projection_percentile(values: List[float], percentile: float) -> Optional[float]:
+    if not values:
+        return None
+    values = sorted(values)
+    if len(values) == 1:
+        return values[0]
+    k = (len(values) - 1) * percentile / 100.0
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return values[int(k)]
+    return values[f] * (c - k) + values[c] * (k - f)
+
+
+def _projection_recent_samples(m: Dict[str, Optional[float]], horizon_days: int) -> List[float]:
+    horizon_months = max(1, round(horizon_days / 21))
+    samples: List[float] = []
+    for months, key in ((1, "1m"), (3, "3m"), (6, "6m")):
+        val = m.get(key)
+        if val is None:
+            continue
+        try:
+            base = 1.0 + float(val) / 100.0
+            if base <= 0:
+                continue
+            scaled = (base ** (horizon_months / months) - 1.0) * 100.0
+            samples.append(scaled)
+        except Exception:
+            continue
+    return samples
+
+
+def _projection_clip(value: float, floor: float, cap: float) -> float:
+    return max(floor, min(cap, value))
+
+
+def _projection_range_from_center(
+    center: Optional[float],
+    m: Dict[str, Optional[float]],
+    horizon_days: int,
+) -> ProjectionRange:
+    if center is None:
+        return None, None, None
+    try:
+        center_f = float(center)
+    except Exception:
+        return None, None, None
+
+    low_model = high_model = None
+    vol_ann = m.get("vol_ann")
+    if vol_ann is not None:
+        try:
+            sigma_h = (float(vol_ann) / 100.0) * math.sqrt(horizon_days / 252.0)
+            if center_f > -99.0:
+                center_log = math.log1p(center_f / 100.0)
+                low_model = (math.exp(center_log - PROJ_RANGE_PCTL * sigma_h) - 1.0) * 100.0
+                high_model = (math.exp(center_log + PROJ_RANGE_PCTL * sigma_h) - 1.0) * 100.0
+        except Exception:
+            low_model = high_model = None
+
+    samples = _projection_recent_samples(m, horizon_days)
+    low_hist = _projection_percentile(samples, 25.0) if samples else None
+    high_hist = _projection_percentile(samples, 75.0) if samples else None
+
+    if low_model is not None and low_hist is not None and high_model is not None and high_hist is not None:
+        low_raw = (low_model + low_hist) / 2.0
+        high_raw = (high_model + high_hist) / 2.0
+    elif low_model is not None and high_model is not None:
+        low_raw = low_model
+        high_raw = high_model
+    elif low_hist is not None and high_hist is not None:
+        low_raw = low_hist
+        high_raw = high_hist
+    else:
+        return center_f, None, None
+
+    floor, cap = PROJ_RANGE_LIMITS.get(horizon_days, (-80.0, 150.0))
+    center_clipped = _projection_clip(center_f, floor, cap)
+    low = center_clipped + (low_raw - center_clipped) * PROJ_RANGE_SHRINK
+    high = center_clipped + (high_raw - center_clipped) * PROJ_RANGE_SHRINK
+    low = _projection_clip(low, floor, cap)
+    high = _projection_clip(high, floor, cap)
+    if low > high:
+        low, high = high, low
+    return center_clipped, low, high
+
+
 def _projection_range(
     m: Dict[str, Optional[float]],
     horizon: int,
-    k: float = 1.0,
     mu_override: Optional[float] = None,
 ) -> ProjectionRange:
     mu = _expected_daily_return(m) if mu_override is None else mu_override
     mu_h = mu * horizon
     center = (math.exp(mu_h) - 1.0) * 100.0
-
-    vol_ann = m.get("vol_ann")
-    if vol_ann is None:
-        return center, None, None
-
-    try:
-        sigma_h = (float(vol_ann) / 100.0) * math.sqrt(horizon / 252.0)
-    except Exception:
-        return center, None, None
-
-    low = (math.exp(mu_h - k * sigma_h) - 1.0) * 100.0
-    high = (math.exp(mu_h + k * sigma_h) - 1.0) * 100.0
-    return center, low, high
+    return _projection_range_from_center(center, m, horizon)
 
 def format_proj_dual(title: str, fecha: Optional[str], rows: List[Tuple[str, ProjectionRange, ProjectionRange]]) -> str:
     head = f"<b>{title}</b>" + (f" <i>Últ. Dato: {fecha}</i>" if fecha else "")
-    sub = "<i>Proy. 3M (corto) y Proy. 6M (medio)</i>"
-    lines = [head, sub, "<pre>Rank Empresa (Ticker)           Proy. 3M (rango)        Proy. 6M (rango)</pre>"]
+    sub = "<i>Proy. 3M (corto) y Proy. 6M (medio) — rango estimado P25–P75</i>"
+    lines = [head, sub, "<pre>Rank Empresa (Ticker)     Proy. 3M (rango est.)    Proy. 6M (rango est.)</pre>"]
     out = []
     if not rows: out.append("<pre>—</pre>")
     else:
@@ -4234,17 +4311,19 @@ def projection_6m_raw(m: Dict[str, Optional[float]]) -> float:
             mu -= penalty
         except Exception:
             pass
-    return _projection_range(m, 126, mu_override=mu)
+    return (math.exp(mu * 126) - 1.0) * 100.0
 
 
-def projection_3m(m: Dict[str, Optional[float]]) -> float:
+def projection_3m(m: Dict[str, Optional[float]]) -> ProjectionRange:
     raw = projection_3m_raw(m)
-    return calibrate_projection(raw, "3m")
+    center = calibrate_projection(raw, "3m")
+    return _projection_range_from_center(center, m, 63)
 
 
-def projection_6m(m: Dict[str, Optional[float]]) -> float:
+def projection_6m(m: Dict[str, Optional[float]]) -> ProjectionRange:
     raw = projection_6m_raw(m)
-    return calibrate_projection(raw, "6m")
+    center = calibrate_projection(raw, "6m")
+    return _projection_range_from_center(center, m, 126)
 
 
 def _format_projection_date(ts: float) -> str:
@@ -4273,7 +4352,7 @@ def _build_projection_batch_id(horizon: int, created_at: float) -> str:
 
 
 def _record_projection_batch_from_rank(
-    rows: List[Tuple[str, float, float]],
+    rows: List[Tuple[str, ProjectionRange, ProjectionRange]],
     metrics_by_symbol: Dict[str, Dict[str, Optional[float]]],
 ) -> bool:
     if not rows:
@@ -4284,12 +4363,16 @@ def _record_projection_batch_from_rank(
     projections_3m: Dict[str, float] = {}
     projections_6m: Dict[str, float] = {}
     for sym, p3, p6 in rows:
+        c3, _, _ = _projection_bounds(p3)
+        c6, _, _ = _projection_bounds(p6)
+        if c3 is None or c6 is None:
+            continue
         base_px = metric_last_price(metrics_by_symbol.get(sym, {}))
         if base_px is None:
             continue
         base_prices[sym] = base_px
-        projections_3m[sym] = float(p3)
-        projections_6m[sym] = float(p6)
+        projections_3m[sym] = float(c3)
+        projections_6m[sym] = float(c6)
     if not base_prices:
         return False
     for horizon, projections in ((63, projections_3m), (126, projections_6m)):
@@ -4579,7 +4662,7 @@ async def _rank_proj5(
     async with ClientSession() as session:
         mets, last_ts = await metrics_for_symbols_cached(session, symbols)
         fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-        rows = []
+        rows: List[Tuple[str, ProjectionRange, ProjectionRange, Optional[float]]] = []
         history_added = False
         for sym, m in mets.items():
             if m.get("6m") is None:
@@ -4589,9 +4672,12 @@ async def _rank_proj5(
             register_projection_history(sym, "3m", raw3, m)
             register_projection_history(sym, "6m", raw6, m)
             history_added = True
-            rows.append((sym, calibrate_projection(raw3, "3m"), calibrate_projection(raw6, "6m")))
-        rows.sort(key=lambda x: x[2], reverse=True)
-        top_rows = rows[: RANK_PROJ_LIMIT]
+            p3 = projection_3m(m)
+            p6 = projection_6m(m)
+            c6, _, _ = _projection_bounds(p6)
+            rows.append((sym, p3, p6, c6))
+        rows.sort(key=lambda x: x[3] if x[3] is not None else float("-inf"), reverse=True)
+        top_rows = [(sym, p3, p6) for sym, p3, p6, _ in rows[: RANK_PROJ_LIMIT]]
         msg = format_proj_dual(title, fecha, top_rows)
         if history_added:
             asyncio.create_task(save_state())
@@ -8833,7 +8919,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     w6_low = 0.0
     w6_high = 0.0
     detail: List[str] = []
-    per_instrument_points: List[Tuple[str, Optional[float], Optional[float]]] = []
+    per_instrument_points: List[Tuple[str, ProjectionRange, ProjectionRange]] = []
     history_added = False
     for entry in snapshot:
         metrics = entry.get("metrics") or {}
@@ -8848,10 +8934,16 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
             register_projection_history(symbol, "3m", raw3, metrics)
             register_projection_history(symbol, "6m", raw6, metrics)
             history_added = True
-        p3 = calibrate_projection(raw3, "3m")
-        p6 = calibrate_projection(raw6, "6m")
-        w3 += weight * p3
-        w6 += weight * p6
+        p3 = projection_3m(metrics)
+        p6 = projection_6m(metrics)
+        c3, l3, h3 = _projection_bounds(p3)
+        c6, l6, h6 = _projection_bounds(p6)
+        w3 += weight * (c3 or 0.0)
+        w6 += weight * (c6 or 0.0)
+        w3_low += weight * (l3 or c3 or 0.0)
+        w3_high += weight * (h3 or c3 or 0.0)
+        w6_low += weight * (l6 or c6 or 0.0)
+        w6_high += weight * (h6 or c6 or 0.0)
 
         short_label = _label_short(entry["symbol"]) if entry.get("symbol") else entry["label"]
         per_instrument_points.append((short_label, p3, p6))
@@ -8892,12 +8984,12 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         header += f" <i>Datos al {fecha}</i>"
     lines = [header, f"🧮 Valor actual estimado: {f_money(total_actual)}"]
     lines.append(
-        "✨ Proyección 3M: "
+        "✨ Proyección 3M (rango estimado): "
         + f"{pct(w3,2)} ({pct(w3_low,2)} a {pct(w3_high,2)}) → "
         + f"{f_money(forecast3)} ({f_money(forecast3_low)} a {f_money(forecast3_high)})"
     )
     lines.append(
-        "🌟 Proyección 6M: "
+        "🌟 Proyección 6M (rango estimado): "
         + f"{pct(w6,2)} ({pct(w6_low,2)} a {pct(w6_high,2)}) → "
         + f"{f_money(forecast6)} ({f_money(forecast6_low)} a {f_money(forecast6_high)})"
     )
