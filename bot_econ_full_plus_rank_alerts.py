@@ -3753,18 +3753,60 @@ def format_top3_table(title: str, fecha: Optional[str], rows_syms: List[str], re
     if not out: out.append("<pre>—</pre>")
     return "\n".join([lines[0], lines[1]] + out)
 
-def format_proj_dual(title: str, fecha: Optional[str], rows: List[Tuple[str, float, float]]) -> str:
+ProjectionRange = Tuple[Optional[float], Optional[float], Optional[float]]
+
+def _format_projection_range(proj: ProjectionRange, nd: int = 1) -> str:
+    center, low, high = proj
+    if center is None:
+        return "—"
+    center_txt = pct(center, nd)
+    if low is None or high is None:
+        return center_txt
+    return f"{center_txt} ({pct(low, nd)} a {pct(high, nd)})"
+
+def _projection_bounds(proj: ProjectionRange) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    center, low, high = proj
+    if center is None:
+        return None, None, None
+    if low is None or high is None:
+        return center, center, center
+    return center, low, high
+
+def _projection_range(
+    m: Dict[str, Optional[float]],
+    horizon: int,
+    k: float = 1.0,
+    mu_override: Optional[float] = None,
+) -> ProjectionRange:
+    mu = _expected_daily_return(m) if mu_override is None else mu_override
+    mu_h = mu * horizon
+    center = (math.exp(mu_h) - 1.0) * 100.0
+
+    vol_ann = m.get("vol_ann")
+    if vol_ann is None:
+        return center, None, None
+
+    try:
+        sigma_h = (float(vol_ann) / 100.0) * math.sqrt(horizon / 252.0)
+    except Exception:
+        return center, None, None
+
+    low = (math.exp(mu_h - k * sigma_h) - 1.0) * 100.0
+    high = (math.exp(mu_h + k * sigma_h) - 1.0) * 100.0
+    return center, low, high
+
+def format_proj_dual(title: str, fecha: Optional[str], rows: List[Tuple[str, ProjectionRange, ProjectionRange]]) -> str:
     head = f"<b>{title}</b>" + (f" <i>Últ. Dato: {fecha}</i>" if fecha else "")
     sub = "<i>Proy. 3M (corto) y Proy. 6M (medio)</i>"
-    lines = [head, sub, "<pre>Rank Empresa (Ticker)             Proy. 3M     Proy. 6M</pre>"]
+    lines = [head, sub, "<pre>Rank Empresa (Ticker)           Proy. 3M (rango)        Proy. 6M (rango)</pre>"]
     out = []
     if not rows: out.append("<pre>—</pre>")
     else:
         for idx, (sym, p3v, p6v) in enumerate(rows[:5], start=1):
-            p3 = pct(p3v, 1) if p3v is not None else "—"
-            p6 = pct(p6v, 1) if p6v is not None else "—"
+            p3 = _format_projection_range(p3v, 1)
+            p6 = _format_projection_range(p6v, 1)
             label = pad(_label_short(sym), 28)
-            c3 = center_text(p3, 12); c6 = center_text(p6, 12)
+            c3 = center_text(p3, 26); c6 = center_text(p6, 26)
             l = f"{idx:<4} {label}{c3}{c6}"
             out.append(f"<pre>{l}</pre>")
     return "\n".join(lines + out)
@@ -3828,11 +3870,10 @@ def _expected_daily_return(m: Dict[str, Optional[float]]) -> float:
 
     return mu
 
-def projection_3m(m: Dict[str, Optional[float]]) -> float:
-    mu = _expected_daily_return(m)
-    return (math.exp(mu * 63) - 1.0) * 100.0
+def projection_3m(m: Dict[str, Optional[float]]) -> ProjectionRange:
+    return _projection_range(m, 63)
 
-def projection_6m(m: Dict[str, Optional[float]]) -> float:
+def projection_6m(m: Dict[str, Optional[float]]) -> ProjectionRange:
     mu = _expected_daily_return(m)
     vol_ann = m.get("vol_ann")
     if vol_ann is not None:
@@ -3841,7 +3882,7 @@ def projection_6m(m: Dict[str, Optional[float]]) -> float:
             mu -= penalty
         except Exception:
             pass
-    return (math.exp(mu * 126) - 1.0) * 100.0
+    return _projection_range(m, 126, mu_override=mu)
 
 RET_SERIES_ORDER: List[Tuple[str, str]] = [
     ("6m", "Rend. 6M"),
@@ -3915,12 +3956,17 @@ async def _rank_proj5(
     async with ClientSession() as session:
         mets, last_ts = await metrics_for_symbols_cached(session, symbols)
         fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-        rows = []
+        rows: List[Tuple[str, ProjectionRange, ProjectionRange]] = []
         for sym, m in mets.items():
             if m.get("6m") is None:
                 continue
-            rows.append((sym, projection_3m(m), projection_6m(m)))
-        rows.sort(key=lambda x: x[2], reverse=True)
+            p3 = projection_3m(m)
+            p6 = projection_6m(m)
+            center_6m, _, _ = _projection_bounds(p6)
+            if center_6m is None:
+                continue
+            rows.append((sym, p3, p6))
+        rows.sort(key=lambda x: (_projection_bounds(x[2])[0] or -1e9), reverse=True)
         top_rows = rows[: RANK_PROJ_LIMIT]
         msg = format_proj_dual(title, fecha, top_rows)
         await update.effective_message.reply_text(
@@ -3931,14 +3977,22 @@ async def _rank_proj5(
 
         if HAS_MPL and top_rows:
             chart_rows = []
+            label_rows: List[List[Optional[str]]] = []
             for sym, p3, p6 in top_rows:
-                chart_rows.append((_label_short(sym), [p3, p6]))
+                c3, _, _ = _projection_bounds(p3)
+                c6, _, _ = _projection_bounds(p6)
+                chart_rows.append((_label_short(sym), [c3, c6]))
+                label_rows.append([
+                    _format_projection_range(p3, 1),
+                    _format_projection_range(p6, 1),
+                ])
             subtitle = f"Datos al {fecha}" if fecha else None
             img = _bar_image_from_rank(
                 chart_rows,
                 title=f"{title} — Proyecciones",
                 subtitle=subtitle,
                 series_labels=["Proy. 3M", "Proy. 6M"],
+                value_labels=label_rows,
             )
             if img:
                 await update.effective_message.reply_photo(photo=img)
@@ -7339,6 +7393,7 @@ def _bar_image_from_rank(
     title: str,
     subtitle: Optional[str] = None,
     series_labels: Optional[List[str]] = None,
+    value_labels: Optional[List[List[Optional[str]]]] = None,
 ) -> Optional[bytes]:
     if not HAS_MPL:
         return None
@@ -7365,9 +7420,19 @@ def _bar_image_from_rank(
     x_positions = list(range(len(clean_rows)))
     width = 0.75 / max(1, n_series)
 
+    if value_labels and len(value_labels) != len(clean_rows):
+        value_labels = None
+
     for idx in range(n_series):
         heights = [vals[idx] if vals[idx] is not None else 0.0 for _, vals in clean_rows]
         present_flags = [vals[idx] is not None for _, vals in clean_rows]
+        label_texts = []
+        if value_labels:
+            for row_idx in range(len(clean_rows)):
+                row_labels = value_labels[row_idx]
+                label_texts.append(row_labels[idx] if row_labels and idx < len(row_labels) else None)
+        else:
+            label_texts = [None] * len(clean_rows)
         offsets = [x + (idx - (n_series - 1) / 2) * width for x in x_positions]
         bars = ax.bar(
             offsets,
@@ -7377,7 +7442,7 @@ def _bar_image_from_rank(
             label=series_labels[idx] if series_labels and idx < len(series_labels) else None,
         )
 
-        for bar, val, present in zip(bars, heights, present_flags):
+        for bar, val, present, label_text in zip(bars, heights, present_flags, label_texts):
             if not present:
                 ax.text(
                     bar.get_x() + bar.get_width() / 2,
@@ -7393,10 +7458,11 @@ def _bar_image_from_rank(
             y = bar.get_height()
             va = "bottom" if y >= 0 else "top"
             offset = 0.6 if y >= 0 else -0.6
+            text_value = label_text or f"{val:.1f}%"
             ax.text(
                 bar.get_x() + bar.get_width() / 2,
                 y + offset,
-                f"{val:.1f}%",
+                text_value,
                 ha="center",
                 va=va,
                 fontsize=8,
@@ -7597,28 +7663,29 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
 
 
 def _projection_bar_image(
-    points: List[Tuple[str, Optional[float]]],
-    formatter: Callable[[Optional[float]], str],
+    points: List[Tuple[str, Optional[float], Optional[str]]],
+    formatter: Callable[[Optional[float], Optional[str]], str],
     title: str,
     subtitle: Optional[str] = None,
 ) -> Optional[bytes]:
     if not HAS_MPL:
         return None
 
-    cleaned: List[Tuple[str, float]] = []
-    for label, value in points:
+    cleaned: List[Tuple[str, float, Optional[str]]] = []
+    for label, value, value_label in points:
         if value is None:
             continue
         try:
-            cleaned.append((label, float(value)))
+            cleaned.append((label, float(value), value_label))
         except (TypeError, ValueError):
             continue
 
     if len(cleaned) < 2:
         return None
 
-    labels = [label for label, _ in cleaned]
-    values = [val for _, val in cleaned]
+    labels = [label for label, _, _ in cleaned]
+    values = [val for _, val, _ in cleaned]
+    value_labels = [val_label for _, _, val_label in cleaned]
     max_val = max(values)
 
     fig, ax = plt.subplots(figsize=(6, 4), dpi=160)
@@ -7628,8 +7695,8 @@ def _projection_bar_image(
     max_display = max_val if max_val else 1.0
     inner_margin = max_display * 0.04
     top_margin = max_display * 0.08
-    for bar, val in zip(bars, values):
-        label = formatter(val)
+    for bar, val, value_label in zip(bars, values, value_labels):
+        label = formatter(val, value_label)
         text_x = bar.get_x() + bar.get_width() / 2
         height = bar.get_height()
         rotation = 90 if len(label) > 12 else 0
@@ -7686,7 +7753,7 @@ def _projection_bar_image(
 
 
 def _projection_by_instrument_image(
-    points: List[Tuple[str, Optional[float], Optional[float]]],
+    points: List[Tuple[str, ProjectionRange, ProjectionRange]],
     title: str,
     subtitle: Optional[str] = None,
     formatter: Callable[[float], str] = lambda v: f"{v:+.1f}%",
@@ -7694,9 +7761,9 @@ def _projection_by_instrument_image(
     if not HAS_MPL or np is None:
         return None
 
-    cleaned: List[Tuple[str, Optional[float], Optional[float]]] = []
+    cleaned: List[Tuple[str, ProjectionRange, ProjectionRange]] = []
     for label, val_3m, val_6m in points:
-        if val_3m is None and val_6m is None:
+        if val_3m[0] is None and val_6m[0] is None:
             continue
         cleaned.append((label, val_3m, val_6m))
 
@@ -7708,12 +7775,18 @@ def _projection_by_instrument_image(
     values_6m: List[float] = []
     missing_3m: List[bool] = []
     missing_6m: List[bool] = []
+    labels_3m: List[str] = []
+    labels_6m: List[str] = []
     for label, val_3m, val_6m in cleaned:
+        center_3m, _, _ = _projection_bounds(val_3m)
+        center_6m, _, _ = _projection_bounds(val_6m)
         labels.append(label)
-        missing_3m.append(val_3m is None)
-        missing_6m.append(val_6m is None)
-        values_3m.append(val_3m if val_3m is not None else 0.0)
-        values_6m.append(val_6m if val_6m is not None else 0.0)
+        missing_3m.append(center_3m is None)
+        missing_6m.append(center_6m is None)
+        values_3m.append(center_3m if center_3m is not None else 0.0)
+        values_6m.append(center_6m if center_6m is not None else 0.0)
+        labels_3m.append(_format_projection_range(val_3m, 1))
+        labels_6m.append(_format_projection_range(val_6m, 1))
 
     all_values = [abs(v) for v, miss in zip(values_3m, missing_3m) if not miss]
     all_values += [abs(v) for v, miss in zip(values_6m, missing_6m) if not miss]
@@ -7757,9 +7830,9 @@ def _projection_by_instrument_image(
     outer_offset = max_abs * 0.08
     inner_offset = max_abs * 0.06
 
-    def _annotate_bar(bar, val: float, missing: bool) -> None:
+    def _annotate_bar(bar, val: float, missing: bool, text_override: str) -> None:
         height = bar.get_height()
-        text = "N/D" if missing else formatter(val)
+        text = "N/D" if missing else text_override
         if missing:
             y = height + outer_offset
             va = "bottom"
@@ -7797,10 +7870,10 @@ def _projection_by_instrument_image(
             color=color,
         )
 
-    for bar, val, miss in zip(bars_3m, values_3m, missing_3m):
-        _annotate_bar(bar, val, miss)
-    for bar, val, miss in zip(bars_6m, values_6m, missing_6m):
-        _annotate_bar(bar, val, miss)
+    for bar, val, miss, text in zip(bars_3m, values_3m, missing_3m, labels_3m):
+        _annotate_bar(bar, val, miss, text)
+    for bar, val, miss, text in zip(bars_6m, values_6m, missing_6m, labels_6m):
+        _annotate_bar(bar, val, miss, text)
 
     ax.set_xticks(x)
     ax.set_xticklabels(labels, rotation=15, ha="right")
@@ -8099,8 +8172,12 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
 
     w3 = 0.0
     w6 = 0.0
+    w3_low = 0.0
+    w3_high = 0.0
+    w6_low = 0.0
+    w6_high = 0.0
     detail: List[str] = []
-    per_instrument_points: List[Tuple[str, Optional[float], Optional[float]]] = []
+    per_instrument_points: List[Tuple[str, ProjectionRange, ProjectionRange]] = []
     for entry in snapshot:
         metrics = entry.get("metrics") or {}
         weight = float(entry.get("peso") or 0.0)
@@ -8109,8 +8186,21 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
 
         p3 = projection_3m(metrics)
         p6 = projection_6m(metrics)
-        w3 += weight * p3
-        w6 += weight * p6
+        c3, l3, h3 = _projection_bounds(p3)
+        c6, l6, h6 = _projection_bounds(p6)
+        c3 = c3 if c3 is not None else 0.0
+        c6 = c6 if c6 is not None else 0.0
+        l3 = l3 if l3 is not None else c3
+        h3 = h3 if h3 is not None else c3
+        l6 = l6 if l6 is not None else c6
+        h6 = h6 if h6 is not None else c6
+
+        w3 += weight * c3
+        w6 += weight * c6
+        w3_low += weight * l3
+        w3_high += weight * h3
+        w6_low += weight * l6
+        w6_high += weight * h6
 
         short_label = _label_short(entry["symbol"]) if entry.get("symbol") else entry["label"]
         per_instrument_points.append((short_label, p3, p6))
@@ -8127,7 +8217,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         delta = valor_actual - invertido
         actual_pct = (delta / invertido) * 100.0 if invertido > 0 else None
         actual_txt = pct(actual_pct, 2)
-        proj_txt = f"🔭 3M {pct(p3, 2)} | 6M {pct(p6, 2)}"
+        proj_txt = f"🔭 3M {_format_projection_range(p3, 2)} | 6M {_format_projection_range(p6, 2)}"
         delta_txt = f"📈 Δ {f_money(delta)}"
 
         detail.append(
@@ -8140,14 +8230,26 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
 
     forecast3 = total_actual * (1.0 + w3/100.0)
     forecast6 = total_actual * (1.0 + w6/100.0)
+    forecast3_low = total_actual * (1.0 + w3_low/100.0)
+    forecast3_high = total_actual * (1.0 + w3_high/100.0)
+    forecast6_low = total_actual * (1.0 + w6_low/100.0)
+    forecast6_high = total_actual * (1.0 + w6_high/100.0)
     total_pct = ((total_actual / total_invertido) - 1.0) * 100.0 if total_invertido > 0 else math.nan
 
     header = "<b>🔮 Proyección del Portafolio</b>"
     if fecha:
         header += f" <i>Datos al {fecha}</i>"
     lines = [header, f"🧮 Valor actual estimado: {f_money(total_actual)}"]
-    lines.append(f"✨ Proyección 3M: {pct(w3,2)} → {f_money(forecast3)}")
-    lines.append(f"🌟 Proyección 6M: {pct(w6,2)} → {f_money(forecast6)}")
+    lines.append(
+        "✨ Proyección 3M: "
+        + f"{pct(w3,2)} ({pct(w3_low,2)} a {pct(w3_high,2)}) → "
+        + f"{f_money(forecast3)} ({f_money(forecast3_low)} a {f_money(forecast3_high)})"
+    )
+    lines.append(
+        "🌟 Proyección 6M: "
+        + f"{pct(w6,2)} ({pct(w6_low,2)} a {pct(w6_high,2)}) → "
+        + f"{f_money(forecast6)} ({f_money(forecast6_low)} a {f_money(forecast6_high)})"
+    )
     if tc_val is not None:
         tc_line = f"💱 Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
         if tc_ts:
@@ -8175,11 +8277,11 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
 
     img = _projection_bar_image(
         [
-            ("Actual", total_actual),
-            ("3M", forecast3),
-            ("6M", forecast6),
+            ("Actual", total_actual, f_money(total_actual)),
+            ("3M", forecast3, f"{f_money(forecast3)} ({f_money(forecast3_low)} a {f_money(forecast3_high)})"),
+            ("6M", forecast6, f"{f_money(forecast6)} ({f_money(forecast6_low)} a {f_money(forecast6_high)})"),
         ],
-        f_money,
+        lambda value, label: label or f_money(value),
         "Proyección del portafolio",
         "Valores estimados",
     )
