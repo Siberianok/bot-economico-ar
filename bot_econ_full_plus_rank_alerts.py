@@ -2824,6 +2824,18 @@ def _combine_returns(usd_ret: Optional[float], fx_ret: Optional[float]) -> Optio
     except Exception:
         return None
 
+def _remove_fx_return(ars_ret: Optional[float], fx_ret: Optional[float]) -> Optional[float]:
+    if ars_ret is None and fx_ret is None:
+        return None
+    if ars_ret is None:
+        return None
+    if fx_ret is None:
+        return ars_ret
+    try:
+        return ((1.0 + float(ars_ret) / 100.0) / (1.0 + float(fx_ret) / 100.0) - 1.0) * 100.0
+    except Exception:
+        return None
+
 async def _cedear_metrics(
     session: ClientSession,
     symbol: str,
@@ -2836,9 +2848,15 @@ async def _cedear_metrics(
         usd_metrics = await _yf_metrics_1y(session, underlying)
 
     for horizon in ("1m", "3m", "6m"):
-        usd_val = usd_metrics.get(horizon)
+        ars_val = local.get(horizon)
         fx_val = fx_metrics.get(horizon)
-        local[horizon] = _combine_returns(usd_val, fx_val)
+        usd_val = usd_metrics.get(horizon)
+        if ars_val is None:
+            ars_val = _combine_returns(usd_val, fx_val)
+        if usd_val is None:
+            usd_val = _remove_fx_return(ars_val, fx_val)
+        local[horizon] = ars_val
+        local[f"{horizon}_ars"] = ars_val
         local[f"{horizon}_usd"] = usd_val
         local[f"{horizon}_fx"] = fx_val
 
@@ -4077,15 +4095,41 @@ def format_dolar_message(d: Dict[str, Dict[str, Any]]) -> str:
     compra_msg, venta_msg = format_dolar_panels(d)
     return "\n\n".join([compra_msg, venta_msg])
 
-def format_top3_table(title: str, fecha: Optional[str], rows_syms: List[str], retmap: Dict[str, Dict[str, Optional[float]]]) -> str:
+def _ret_label(base: str, currency_label: Optional[str]) -> str:
+    if not currency_label:
+        return base
+    return f"{base} ({currency_label})"
+
+def format_top3_table(
+    title: str,
+    fecha: Optional[str],
+    rows_syms: List[str],
+    retmap: Dict[str, Dict[str, Optional[float]]],
+    *,
+    key_suffix: str = "",
+    currency_label: Optional[str] = None,
+) -> str:
     head = f"<b>{title}</b>" + (f" <i>Últ. Dato: {fecha}</i>" if fecha else "")
-    lines = [head, "<pre>Rank Empresa (Ticker)             6M        3M        1M</pre>"]
+    header = (
+        f"<pre>Rank Empresa (Ticker)        {_ret_label('6M', currency_label):>10}"
+        f"{_ret_label('3M', currency_label):>10}{_ret_label('1M', currency_label):>10}</pre>"
+    )
+    lines = [head, header]
     out = []
     for idx, sym in enumerate(rows_syms[:3], start=1):
         d = retmap.get(sym, {})
-        p6 = pct(d.get("6m"), 2) if d.get("6m") is not None else "—"
-        p3 = pct(d.get("3m"), 2) if d.get("3m") is not None else "—"
-        p1 = pct(d.get("1m"), 2) if d.get("1m") is not None else "—"
+        def _val_with_fallback(key: str) -> Optional[float]:
+            primary = d.get(f"{key}{key_suffix}")
+            if primary is None and key_suffix == "_ars":
+                return d.get(key)
+            return primary
+
+        p6_val = _val_with_fallback("6m")
+        p3_val = _val_with_fallback("3m")
+        p1_val = _val_with_fallback("1m")
+        p6 = pct(p6_val, 2) if p6_val is not None else "—"
+        p3 = pct(p3_val, 2) if p3_val is not None else "—"
+        p1 = pct(p1_val, 2) if p1_val is not None else "—"
         label = pad(_label_short(sym), 28)
         c6 = center_text(p6, 10); c3 = center_text(p3, 10); c1 = center_text(p1, 10)
         l = f"{idx:<4} {label}{c6}{c3}{c1}"
@@ -4507,11 +4551,22 @@ def _summarize_projection_performance(batches: List[Dict[str, Any]]) -> Dict[str
         "spearman": spearman_avg,
     }
 
-RET_SERIES_ORDER: List[Tuple[str, str]] = [
+RET_SERIES_BASE: List[Tuple[str, str]] = [
     ("6m", "Rend. 6M"),
     ("3m", "Rend. 3M"),
     ("1m", "Rend. 1M"),
 ]
+
+def _ret_series_order(currency_label: Optional[str] = None, key_suffix: str = "") -> List[Tuple[str, str]]:
+    series = []
+    for key, label in RET_SERIES_BASE:
+        key_out = f"{key}{key_suffix}"
+        if currency_label:
+            label_out = f"{label} ({currency_label})"
+        else:
+            label_out = label
+        series.append((key_out, label_out))
+    return series
 
 
 async def _rank_top3(
@@ -4528,9 +4583,39 @@ async def _rank_top3(
     async with ClientSession() as session:
         mets, last_ts = await metrics_for_symbols_cached(session, symbols)
         fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-        pairs = sorted([(sym, m["6m"]) for sym, m in mets.items() if m.get("6m") is not None], key=lambda x: x[1], reverse=True)
-        top_syms = [sym for sym, _ in pairs[: RANK_TOP_LIMIT]]
-        msg = format_top3_table(title, fecha, top_syms, mets)
+        is_cedear = all(sym.upper() in CEDEARS_SET for sym in symbols)
+        if is_cedear:
+            pairs_ars = sorted(
+                [(sym, m.get("6m_ars")) for sym, m in mets.items() if m.get("6m_ars") is not None],
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            if not pairs_ars:
+                pairs_ars = sorted(
+                    [(sym, m.get("6m")) for sym, m in mets.items() if m.get("6m") is not None],
+                    key=lambda x: x[1],
+                    reverse=True,
+                )
+            top_syms_ars = [sym for sym, _ in pairs_ars[: RANK_TOP_LIMIT]]
+            msg_parts = [
+                format_top3_table(title, fecha, top_syms_ars, mets, key_suffix="_ars", currency_label="ARS")
+            ]
+            pairs_usd = sorted(
+                [(sym, m.get("6m_usd")) for sym, m in mets.items() if m.get("6m_usd") is not None],
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            if pairs_usd:
+                top_syms_usd = [sym for sym, _ in pairs_usd[: RANK_TOP_LIMIT]]
+                msg_parts.append(
+                    format_top3_table(f"{title} (USD)", fecha, top_syms_usd, mets, key_suffix="_usd", currency_label="USD")
+                )
+            msg = "\n\n".join(msg_parts)
+            pairs = pairs_ars
+        else:
+            pairs = sorted([(sym, m["6m"]) for sym, m in mets.items() if m.get("6m") is not None], key=lambda x: x[1], reverse=True)
+            top_syms = [sym for sym, _ in pairs[: RANK_TOP_LIMIT]]
+            msg = format_top3_table(title, fecha, top_syms, mets)
         await update.effective_message.reply_text(
             msg,
             parse_mode=ParseMode.HTML,
@@ -4539,11 +4624,14 @@ async def _rank_top3(
 
         if HAS_MPL and pairs:
             chart_rows: List[Tuple[str, List[Optional[float]]]] = []
+            series_order = _ret_series_order("ARS", "_ars") if is_cedear else _ret_series_order()
             for sym, _ in pairs[: RANK_TOP_LIMIT]:
                 metrics = mets.get(sym, {})
                 values: List[Optional[float]] = []
-                for key, _ in RET_SERIES_ORDER:
+                for key, _ in series_order:
                     raw_val = metrics.get(key)
+                    if raw_val is None and is_cedear and key.endswith("_ars"):
+                        raw_val = metrics.get(key.replace("_ars", ""))
                     if raw_val is None:
                         values.append(None)
                         continue
@@ -4557,9 +4645,9 @@ async def _rank_top3(
             subtitle = f"Datos al {fecha}" if fecha else None
             img = _bar_image_from_rank(
                 chart_rows,
-                title=f"{title} — Rendimientos 6/3/1M",
+                title=f"{title} — Rendimientos 6/3/1M{' (ARS)' if is_cedear else ''}",
                 subtitle=subtitle,
-                series_labels=[label for _, label in RET_SERIES_ORDER],
+                series_labels=[label for _, label in series_order],
             )
             if img:
                 await update.effective_message.reply_photo(photo=img)
@@ -5044,8 +5132,8 @@ async def cmd_acciones_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_cedears_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_menu_counter(context, "cedears", 2)
     kb_menu = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Top 3 Cedears (Rendimiento)", callback_data="CED:TOP3")],
-        [InlineKeyboardButton("Top 5 Cedears (Proyección)", callback_data="CED:TOP5")],
+        [InlineKeyboardButton("Top 3 Cedears (Rendimiento ARS/USD)", callback_data="CED:TOP3")],
+        [InlineKeyboardButton("Top 5 Cedears (Proyección ARS)", callback_data="CED:TOP5")],
     ])
     await update.effective_message.reply_text("🌎 Menú cedears", reply_markup=kb_menu)
 
@@ -5080,7 +5168,7 @@ async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _rank_proj5(
             update,
             CEDEARS_BA,
-            "🏁 Top 5 Cedears (Proyección)",
+            "🏁 Top 5 Cedears (Proyección ARS)",
             throttle_key=None,
         )
         await dec_and_maybe_show(update, context, "cedears", cmd_cedears_menu)
