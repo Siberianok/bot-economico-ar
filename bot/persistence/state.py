@@ -297,6 +297,134 @@ def _clean_pf(raw: Any) -> Dict[int, Dict[str, Any]]:
     return result
 
 
+def _clean_projection_records(raw: Any) -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return records
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        symbol = entry.get("symbol")
+        if not isinstance(symbol, str) or not symbol:
+            continue
+        try:
+            horizon = int(entry.get("horizon"))
+        except Exception:
+            continue
+        if horizon not in (63, 126):
+            continue
+        try:
+            base_price = float(entry.get("base_price"))
+        except Exception:
+            continue
+        try:
+            projection = float(entry.get("projection"))
+        except Exception:
+            continue
+        try:
+            created_at = float(entry.get("created_at"))
+        except Exception:
+            continue
+        record: Dict[str, Any] = {
+            "symbol": symbol,
+            "horizon": horizon,
+            "base_price": base_price,
+            "projection": projection,
+            "created_at": created_at,
+        }
+        created_date = entry.get("created_date")
+        if isinstance(created_date, str):
+            record["created_date"] = created_date
+        batch_id = entry.get("batch_id")
+        if isinstance(batch_id, str):
+            record["batch_id"] = batch_id
+        for optional_key in (
+            "evaluated",
+            "evaluated_at",
+            "actual_price",
+            "actual_return",
+            "error_abs",
+            "direction_hit",
+        ):
+            if optional_key in entry:
+                record[optional_key] = entry.get(optional_key)
+        records.append(record)
+    return records
+
+
+def _clean_projection_batches(raw: Any) -> List[Dict[str, Any]]:
+    batches: List[Dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return batches
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        batch_id = entry.get("batch_id")
+        if not isinstance(batch_id, str) or not batch_id:
+            continue
+        try:
+            horizon = int(entry.get("horizon"))
+        except Exception:
+            continue
+        if horizon not in (63, 126):
+            continue
+        try:
+            created_at = float(entry.get("created_at"))
+        except Exception:
+            continue
+        symbols = entry.get("symbols")
+        if not isinstance(symbols, list):
+            continue
+        symbol_list = [s for s in symbols if isinstance(s, str) and s]
+        predictions = entry.get("predictions")
+        base_prices = entry.get("base_prices")
+        if not isinstance(predictions, dict) or not isinstance(base_prices, dict):
+            continue
+        cleaned_predictions: Dict[str, float] = {}
+        cleaned_base_prices: Dict[str, float] = {}
+        for sym, val in predictions.items():
+            if not isinstance(sym, str) or not sym:
+                continue
+            try:
+                cleaned_predictions[sym] = float(val)
+            except Exception:
+                continue
+        for sym, val in base_prices.items():
+            if not isinstance(sym, str) or not sym:
+                continue
+            try:
+                cleaned_base_prices[sym] = float(val)
+            except Exception:
+                continue
+        if not cleaned_predictions or not cleaned_base_prices:
+            continue
+        batch: Dict[str, Any] = {
+            "batch_id": batch_id,
+            "horizon": horizon,
+            "created_at": created_at,
+            "symbols": symbol_list,
+            "predictions": cleaned_predictions,
+            "base_prices": cleaned_base_prices,
+        }
+        created_date = entry.get("created_date")
+        if isinstance(created_date, str):
+            batch["created_date"] = created_date
+        for optional_key in (
+            "evaluated",
+            "evaluated_at",
+            "mae",
+            "hit_rate",
+            "hit_count",
+            "count",
+            "spearman",
+            "actual_returns",
+        ):
+            if optional_key in entry:
+                batch[optional_key] = entry.get(optional_key)
+        batches.append(batch)
+    return batches
+
+
 def deserialize_state_payload(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         return {}
@@ -318,6 +446,8 @@ def deserialize_state_payload(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     payload["alerts"] = _clean_alerts(payload.get("alerts"))
     payload["subs"] = _clean_subs(payload.get("subs"))
     payload["pf"] = _clean_pf(payload.get("pf"))
+    payload["projection_records"] = _clean_projection_records(payload.get("projection_records"))
+    payload["projection_batches"] = _clean_projection_batches(payload.get("projection_batches"))
     return payload
 
 
@@ -332,4 +462,6 @@ def serialize_state_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     payload["alerts"] = _clean_alerts(payload.get("alerts"))
     payload["subs"] = _clean_subs(payload.get("subs"))
     payload["pf"] = _clean_pf(payload.get("pf"))
+    payload["projection_records"] = _clean_projection_records(payload.get("projection_records"))
+    payload["projection_batches"] = _clean_projection_batches(payload.get("projection_batches"))
     return payload
