@@ -800,6 +800,8 @@ ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 SUBS: Dict[int, Dict[str, Any]] = {}
 PF: Dict[int, Dict[str, Any]] = {}
 ALERT_USAGE: Dict[int, Dict[str, Dict[str, Any]]] = {}
+PROJECTION_RECORDS: List[Dict[str, Any]] = []
+PROJECTION_BATCHES: List[Dict[str, Any]] = []
 NEWS_HISTORY: List[Tuple[str, float]] = []
 NEWS_CACHE: Dict[str, Any] = {"date": "", "items": []}
 RIESGO_CACHE: Dict[str, Any] = {}
@@ -878,6 +880,10 @@ async def load_state():
         SUBS = {int(k): v for k, v in data.get("subs", {}).items()}
         PF = {int(k): v for k, v in data.get("pf", {}).items()}
         ALERT_USAGE = {int(k): v for k, v in data.get("alert_usage", {}).items()}
+        projection_records = data.get("projection_records", [])
+        projection_batches = data.get("projection_batches", [])
+        PROJECTION_RECORDS = projection_records if isinstance(projection_records, list) else []
+        PROJECTION_BATCHES = projection_batches if isinstance(projection_batches, list) else []
 
         raw_history = data.get("news_history", [])
         if isinstance(raw_history, list):
@@ -1163,6 +1169,8 @@ async def save_state():
             "subs": SUBS,
             "pf": PF,
             "alert_usage": ALERT_USAGE,
+            "projection_records": PROJECTION_RECORDS,
+            "projection_batches": PROJECTION_BATCHES,
             "news_history": NEWS_HISTORY,
             "news_cache_date": NEWS_CACHE.get("date", ""),
             "news_cache_items": NEWS_CACHE.get("items", []),
@@ -4238,6 +4246,267 @@ def projection_6m(m: Dict[str, Optional[float]]) -> float:
     raw = projection_6m_raw(m)
     return calibrate_projection(raw, "6m")
 
+
+def _format_projection_date(ts: float) -> str:
+    try:
+        return datetime.fromtimestamp(ts, TZ).strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def _trading_days_between(start_date: date, end_date: date) -> int:
+    if end_date <= start_date:
+        return 0
+    days = 0
+    cur = start_date + timedelta(days=1)
+    while cur <= end_date:
+        if cur.weekday() < 5:
+            days += 1
+        cur += timedelta(days=1)
+    return days
+
+
+def _build_projection_batch_id(horizon: int, created_at: float) -> str:
+    stamp = int(created_at)
+    date_str = _format_projection_date(created_at)
+    return f"{date_str}-{stamp}-{horizon}"
+
+
+def _record_projection_batch_from_rank(
+    rows: List[Tuple[str, float, float]],
+    metrics_by_symbol: Dict[str, Dict[str, Optional[float]]],
+) -> bool:
+    if not rows:
+        return False
+    created_at = time()
+    created_date = _format_projection_date(created_at)
+    base_prices: Dict[str, float] = {}
+    projections_3m: Dict[str, float] = {}
+    projections_6m: Dict[str, float] = {}
+    for sym, p3, p6 in rows:
+        base_px = metric_last_price(metrics_by_symbol.get(sym, {}))
+        if base_px is None:
+            continue
+        base_prices[sym] = base_px
+        projections_3m[sym] = float(p3)
+        projections_6m[sym] = float(p6)
+    if not base_prices:
+        return False
+    for horizon, projections in ((63, projections_3m), (126, projections_6m)):
+        if not projections:
+            continue
+        batch_id = _build_projection_batch_id(horizon, created_at)
+        PROJECTION_BATCHES.append(
+            {
+                "batch_id": batch_id,
+                "created_at": created_at,
+                "created_date": created_date,
+                "horizon": horizon,
+                "symbols": sorted(projections.keys()),
+                "predictions": dict(projections),
+                "base_prices": {sym: base_prices[sym] for sym in projections},
+                "evaluated": False,
+            }
+        )
+        for sym, projection in projections.items():
+            PROJECTION_RECORDS.append(
+                {
+                    "symbol": sym,
+                    "horizon": horizon,
+                    "base_price": base_prices[sym],
+                    "projection": projection,
+                    "created_at": created_at,
+                    "created_date": created_date,
+                    "batch_id": batch_id,
+                    "evaluated": False,
+                }
+            )
+    return True
+
+
+def _rank_values(values: Dict[str, float]) -> Dict[str, float]:
+    items = sorted(values.items(), key=lambda x: x[1], reverse=True)
+    ranks: Dict[str, float] = {}
+    i = 0
+    while i < len(items):
+        j = i
+        val = items[i][1]
+        while j < len(items) and items[j][1] == val:
+            j += 1
+        avg_rank = (i + 1 + j) / 2.0
+        for k in range(i, j):
+            ranks[items[k][0]] = avg_rank
+        i = j
+    return ranks
+
+
+def _spearman_correlation(
+    predicted: Dict[str, float], actual: Dict[str, float]
+) -> Optional[float]:
+    common = [sym for sym in predicted.keys() if sym in actual]
+    n = len(common)
+    if n < 2:
+        return None
+    pred_vals = {sym: float(predicted[sym]) for sym in common}
+    act_vals = {sym: float(actual[sym]) for sym in common}
+    rank_pred = _rank_values(pred_vals)
+    rank_act = _rank_values(act_vals)
+    diff_sq = sum((rank_pred[s] - rank_act[s]) ** 2 for s in common)
+    return 1.0 - (6.0 * diff_sq) / (n * (n * n - 1))
+
+
+def _update_projection_record(
+    batch_id: str,
+    symbol: str,
+    *,
+    evaluated_at: float,
+    actual_price: float,
+    actual_return: float,
+    error_abs: float,
+    direction_hit: bool,
+) -> None:
+    for record in PROJECTION_RECORDS:
+        if record.get("batch_id") != batch_id or record.get("symbol") != symbol:
+            continue
+        record.update(
+            {
+                "evaluated": True,
+                "evaluated_at": evaluated_at,
+                "actual_price": actual_price,
+                "actual_return": actual_return,
+                "error_abs": error_abs,
+                "direction_hit": direction_hit,
+            }
+        )
+
+
+async def _evaluate_projection_batches() -> int:
+    if not PROJECTION_BATCHES:
+        return 0
+    today = datetime.now(TZ).date()
+    matured: List[Dict[str, Any]] = []
+    for batch in PROJECTION_BATCHES:
+        if batch.get("evaluated"):
+            continue
+        created_date_str = batch.get("created_date")
+        created_at = batch.get("created_at")
+        if isinstance(created_date_str, str) and created_date_str:
+            try:
+                created_date = datetime.strptime(created_date_str, "%Y-%m-%d").date()
+            except Exception:
+                created_date = None
+        else:
+            created_date = None
+        if created_date is None and created_at is not None:
+            try:
+                created_date = datetime.fromtimestamp(float(created_at), TZ).date()
+            except Exception:
+                created_date = None
+        if created_date is None:
+            continue
+        try:
+            horizon = int(batch.get("horizon"))
+        except Exception:
+            continue
+        if _trading_days_between(created_date, today) >= horizon:
+            matured.append(batch)
+    if not matured:
+        return 0
+
+    symbols = sorted(
+        {sym for batch in matured for sym in batch.get("symbols", []) if isinstance(sym, str)}
+    )
+    if not symbols:
+        return 0
+
+    async with ClientSession() as session:
+        metrics_by_symbol, _ = await metrics_for_symbols(session, symbols)
+
+    now_ts = time()
+    for batch in matured:
+        predictions = batch.get("predictions", {})
+        base_prices = batch.get("base_prices", {})
+        actual_returns: Dict[str, float] = {}
+        errors: List[float] = []
+        hit_count = 0
+        count = 0
+        for sym, proj in predictions.items():
+            base_px = base_prices.get(sym)
+            if base_px is None or base_px == 0:
+                continue
+            current_px = metric_last_price(metrics_by_symbol.get(sym, {}))
+            if current_px is None:
+                continue
+            actual_return = (float(current_px) / float(base_px) - 1.0) * 100.0
+            actual_returns[sym] = actual_return
+            try:
+                proj_val = float(proj)
+            except Exception:
+                continue
+            error_abs = abs(actual_return - proj_val)
+            errors.append(error_abs)
+            direction_hit = (actual_return >= 0) == (proj_val >= 0)
+            if direction_hit:
+                hit_count += 1
+            count += 1
+            _update_projection_record(
+                batch.get("batch_id", ""),
+                sym,
+                evaluated_at=now_ts,
+                actual_price=float(current_px),
+                actual_return=actual_return,
+                error_abs=error_abs,
+                direction_hit=direction_hit,
+            )
+
+        mae = (sum(errors) / count) if count else None
+        hit_rate = (hit_count / count) if count else None
+        spearman = _spearman_correlation(
+            {k: float(v) for k, v in predictions.items() if k in actual_returns},
+            actual_returns,
+        )
+        batch.update(
+            {
+                "evaluated": True,
+                "evaluated_at": now_ts,
+                "actual_returns": actual_returns,
+                "mae": mae,
+                "hit_rate": hit_rate,
+                "hit_count": hit_count,
+                "count": count,
+                "spearman": spearman,
+            }
+        )
+    return len(matured)
+
+
+def _summarize_projection_performance(batches: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    total_count = 0
+    total_abs_error = 0.0
+    total_hits = 0
+    spearman_vals: List[float] = []
+    for batch in batches:
+        count = batch.get("count")
+        mae = batch.get("mae")
+        hit_count = batch.get("hit_count")
+        if isinstance(count, int) and count > 0 and isinstance(mae, (int, float)):
+            total_count += count
+            total_abs_error += float(mae) * count
+        if isinstance(hit_count, int) and hit_count >= 0 and isinstance(count, int) and count > 0:
+            total_hits += hit_count
+        spearman = batch.get("spearman")
+        if isinstance(spearman, (int, float)):
+            spearman_vals.append(float(spearman))
+    mae = (total_abs_error / total_count) if total_count else None
+    hit_rate = (total_hits / total_count) if total_count else None
+    spearman_avg = (sum(spearman_vals) / len(spearman_vals)) if spearman_vals else None
+    return {
+        "count": total_count,
+        "mae": mae,
+        "hit_rate": hit_rate,
+        "spearman": spearman_avg,
+    }
+
 RET_SERIES_ORDER: List[Tuple[str, str]] = [
     ("6m", "Rend. 6M"),
     ("3m", "Rend. 3M"),
@@ -4331,6 +4600,11 @@ async def _rank_proj5(
             parse_mode=ParseMode.HTML,
             link_preview_options=build_preview_options(),
         )
+
+        if top_rows:
+            recorded = _record_projection_batch_from_rank(top_rows, mets)
+            if recorded:
+                await save_state()
 
         if HAS_MPL and top_rows:
             chart_rows = []
@@ -6771,6 +7045,15 @@ async def _job_send_daily(context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.warning("send daily failed %s: %s", chat_id, e)
 
+
+async def _job_projection_performance(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        updated = await _evaluate_projection_batches()
+        if updated:
+            await save_state()
+    except Exception as exc:
+        log.warning("performance job error: %s", exc)
+
 def _job_name_daily(chat_id: int) -> str: return f"daily_{chat_id}"
 
 def _schedule_daily_for_chat(app: Application, chat_id: int, hhmm: str):
@@ -8709,6 +8992,53 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
         link_preview_options=build_preview_options(),
     )
 
+
+async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    evaluated = [b for b in PROJECTION_BATCHES if b.get("evaluated")]
+    if not evaluated:
+        await update.effective_message.reply_text("Sin métricas de performance todavía.")
+        return
+    batches_3m = [b for b in evaluated if b.get("horizon") == 63]
+    batches_6m = [b for b in evaluated if b.get("horizon") == 126]
+    summary_3m = _summarize_projection_performance(batches_3m)
+    summary_6m = _summarize_projection_performance(batches_6m)
+    lines = ["<b>📊 Performance de Proyecciones</b>"]
+    for label, summary in (("3M (63 ruedas)", summary_3m), ("6M (126 ruedas)", summary_6m)):
+        if summary.get("count"):
+            lines.append(
+                f"• {label}: MAE {pct_plain(summary.get('mae'), 2)}"
+                f" | Hit {pct_plain((summary.get('hit_rate') or 0) * 100.0, 1)}"
+                f" | Spearman {fmt_number(summary.get('spearman'), 2)}"
+                f" | N={summary.get('count')}"
+            )
+        else:
+            lines.append(f"• {label}: sin datos evaluados.")
+
+    latest = sorted(
+        evaluated,
+        key=lambda b: b.get("evaluated_at") or b.get("created_at") or 0,
+        reverse=True,
+    )[:5]
+    if latest:
+        lines.append("")
+        lines.append("<b>Últimos batches</b>")
+        for batch in latest:
+            created_date = batch.get("created_date") or "s/d"
+            horizon = batch.get("horizon")
+            mae = pct_plain(batch.get("mae"), 2)
+            hit_rate = pct_plain((batch.get("hit_rate") or 0) * 100.0, 1)
+            spearman = fmt_number(batch.get("spearman"), 2)
+            count = batch.get("count") or 0
+            lines.append(
+                f"• {created_date} · {horizon}r: MAE {mae} | Hit {hit_rate} | ρ {spearman} | N={count}"
+            )
+
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        link_preview_options=build_preview_options(),
+    )
+
 # ============================ WEBHOOK / APP ============================
 
 async def keepalive_loop():
@@ -8756,9 +9086,29 @@ def setup_health_routes(application: Application) -> None:
     async def _metrics(_: web.Request) -> web.Response:
         return web.json_response(metrics.snapshot())
 
+    async def _performance(_: web.Request) -> web.Response:
+        evaluated = [b for b in PROJECTION_BATCHES if b.get("evaluated")]
+        batches_3m = [b for b in evaluated if b.get("horizon") == 63]
+        batches_6m = [b for b in evaluated if b.get("horizon") == 126]
+        return web.json_response(
+            {
+                "summary": {
+                    "3m": _summarize_projection_performance(batches_3m),
+                    "6m": _summarize_projection_performance(batches_6m),
+                },
+                "batches": evaluated[-50:],
+                "generated_at": time(),
+            }
+        )
+
     router = inner_app.router
 
-    for path, handler in (("/", _health), ("/healthz", _health), ("/metrics", _metrics)):
+    for path, handler in (
+        ("/", _health),
+        ("/healthz", _health),
+        ("/metrics", _metrics),
+        ("/performance", _performance),
+    ):
         already_registered = False
         for route in router.routes():
             resource = getattr(route, "resource", None)
@@ -8783,6 +9133,7 @@ BOT_COMMANDS = [
     BotCommand("alertas_menu","Configurar alertas"),
     BotCommand("portafolio","Menú portafolio"),
     BotCommand("subs","Suscripción a resumen diario"),
+    BotCommand("performance","Métricas de performance"),
 ]
 
 
@@ -8879,6 +9230,7 @@ def build_application() -> Application:
 
     # Resumen diario on-demand
     app.add_handler(CommandHandler("resumen", instrument_command("resumen", cmd_resumen_diario)))
+    app.add_handler(CommandHandler("performance", instrument_command("performance", cmd_performance)))
 
     app.add_error_handler(handle_error)
 
