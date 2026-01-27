@@ -7,7 +7,7 @@ import urllib.request
 import urllib.error
 from time import time
 from math import sqrt, floor
-from datetime import datetime, timedelta, time as dtime
+from datetime import datetime, timedelta, time as dtime, date
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable, Iterable
 from urllib.parse import urlparse, quote, parse_qs, urljoin
@@ -115,6 +115,10 @@ CEDEARS_BA = [
     "AAPL.BA","MSFT.BA","NVDA.BA","AMZN.BA","GOOGL.BA","TSLA.BA","META.BA","JNJ.BA","KO.BA","NFLX.BA",
     "BRKB.BA","PG.BA","DISN.BA","AMD.BA","INTC.BA","NKE.BA","V.BA","MA.BA","PFE.BA","XOM.BA"
 ]
+CEDEAR_UNDERLYING_OVERRIDES = {
+    "BRKB.BA": "BRK-B",
+    "DISN.BA": "DIS",
+}
 BONOS_AR = [
     "AL30","AL30D","AL35","AL29","GD30","GD30D","GD35","GD38","GD41","AE38",
     "AL41","AL38","GD46","AL32","GD29","AL36","AL39","GD35D","GD41D","AL29D"
@@ -571,6 +575,16 @@ for sym, name in TICKER_NAME.items():
         PF_NAME_LOOKUP[_sanitize_match(name)] = entry
 
 CEDEARS_SET = {sym.upper() for sym in CEDEARS_BA}
+
+def cedear_underlying_symbol(symbol: str) -> Optional[str]:
+    if not symbol:
+        return None
+    key = symbol.upper()
+    if not key.endswith(".BA"):
+        return None
+    if key in CEDEAR_UNDERLYING_OVERRIDES:
+        return CEDEAR_UNDERLYING_OVERRIDES[key]
+    return key[:-3]
 
 def label_with_currency(sym: str) -> str:
     if sym.endswith(".BA"):
@@ -1844,6 +1858,98 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
     SHORT_CACHE.set(cache_key, merged)
     return merged
 
+FX_DOLARAPI_PATHS = {
+    "mep": "/dolares/bolsa",
+    "ccl": "/dolares/contadoconliqui",
+}
+
+def _pick_fx_value(compra: Optional[float], venta: Optional[float]) -> Optional[float]:
+    if venta is not None:
+        return float(venta)
+    if compra is not None:
+        return float(compra)
+    return None
+
+async def _dolarapi_quote(
+    session: ClientSession,
+    path: str,
+    date: Optional[str] = None,
+) -> Optional[Tuple[Optional[float], Optional[float], Optional[str]]]:
+    url = f"{DOLARAPI_BASE}{path}"
+    if date:
+        url = f"{url}?fecha={date}"
+    j = await fetch_json(session, url, source="dolarapi")
+    if not j:
+        return None
+    compra = j.get("compra")
+    venta = j.get("venta")
+    fecha = j.get("fechaActualizacion") or j.get("fecha")
+    try:
+        return (
+            float(compra) if compra is not None else None,
+            float(venta) if venta is not None else None,
+            fecha,
+        )
+    except Exception:
+        return None
+
+async def _fx_value_at(
+    session: ClientSession,
+    fx_type: str,
+    target_date: date,
+    max_back: int = 7,
+) -> Optional[float]:
+    path = FX_DOLARAPI_PATHS.get(fx_type)
+    if not path:
+        return None
+    for delta in range(max_back):
+        date_str = (target_date - timedelta(days=delta)).isoformat()
+        quote = await _dolarapi_quote(session, path, date_str)
+        if not quote:
+            continue
+        compra, venta, _ = quote
+        val = _pick_fx_value(compra, venta)
+        if val is not None:
+            return val
+    return None
+
+async def _fx_metrics_series(
+    session: ClientSession,
+    fx_type: str,
+) -> Dict[str, Optional[float]]:
+    out = {
+        "6m": None,
+        "3m": None,
+        "1m": None,
+        "last_ts": None,
+        "last_px": None,
+        "prev_px": None,
+        "last_chg": None,
+    }
+    fx = await get_dolares(session)
+    row = fx.get(fx_type.lower(), {}) if fx_type else {}
+    compra = row.get("compra")
+    venta = row.get("venta")
+    cur_val = _pick_fx_value(compra, venta)
+    if cur_val is None:
+        return out
+
+    out["last_px"] = cur_val
+    out["last_ts"] = int(datetime.now(TZ).timestamp())
+    try:
+        if row.get("variation") is not None:
+            out["last_chg"] = float(row.get("variation"))
+    except Exception:
+        pass
+
+    today = datetime.now(TZ).date()
+    horizons = [(30, "1m"), (90, "3m"), (180, "6m")]
+    for days, key in horizons:
+        prev_val = await _fx_value_at(session, fx_type, today - timedelta(days=days))
+        if prev_val and prev_val > 0:
+            out[key] = (cur_val / prev_val - 1.0) * 100.0
+    return out
+
 async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
     if not tc_name: return None
     fx = await get_dolares(session)
@@ -2698,16 +2804,59 @@ async def _yf_metrics_1y(session: ClientSession, symbol: str) -> Dict[str, Optio
             if m: out.update(m); break
     return out
 
+def _combine_returns(usd_ret: Optional[float], fx_ret: Optional[float]) -> Optional[float]:
+    if usd_ret is None and fx_ret is None:
+        return None
+    if usd_ret is None:
+        return fx_ret
+    if fx_ret is None:
+        return usd_ret
+    try:
+        return ((1.0 + float(usd_ret) / 100.0) * (1.0 + float(fx_ret) / 100.0) - 1.0) * 100.0
+    except Exception:
+        return None
+
+async def _cedear_metrics(
+    session: ClientSession,
+    symbol: str,
+    fx_metrics: Dict[str, Optional[float]],
+) -> Dict[str, Optional[float]]:
+    local = await _yf_metrics_1y(session, symbol)
+    underlying = cedear_underlying_symbol(symbol)
+    usd_metrics: Dict[str, Optional[float]] = {}
+    if underlying:
+        usd_metrics = await _yf_metrics_1y(session, underlying)
+
+    for horizon in ("1m", "3m", "6m"):
+        usd_val = usd_metrics.get(horizon)
+        fx_val = fx_metrics.get(horizon)
+        local[horizon] = _combine_returns(usd_val, fx_val)
+        local[f"{horizon}_usd"] = usd_val
+        local[f"{horizon}_fx"] = fx_val
+
+    ts_candidates = [v for v in [local.get("last_ts"), usd_metrics.get("last_ts")] if v]
+    if ts_candidates:
+        local["last_ts"] = max(ts_candidates)
+    return local
+
 async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tuple[Dict[str, Dict[str, Optional[float]]], Optional[int]]:
     out = {s: {"6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None, "dd6m": None, "hi52": None,
                "slope50": None, "trend_flag": None, "last_px": None, "prev_px": None, "last_chg": None} for s in symbols}
     sem = asyncio.Semaphore(4)
+    fx_type = "ccl"
+    fx_metrics = await _fx_metrics_series(session, fx_type)
+    if not any(fx_metrics.get(k) for k in ("1m", "3m", "6m")):
+        fx_type = "mep"
+        fx_metrics = await _fx_metrics_series(session, fx_type)
+
     async def work(sym: str):
         async with sem:
             if sym.startswith("FCI-"):
                 out[sym] = await _fci_metrics(session, sym)
             elif sym in BONOS_AR:
                 out[sym] = await _rava_metrics(session, sym)
+            elif sym.upper() in CEDEARS_SET:
+                out[sym] = await _cedear_metrics(session, sym, fx_metrics)
             else:
                 out[sym] = await _yf_metrics_1y(session, sym)
     await asyncio.gather(*(work(s) for s in symbols))
