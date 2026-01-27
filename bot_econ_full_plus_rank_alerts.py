@@ -793,6 +793,13 @@ RESERVAS_CACHE: Dict[str, Any] = {}
 DOLAR_CACHE: Dict[str, Any] = {}
 SHORT_CACHE = ShortCache(default_ttl=45, redis_url=UPSTASH_REDIS_URL, namespace="bot-econ:short")
 CMD_THROTTLER = RateLimiter(redis_url=UPSTASH_REDIS_URL, namespace="bot-econ:throttle")
+PROJ_HISTORY: List[Dict[str, Any]] = []
+PROJ_CALIBRATION: Dict[str, Dict[str, float]] = {}
+PROJ_HORIZON_DAYS = {"3m": 90, "6m": 180}
+PROJ_HISTORY_TOLERANCE_DAYS = 21
+PROJ_HISTORY_MAX_AGE_DAYS = 400
+PROJ_HISTORY_MAX_ENTRIES = 2000
+PROJ_CALIBRATION_MIN_POINTS = 25
 
 
 def invalidate_rankings_cache() -> None:
@@ -817,6 +824,7 @@ def is_throttled(command: str, chat_id: Optional[int], user_id: Optional[int], t
 
 async def load_state():
     global ALERTS, SUBS, PF, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE, RIESGO_CACHE, RESERVAS_CACHE, DOLAR_CACHE
+    global PROJ_HISTORY, PROJ_CALIBRATION
     data: Optional[Dict[str, Any]] = None
     try:
         data = await STATE_STORE.load()
@@ -942,6 +950,12 @@ async def load_state():
         else:
             DOLAR_CACHE = {}
 
+        raw_proj_history = data.get("proj_history")
+        PROJ_HISTORY = _clean_proj_history(raw_proj_history)
+
+        raw_proj_cal = data.get("proj_calibration")
+        PROJ_CALIBRATION = _clean_proj_calibration(raw_proj_cal)
+
         log.info(
             "State loaded (v%s). alerts=%d subs=%d pf=%d",
             version,
@@ -960,8 +974,175 @@ def _prune_news_history(now: Optional[float] = None, window_hours: int = 72) -> 
     NEWS_HISTORY = [(stem, ts) for stem, ts in NEWS_HISTORY if ts >= cutoff]
 
 
+def _clean_proj_history(raw: Any) -> List[Dict[str, Any]]:
+    cleaned: List[Dict[str, Any]] = []
+    if not isinstance(raw, list):
+        return cleaned
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        symbol = entry.get("symbol")
+        horizon = entry.get("horizon")
+        raw_val = entry.get("raw")
+        ts = entry.get("ts")
+        last_px = entry.get("last_px")
+        if not isinstance(symbol, str) or horizon not in PROJ_HORIZON_DAYS:
+            continue
+        try:
+            raw_f = float(raw_val)
+            ts_f = float(ts)
+            last_px_f = float(last_px)
+        except Exception:
+            continue
+        cleaned.append(
+            {
+                "symbol": symbol,
+                "horizon": horizon,
+                "raw": raw_f,
+                "ts": ts_f,
+                "last_px": last_px_f,
+            }
+        )
+    return cleaned
+
+
+def _clean_proj_calibration(raw: Any) -> Dict[str, Dict[str, float]]:
+    cleaned: Dict[str, Dict[str, float]] = {}
+    if not isinstance(raw, dict):
+        return cleaned
+    for horizon, entry in raw.items():
+        if horizon not in PROJ_HORIZON_DAYS or not isinstance(entry, dict):
+            continue
+        try:
+            a = float(entry.get("a"))
+            b = float(entry.get("b"))
+        except Exception:
+            continue
+        cleaned[horizon] = {
+            "a": a,
+            "b": b,
+            "n": float(entry.get("n")) if entry.get("n") is not None else 0.0,
+            "updated_at": float(entry.get("updated_at")) if entry.get("updated_at") is not None else 0.0,
+        }
+    return cleaned
+
+
+def _prune_proj_history(now_ts: Optional[float] = None) -> None:
+    global PROJ_HISTORY
+    ts_now = now_ts if now_ts is not None else time()
+    cutoff = ts_now - (PROJ_HISTORY_MAX_AGE_DAYS * 86400)
+    PROJ_HISTORY = [e for e in PROJ_HISTORY if e.get("ts") is not None and e["ts"] >= cutoff]
+    if len(PROJ_HISTORY) > PROJ_HISTORY_MAX_ENTRIES:
+        PROJ_HISTORY = sorted(PROJ_HISTORY, key=lambda e: e.get("ts", 0.0), reverse=True)[
+            :PROJ_HISTORY_MAX_ENTRIES
+        ]
+
+
+def register_projection_history(symbol: str, horizon: str, raw: float, metrics: Dict[str, Optional[float]]) -> None:
+    if horizon not in PROJ_HORIZON_DAYS:
+        return
+    if not symbol:
+        return
+    last_px = metrics.get("last_px")
+    last_ts = metrics.get("last_ts")
+    if last_px is None or last_ts is None:
+        return
+    try:
+        entry = {
+            "symbol": str(symbol),
+            "horizon": horizon,
+            "raw": float(raw),
+            "ts": float(last_ts),
+            "last_px": float(last_px),
+        }
+    except Exception:
+        return
+    PROJ_HISTORY.append(entry)
+
+
+async def recalibrate_projection_coeffs() -> None:
+    if not PROJ_HISTORY:
+        return
+    now_ts = time()
+    _prune_proj_history(now_ts)
+    by_horizon: Dict[str, List[Dict[str, Any]]] = {h: [] for h in PROJ_HORIZON_DAYS}
+    for entry in PROJ_HISTORY:
+        horizon = entry.get("horizon")
+        if horizon in by_horizon:
+            by_horizon[horizon].append(entry)
+
+    symbols: Set[str] = set()
+    for entries in by_horizon.values():
+        for entry in entries:
+            symbol = entry.get("symbol")
+            if isinstance(symbol, str):
+                symbols.add(symbol)
+
+    if not symbols:
+        return
+
+    async with ClientSession() as session:
+        metrics_map, _ = await metrics_for_symbols(session, sorted(symbols))
+
+    updated = False
+    for horizon, entries in by_horizon.items():
+        horizon_days = PROJ_HORIZON_DAYS[horizon]
+        pairs: List[Tuple[float, float]] = []
+        for entry in entries:
+            symbol = entry.get("symbol")
+            if symbol not in metrics_map:
+                continue
+            metrics = metrics_map[symbol]
+            now_px = metrics.get("last_px")
+            now_ts_entry = metrics.get("last_ts")
+            if now_px is None or now_ts_entry is None:
+                continue
+            entry_ts = entry.get("ts")
+            entry_px = entry.get("last_px")
+            if entry_ts is None or entry_px is None:
+                continue
+            try:
+                age_days = (float(now_ts_entry) - float(entry_ts)) / 86400.0
+            except Exception:
+                continue
+            if age_days < (horizon_days - PROJ_HISTORY_TOLERANCE_DAYS):
+                continue
+            if age_days > (horizon_days + PROJ_HISTORY_TOLERANCE_DAYS):
+                continue
+            try:
+                actual = (float(now_px) / float(entry_px) - 1.0) * 100.0
+                raw_val = float(entry.get("raw"))
+            except Exception:
+                continue
+            pairs.append((raw_val, actual))
+
+        if len(pairs) < PROJ_CALIBRATION_MIN_POINTS:
+            continue
+        mean_x = sum(p[0] for p in pairs) / len(pairs)
+        mean_y = sum(p[1] for p in pairs) / len(pairs)
+        var_x = sum((p[0] - mean_x) ** 2 for p in pairs)
+        if var_x <= 1e-6:
+            b = 1.0
+            a = 0.0
+        else:
+            cov = sum((p[0] - mean_x) * (p[1] - mean_y) for p in pairs)
+            b = cov / var_x
+            a = mean_y - b * mean_x
+        PROJ_CALIBRATION[horizon] = {
+            "a": a,
+            "b": b,
+            "n": float(len(pairs)),
+            "updated_at": now_ts,
+        }
+        updated = True
+
+    if updated:
+        await save_state()
+
+
 async def save_state():
     _prune_news_history()
+    _prune_proj_history()
     payload = serialize_state_payload(
         {
             "alerts": ALERTS,
@@ -974,6 +1155,8 @@ async def save_state():
             "riesgo_cache": RIESGO_CACHE,
             "reservas_cache": RESERVAS_CACHE,
             "dolar_cache": DOLAR_CACHE,
+            "proj_history": PROJ_HISTORY,
+            "proj_calibration": PROJ_CALIBRATION,
         }
     )
     stored = await STATE_STORE.save(payload)
@@ -3870,10 +4053,22 @@ def _expected_daily_return(m: Dict[str, Optional[float]]) -> float:
 
     return mu
 
-def projection_3m(m: Dict[str, Optional[float]]) -> ProjectionRange:
-    return _projection_range(m, 63)
+def calibrate_projection(raw: float, horizon: str) -> float:
+    coeffs = PROJ_CALIBRATION.get(horizon)
+    if not coeffs:
+        return raw
+    try:
+        return coeffs["a"] + coeffs["b"] * raw
+    except Exception:
+        return raw
 
-def projection_6m(m: Dict[str, Optional[float]]) -> ProjectionRange:
+
+def projection_3m_raw(m: Dict[str, Optional[float]]) -> float:
+    mu = _expected_daily_return(m)
+    return (math.exp(mu * 63) - 1.0) * 100.0
+
+
+def projection_6m_raw(m: Dict[str, Optional[float]]) -> float:
     mu = _expected_daily_return(m)
     vol_ann = m.get("vol_ann")
     if vol_ann is not None:
@@ -3883,6 +4078,16 @@ def projection_6m(m: Dict[str, Optional[float]]) -> ProjectionRange:
         except Exception:
             pass
     return _projection_range(m, 126, mu_override=mu)
+
+
+def projection_3m(m: Dict[str, Optional[float]]) -> float:
+    raw = projection_3m_raw(m)
+    return calibrate_projection(raw, "3m")
+
+
+def projection_6m(m: Dict[str, Optional[float]]) -> float:
+    raw = projection_6m_raw(m)
+    return calibrate_projection(raw, "6m")
 
 RET_SERIES_ORDER: List[Tuple[str, str]] = [
     ("6m", "Rend. 6M"),
@@ -3956,19 +4161,22 @@ async def _rank_proj5(
     async with ClientSession() as session:
         mets, last_ts = await metrics_for_symbols_cached(session, symbols)
         fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
-        rows: List[Tuple[str, ProjectionRange, ProjectionRange]] = []
+        rows = []
+        history_added = False
         for sym, m in mets.items():
             if m.get("6m") is None:
                 continue
-            p3 = projection_3m(m)
-            p6 = projection_6m(m)
-            center_6m, _, _ = _projection_bounds(p6)
-            if center_6m is None:
-                continue
-            rows.append((sym, p3, p6))
-        rows.sort(key=lambda x: (_projection_bounds(x[2])[0] or -1e9), reverse=True)
+            raw3 = projection_3m_raw(m)
+            raw6 = projection_6m_raw(m)
+            register_projection_history(sym, "3m", raw3, m)
+            register_projection_history(sym, "6m", raw6, m)
+            history_added = True
+            rows.append((sym, calibrate_projection(raw3, "3m"), calibrate_projection(raw6, "6m")))
+        rows.sort(key=lambda x: x[2], reverse=True)
         top_rows = rows[: RANK_PROJ_LIMIT]
         msg = format_proj_dual(title, fecha, top_rows)
+        if history_added:
+            asyncio.create_task(save_state())
         await update.effective_message.reply_text(
             msg,
             parse_mode=ParseMode.HTML,
@@ -6426,6 +6634,22 @@ def _schedule_all_subs(app: Application):
         hhmm = conf.get("daily")
         if hhmm: _schedule_daily_for_chat(app, chat_id, hhmm)
 
+
+async def _job_recalibrate_projections(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await recalibrate_projection_coeffs()
+
+
+def _schedule_projection_calibration(app: Application) -> None:
+    job_name = "proj_calibration_weekly"
+    for j in app.job_queue.get_jobs_by_name(job_name):
+        j.schedule_removal()
+    app.job_queue.run_repeating(
+        _job_recalibrate_projections,
+        interval=7 * 24 * 3600,
+        first=3600,
+        name=job_name,
+    )
+
 def kb_times_full() -> InlineKeyboardMarkup:
     rows, row = [], []
     rows.append([("📃 Ver resumen ahora", "SUBS:NOW")])
@@ -8177,30 +8401,25 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     w6_low = 0.0
     w6_high = 0.0
     detail: List[str] = []
-    per_instrument_points: List[Tuple[str, ProjectionRange, ProjectionRange]] = []
+    per_instrument_points: List[Tuple[str, Optional[float], Optional[float]]] = []
+    history_added = False
     for entry in snapshot:
         metrics = entry.get("metrics") or {}
         weight = float(entry.get("peso") or 0.0)
         if not metrics:
             continue
 
-        p3 = projection_3m(metrics)
-        p6 = projection_6m(metrics)
-        c3, l3, h3 = _projection_bounds(p3)
-        c6, l6, h6 = _projection_bounds(p6)
-        c3 = c3 if c3 is not None else 0.0
-        c6 = c6 if c6 is not None else 0.0
-        l3 = l3 if l3 is not None else c3
-        h3 = h3 if h3 is not None else c3
-        l6 = l6 if l6 is not None else c6
-        h6 = h6 if h6 is not None else c6
-
-        w3 += weight * c3
-        w6 += weight * c6
-        w3_low += weight * l3
-        w3_high += weight * h3
-        w6_low += weight * l6
-        w6_high += weight * h6
+        raw3 = projection_3m_raw(metrics)
+        raw6 = projection_6m_raw(metrics)
+        symbol = entry.get("symbol")
+        if symbol:
+            register_projection_history(symbol, "3m", raw3, metrics)
+            register_projection_history(symbol, "6m", raw6, metrics)
+            history_added = True
+        p3 = calibrate_projection(raw3, "3m")
+        p6 = calibrate_projection(raw6, "6m")
+        w3 += weight * p3
+        w6 += weight * p6
 
         short_label = _label_short(entry["symbol"]) if entry.get("symbol") else entry["label"]
         per_instrument_points.append((short_label, p3, p6))
@@ -8274,6 +8493,8 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         lines.append("ℹ️ Instalá matplotlib para ver la proyección en gráficos.")
 
     await _send_below_menu(context, chat_id, text="\n".join(lines))
+    if history_added:
+        asyncio.create_task(save_state())
 
     img = _projection_bar_image(
         [
@@ -8518,6 +8739,7 @@ async def main():
     await load_state()
     application = build_application()
     _schedule_all_subs(application)
+    _schedule_projection_calibration(application)
 
     alerts_task = None
     keepalive_task = None
