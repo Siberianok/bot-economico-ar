@@ -15,6 +15,7 @@ import httpx
 import certifi
 
 from bot.config import config
+from bot.constants import WINDOW_DAYS, WINDOW_MONTHS
 from bot.services.cache import RateLimiter, ShortCache
 from bot.services.http import SourceSuspendedError, http_service
 
@@ -284,14 +285,11 @@ def _fci_metrics_from_series(symbol: str) -> Dict[str, Optional[float]]:
         base["prev_px"] = prev_val
         base["last_chg"] = (last_val / prev_val - 1.0) * 100.0
 
-    window_1m = 21
-    window_3m = 63
-    window_6m = 126
-    for label, window in (("6m", window_6m), ("3m", window_3m), ("1m", window_1m)):
+    window_map = {f"{months}m": WINDOW_DAYS[months] for months in WINDOW_MONTHS}
+    for label in ("6m", "3m", "1m"):
+        window = window_map[label]
         if len(series) >= window:
             ref = float(series[-window][1])
-        elif series:
-            ref = float(series[0][1])
         else:
             ref = None
         if ref and ref > 0:
@@ -812,7 +810,7 @@ CMD_THROTTLER = RateLimiter(redis_url=UPSTASH_REDIS_URL, namespace="bot-econ:thr
 PROJ_HISTORY: List[Dict[str, Any]] = []
 PROJ_CALIBRATION: Dict[str, Dict[str, float]] = {}
 PROJ_HORIZON_DAYS = {"3m": 90, "6m": 180}
-PROJ_HISTORY_TOLERANCE_DAYS = 21
+PROJ_HISTORY_TOLERANCE_DAYS = WINDOW_DAYS[1]
 PROJ_HISTORY_MAX_AGE_DAYS = 400
 PROJ_HISTORY_MAX_ENTRIES = 2000
 PROJ_CALIBRATION_MIN_POINTS = 25
@@ -2554,22 +2552,13 @@ def _metrics_from_rava_history(history: List[Dict[str, Any]]) -> Dict[str, Optio
     last = closes[-1]
     prev = closes[-2] if len(closes) >= 2 else None
 
-    window_1m = 21
-    window_3m = 63
-    window_6m = 126
+    window_1m = WINDOW_DAYS[1]
+    window_3m = WINDOW_DAYS[3]
+    window_6m = WINDOW_DAYS[6]
 
-    if len(closes) >= window_6m:
-        base6 = closes[-window_6m]
-    else:
-        base6 = closes[0] if closes else None
-    if len(closes) >= window_3m:
-        base3 = closes[-window_3m]
-    else:
-        base3 = closes[0] if closes else None
-    if len(closes) >= window_1m:
-        base1 = closes[-window_1m]
-    else:
-        base1 = closes[0] if closes else None
+    base6 = closes[-window_6m] if len(closes) >= window_6m else None
+    base3 = closes[-window_3m] if len(closes) >= window_3m else None
+    base1 = closes[-window_1m] if len(closes) >= window_1m else None
     ret6 = ((last / base6) - 1.0) * 100.0 if base6 else None
     ret3 = ((last / base3) - 1.0) * 100.0 if base3 else None
     ret1 = ((last / base1) - 1.0) * 100.0 if base1 else None
@@ -2592,7 +2581,7 @@ def _metrics_from_rava_history(history: List[Dict[str, Any]]) -> Dict[str, Optio
 
     # drawdown últimos 6 meses
     day = 24 * 3600
-    t6 = last_ts - 180 * day
+    t6 = last_ts - WINDOW_DAYS[6] * day
     idx_cut = next((i for i, t in enumerate(ts) if t >= t6), 0)
     peak = closes[idx_cut]
     dd_min = 0.0
@@ -2622,9 +2611,10 @@ def _metrics_from_rava_history(history: List[Dict[str, Any]]) -> Dict[str, Optio
     sma50 = _sma(closes, 50)
     sma200 = _sma(closes, 200)
     slope50 = None
-    if sma50[-1] is not None and len(closes) > 20 and sma50[-21] is not None:
+    slope_window = WINDOW_DAYS[1]
+    if sma50[-1] is not None and len(closes) > (slope_window - 1) and sma50[-slope_window] is not None:
         try:
-            slope50 = ((sma50[-1] / sma50[-21]) - 1.0) * 100.0
+            slope50 = ((sma50[-1] / sma50[-slope_window]) - 1.0) * 100.0
         except Exception:
             slope50 = None
     trend_flag = None
@@ -2744,7 +2734,7 @@ async def _yf_chart_1y(session: ClientSession, symbol: str, interval: str) -> Op
             continue
     return None
 
-def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[float]]]:
+def _metrics_from_chart(res: Dict[str, Any], symbol: Optional[str] = None) -> Optional[Dict[str, Optional[float]]]:
     try:
         ts = res["timestamp"]; closes_raw = res["indicators"]["adjclose"][0]["adjclose"]
         pairs = [(t,c) for t,c in zip(ts, closes_raw) if (t is not None and c is not None)]
@@ -2753,6 +2743,13 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         idx_last = len(closes)-1; last = closes[idx_last]; t_last = ts[idx_last]
         prev = closes[idx_last-1] if idx_last >= 1 else None
         last_chg = ((last/prev - 1.0)*100.0) if (prev is not None and prev > 0) else None
+        if symbol and len(closes) < WINDOW_DAYS[6]:
+            log.warning(
+                "YF series corta para %s: %s ruedas (min %s)",
+                symbol,
+                len(closes),
+                WINDOW_DAYS[6],
+            )
 
         # Retornos close-to-close por ruedas desde el último cierre.
         window_1m = 21
@@ -2828,8 +2825,8 @@ def _validate_interval_independence() -> None:
         closes = [100.0 + 0.1 * ((t - base) / 86400.0) for t in timestamps]
         return {"timestamp": timestamps, "indicators": {"adjclose": [{"adjclose": closes}]}}
 
-    daily = _metrics_from_chart(_build_res(daily_ts))
-    weekly = _metrics_from_chart(_build_res(weekly_ts))
+    daily = _metrics_from_chart(_build_res(daily_ts), symbol="__validation_daily__")
+    weekly = _metrics_from_chart(_build_res(weekly_ts), symbol="__validation_weekly__")
     if not daily or not weekly:
         log.warning("Validación intervalos: métricas no disponibles.")
         return
@@ -2848,7 +2845,7 @@ async def _yf_metrics_1y(session: ClientSession, symbol: str) -> Dict[str, Optio
     for interval in ("1d", "1wk"):
         res = await _yf_chart_1y(session, symbol, interval)
         if res:
-            m = _metrics_from_chart(res)
+            m = _metrics_from_chart(res, symbol=symbol)
             if m: out.update(m); break
     return out
 
@@ -4179,7 +4176,7 @@ def format_top3_table(
 
 ProjectionRange = Tuple[Optional[float], Optional[float], Optional[float]]
 PROJ_RANGE_SHRINK = 0.6
-PROJ_RANGE_LIMITS = {63: (-50.0, 80.0), 126: (-70.0, 120.0)}
+PROJ_RANGE_LIMITS = {WINDOW_DAYS[3]: (-50.0, 80.0), WINDOW_DAYS[6]: (-70.0, 120.0)}
 PROJ_RANGE_PCTL = 0.674
 
 def _format_projection_range(proj: ProjectionRange, nd: int = 1) -> str:
@@ -4214,9 +4211,10 @@ def _projection_percentile(values: List[float], percentile: float) -> Optional[f
 
 
 def _projection_recent_samples(m: Dict[str, Optional[float]], horizon_days: int) -> List[float]:
-    horizon_months = max(1, round(horizon_days / 21))
+    horizon_months = max(1, round(horizon_days / WINDOW_DAYS[1]))
     samples: List[float] = []
-    for months, key in ((1, "1m"), (3, "3m"), (6, "6m")):
+    for months in WINDOW_MONTHS:
+        key = f"{months}m"
         val = m.get(key)
         if val is None:
             continue
@@ -4316,12 +4314,17 @@ def _nz(x: Optional[float], fb: float) -> float: return float(x) if x is not Non
 
 def _expected_daily_return(m: Dict[str, Optional[float]]) -> float:
     components: List[Tuple[float, float]] = []
-    for months, key, weight in ((1, "1m", 0.5), (3, "3m", 0.3), (6, "6m", 0.2)):
+    weights = {1: 0.5, 3: 0.3, 6: 0.2}
+    for months in WINDOW_MONTHS:
+        key = f"{months}m"
+        weight = weights.get(months, 0.0)
+        if weight <= 0:
+            continue
         val = m.get(key)
         if val is None:
             continue
         try:
-            lr = math.log1p(float(val) / 100.0) / (21 * months)
+            lr = math.log1p(float(val) / 100.0) / WINDOW_DAYS[months]
             components.append((lr, weight))
         except Exception:
             continue
@@ -4383,7 +4386,7 @@ def calibrate_projection(raw: float, horizon: str) -> float:
 
 def projection_3m_raw(m: Dict[str, Optional[float]]) -> float:
     mu = _expected_daily_return(m)
-    return (math.exp(mu * 63) - 1.0) * 100.0
+    return (math.exp(mu * WINDOW_DAYS[3]) - 1.0) * 100.0
 
 
 def projection_6m_raw(m: Dict[str, Optional[float]]) -> float:
@@ -4395,19 +4398,19 @@ def projection_6m_raw(m: Dict[str, Optional[float]]) -> float:
             mu -= penalty
         except Exception:
             pass
-    return (math.exp(mu * 126) - 1.0) * 100.0
+    return (math.exp(mu * WINDOW_DAYS[6]) - 1.0) * 100.0
 
 
 def projection_3m(m: Dict[str, Optional[float]]) -> ProjectionRange:
     raw = projection_3m_raw(m)
     center = calibrate_projection(raw, "3m")
-    return _projection_range_from_center(center, m, 63)
+    return _projection_range_from_center(center, m, WINDOW_DAYS[3])
 
 
 def projection_6m(m: Dict[str, Optional[float]]) -> ProjectionRange:
     raw = projection_6m_raw(m)
     center = calibrate_projection(raw, "6m")
-    return _projection_range_from_center(center, m, 126)
+    return _projection_range_from_center(center, m, WINDOW_DAYS[6])
 
 
 def _format_projection_date(ts: float) -> str:
@@ -4459,7 +4462,7 @@ def _record_projection_batch_from_rank(
         projections_6m[sym] = float(c6)
     if not base_prices:
         return False
-    for horizon, projections in ((63, projections_3m), (126, projections_6m)):
+    for horizon, projections in ((WINDOW_DAYS[3], projections_3m), (WINDOW_DAYS[6], projections_6m)):
         if not projections:
             continue
         batch_id = _build_projection_batch_id(horizon, created_at)
@@ -9229,12 +9232,15 @@ async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not evaluated:
         await update.effective_message.reply_text("Sin métricas de performance todavía.")
         return
-    batches_3m = [b for b in evaluated if b.get("horizon") == 63]
-    batches_6m = [b for b in evaluated if b.get("horizon") == 126]
+    batches_3m = [b for b in evaluated if b.get("horizon") == WINDOW_DAYS[3]]
+    batches_6m = [b for b in evaluated if b.get("horizon") == WINDOW_DAYS[6]]
     summary_3m = _summarize_projection_performance(batches_3m)
     summary_6m = _summarize_projection_performance(batches_6m)
     lines = ["<b>📊 Performance de Proyecciones</b>"]
-    for label, summary in (("3M (63 ruedas)", summary_3m), ("6M (126 ruedas)", summary_6m)):
+    for label, summary in (
+        (f"3M ({WINDOW_DAYS[3]} ruedas)", summary_3m),
+        (f"6M ({WINDOW_DAYS[6]} ruedas)", summary_6m),
+    ):
         if summary.get("count"):
             lines.append(
                 f"• {label}: MAE {pct_plain(summary.get('mae'), 2)}"
@@ -9319,8 +9325,8 @@ def setup_health_routes(application: Application) -> None:
 
     async def _performance(_: web.Request) -> web.Response:
         evaluated = [b for b in PROJECTION_BATCHES if b.get("evaluated")]
-        batches_3m = [b for b in evaluated if b.get("horizon") == 63]
-        batches_6m = [b for b in evaluated if b.get("horizon") == 126]
+        batches_3m = [b for b in evaluated if b.get("horizon") == WINDOW_DAYS[3]]
+        batches_6m = [b for b in evaluated if b.get("horizon") == WINDOW_DAYS[6]]
         return web.json_response(
             {
                 "summary": {
