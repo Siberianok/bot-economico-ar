@@ -280,15 +280,16 @@ def _fci_metrics_from_series(symbol: str) -> Dict[str, Optional[float]]:
         base["prev_px"] = prev_val
         base["last_chg"] = (last_val / prev_val - 1.0) * 100.0
 
-    def _value_on_or_after(target_ts: int) -> Optional[float]:
-        for ts, value in series:
-            if ts >= target_ts:
-                return float(value)
-        return float(series[0][1]) if series else None
-
-    day = 24 * 3600
-    for label, days in (("6m", 180), ("3m", 90), ("1m", 30)):
-        ref = _value_on_or_after(last_ts - days * day)
+    window_1m = 21
+    window_3m = 63
+    window_6m = 126
+    for label, window in (("6m", window_6m), ("3m", window_3m), ("1m", window_1m)):
+        if len(series) >= window:
+            ref = float(series[-window][1])
+        elif series:
+            ref = float(series[0][1])
+        else:
+            ref = None
         if ref and ref > 0:
             base[label] = (last_val / ref - 1.0) * 100.0
 
@@ -305,6 +306,7 @@ def _fci_metrics_from_series(symbol: str) -> Dict[str, Optional[float]]:
                 var = sum((r - mu) ** 2 for r in window_sample) / (len(window_sample) - 1)
                 base["vol_ann"] = math.sqrt(max(var, 0.0)) * math.sqrt(252) * 100.0
 
+        day = 24 * 3600
         look_back_ts = last_ts - 180 * day
         peak = closes[0]
         dd_min = 0.0
@@ -2255,19 +2257,22 @@ def _metrics_from_rava_history(history: List[Dict[str, Any]]) -> Dict[str, Optio
     last = closes[-1]
     prev = closes[-2] if len(closes) >= 2 else None
 
-    def _first_on_or_after(target: int) -> float:
-        for t, value in points:
-            if t >= target:
-                return value
-        return points[0][1]
+    window_1m = 21
+    window_3m = 63
+    window_6m = 126
 
-    day = 24 * 3600
-    t6 = last_ts - 180 * day
-    t3 = last_ts - 90 * day
-    t1 = last_ts - 30 * day
-    base6 = _first_on_or_after(t6)
-    base3 = _first_on_or_after(t3)
-    base1 = _first_on_or_after(t1)
+    if len(closes) >= window_6m:
+        base6 = closes[-window_6m]
+    else:
+        base6 = closes[0] if closes else None
+    if len(closes) >= window_3m:
+        base3 = closes[-window_3m]
+    else:
+        base3 = closes[0] if closes else None
+    if len(closes) >= window_1m:
+        base1 = closes[-window_1m]
+    else:
+        base1 = closes[0] if closes else None
     ret6 = ((last / base6) - 1.0) * 100.0 if base6 else None
     ret3 = ((last / base3) - 1.0) * 100.0 if base3 else None
     ret1 = ((last / base1) - 1.0) * 100.0 if base1 else None
@@ -2289,6 +2294,8 @@ def _metrics_from_rava_history(history: List[Dict[str, Any]]) -> Dict[str, Optio
         vol_ann = math.sqrt(var) * math.sqrt(252) * 100.0
 
     # drawdown últimos 6 meses
+    day = 24 * 3600
+    t6 = last_ts - 180 * day
     idx_cut = next((i for i, t in enumerate(ts) if t >= t6), 0)
     peak = closes[idx_cut]
     dd_min = 0.0
