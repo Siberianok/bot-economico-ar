@@ -280,17 +280,26 @@ def _fci_metrics_from_series(symbol: str) -> Dict[str, Optional[float]]:
         base["prev_px"] = prev_val
         base["last_chg"] = (last_val / prev_val - 1.0) * 100.0
 
-    def _value_on_or_after(target_ts: int) -> Optional[float]:
+    def _value_on_or_after(target_ts: int) -> Tuple[Optional[int], Optional[float]]:
         for ts, value in series:
             if ts >= target_ts:
-                return float(value)
-        return float(series[0][1]) if series else None
+                return ts, float(value)
+        return (series[0][0], float(series[0][1])) if series else (None, None)
 
     day = 24 * 3600
     for label, days in (("6m", 180), ("3m", 90), ("1m", 30)):
-        ref = _value_on_or_after(last_ts - days * day)
-        if ref and ref > 0:
-            base[label] = (last_val / ref - 1.0) * 100.0
+        base_ts, base_px = _value_on_or_after(last_ts - days * day)
+        if base_px and base_px > 0:
+            base[label] = (last_val / base_px - 1.0) * 100.0
+        if base_ts is not None and base_px is not None:
+            log.debug(
+                "fci_ret_%s fecha_base=%s precio_base=%s fecha_final=%s precio_final=%s",
+                label,
+                datetime.fromtimestamp(base_ts, tz=TZ).isoformat(),
+                base_px,
+                datetime.fromtimestamp(last_ts, tz=TZ).isoformat(),
+                last_val,
+            )
 
     closes = [float(val) for _, val in series]
     if len(closes) >= 2:
@@ -2255,22 +2264,43 @@ def _metrics_from_rava_history(history: List[Dict[str, Any]]) -> Dict[str, Optio
     last = closes[-1]
     prev = closes[-2] if len(closes) >= 2 else None
 
-    def _first_on_or_after(target: int) -> float:
+    def _first_on_or_after(target: int) -> Tuple[int, float]:
         for t, value in points:
             if t >= target:
-                return value
-        return points[0][1]
+                return t, value
+        return points[0]
 
     day = 24 * 3600
     t6 = last_ts - 180 * day
     t3 = last_ts - 90 * day
     t1 = last_ts - 30 * day
-    base6 = _first_on_or_after(t6)
-    base3 = _first_on_or_after(t3)
-    base1 = _first_on_or_after(t1)
-    ret6 = ((last / base6) - 1.0) * 100.0 if base6 else None
-    ret3 = ((last / base3) - 1.0) * 100.0 if base3 else None
-    ret1 = ((last / base1) - 1.0) * 100.0 if base1 else None
+    base_ts_6m, base_px_6m = _first_on_or_after(t6)
+    base_ts_3m, base_px_3m = _first_on_or_after(t3)
+    base_ts_1m, base_px_1m = _first_on_or_after(t1)
+    ret6 = ((last / base_px_6m) - 1.0) * 100.0 if base_px_6m else None
+    ret3 = ((last / base_px_3m) - 1.0) * 100.0 if base_px_3m else None
+    ret1 = ((last / base_px_1m) - 1.0) * 100.0 if base_px_1m else None
+    log.debug(
+        "rava_ret_6m fecha_base=%s precio_base=%s fecha_final=%s precio_final=%s",
+        datetime.fromtimestamp(base_ts_6m, tz=TZ).isoformat(),
+        base_px_6m,
+        datetime.fromtimestamp(last_ts, tz=TZ).isoformat(),
+        last,
+    )
+    log.debug(
+        "rava_ret_3m fecha_base=%s precio_base=%s fecha_final=%s precio_final=%s",
+        datetime.fromtimestamp(base_ts_3m, tz=TZ).isoformat(),
+        base_px_3m,
+        datetime.fromtimestamp(last_ts, tz=TZ).isoformat(),
+        last,
+    )
+    log.debug(
+        "rava_ret_1m fecha_base=%s precio_base=%s fecha_final=%s precio_final=%s",
+        datetime.fromtimestamp(base_ts_1m, tz=TZ).isoformat(),
+        base_px_1m,
+        datetime.fromtimestamp(last_ts, tz=TZ).isoformat(),
+        last,
+    )
 
     # volatilidad anualizada
     daily_returns: List[float] = []
@@ -2452,14 +2482,38 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
 
         def first_on_or_after(tcut):
             for i, t in enumerate(ts):
-                if t >= tcut: return closes[i]
-            return closes[0]
+                if t >= tcut:
+                    return ts[i], closes[i]
+            return ts[0], closes[0]
 
         t6 = t_last - 180*24*3600; t3 = t_last - 90*24*3600; t1 = t_last - 30*24*3600
-        base6 = first_on_or_after(t6); base3 = first_on_or_after(t3); base1 = first_on_or_after(t1)
-        ret6 = (last/base6 - 1.0)*100.0 if base6 else None
-        ret3 = (last/base3 - 1.0)*100.0 if base3 else None
-        ret1 = (last/base1 - 1.0)*100.0 if base1 else None
+        base_ts_6m, base_px_6m = first_on_or_after(t6)
+        base_ts_3m, base_px_3m = first_on_or_after(t3)
+        base_ts_1m, base_px_1m = first_on_or_after(t1)
+        ret6 = (last/base_px_6m - 1.0)*100.0 if base_px_6m else None
+        ret3 = (last/base_px_3m - 1.0)*100.0 if base_px_3m else None
+        ret1 = (last/base_px_1m - 1.0)*100.0 if base_px_1m else None
+        log.debug(
+            "yf_ret_6m fecha_base=%s precio_base=%s fecha_final=%s precio_final=%s",
+            datetime.fromtimestamp(base_ts_6m, tz=TZ).isoformat(),
+            base_px_6m,
+            datetime.fromtimestamp(t_last, tz=TZ).isoformat(),
+            last,
+        )
+        log.debug(
+            "yf_ret_3m fecha_base=%s precio_base=%s fecha_final=%s precio_final=%s",
+            datetime.fromtimestamp(base_ts_3m, tz=TZ).isoformat(),
+            base_px_3m,
+            datetime.fromtimestamp(t_last, tz=TZ).isoformat(),
+            last,
+        )
+        log.debug(
+            "yf_ret_1m fecha_base=%s precio_base=%s fecha_final=%s precio_final=%s",
+            datetime.fromtimestamp(base_ts_1m, tz=TZ).isoformat(),
+            base_px_1m,
+            datetime.fromtimestamp(t_last, tz=TZ).isoformat(),
+            last,
+        )
 
         rets_d = []
         for i in range(1, len(closes)):
