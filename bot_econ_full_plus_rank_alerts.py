@@ -7,7 +7,6 @@ import urllib.request
 import urllib.error
 from time import time
 from math import sqrt, floor
-from bisect import bisect_left
 from datetime import datetime, timedelta, time as dtime, date
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable, Iterable
@@ -2755,31 +2754,22 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         prev = closes[idx_last-1] if idx_last >= 1 else None
         last_chg = ((last/prev - 1.0)*100.0) if (prev is not None and prev > 0) else None
 
-        def _closest_index(ts_vals: List[int], target: int) -> int:
-            if not ts_vals:
-                return 0
-            pos = bisect_left(ts_vals, target)
-            if pos <= 0:
-                return 0
-            if pos >= len(ts_vals):
-                return len(ts_vals) - 1
-            before = pos - 1
-            after = pos
-            if abs(ts_vals[after] - target) < abs(ts_vals[before] - target):
-                return after
-            return before
+        # Retornos close-to-close por ruedas desde el último cierre.
+        window_1m = 21
+        window_3m = 63
+        window_6m = 126
 
-        # Retornos close-to-close por tiempo calendario desde el último cierre.
-        t6 = t_last - 180*24*3600; t3 = t_last - 90*24*3600; t1 = t_last - 30*24*3600
-        idx_1m = _closest_index(ts, t1)
-        idx_3m = _closest_index(ts, t3)
-        idx_6m = _closest_index(ts, t6)
-        base1 = closes[idx_1m] if idx_1m is not None else None
-        base3 = closes[idx_3m] if idx_3m is not None else None
-        base6 = closes[idx_6m] if idx_6m is not None else None
-        ret1 = (last/base1 - 1.0)*100.0 if base1 else None
-        ret3 = (last/base3 - 1.0)*100.0 if base3 else None
-        ret6 = (last/base6 - 1.0)*100.0 if base6 else None
+        def _window_base(values: List[float], window: int) -> Optional[float]:
+            if len(values) >= window:
+                return values[-window]
+            return None
+
+        base1 = _window_base(closes, window_1m)
+        base3 = _window_base(closes, window_3m)
+        base6 = _window_base(closes, window_6m)
+        ret1 = (last / base1 - 1.0) * 100.0 if base1 else None
+        ret3 = (last / base3 - 1.0) * 100.0 if base3 else None
+        ret6 = (last / base6 - 1.0) * 100.0 if base6 else None
 
         rets_d = []
         for i in range(1, len(closes)):
@@ -2792,7 +2782,8 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
             var = sum((r-mu)**2 for r in rets_d[-look:])/(len(rets_d[-look:])-1) if len(rets_d[-look:])>1 else 0.0
             sd = sqrt(var); vol_ann = sd*sqrt(252)*100.0
 
-        idx_cut = next((i for i,t in enumerate(ts) if t >= t6), 0)
+        t6 = t_last - 180 * 24 * 3600
+        idx_cut = next((i for i, t in enumerate(ts) if t >= t6), 0)
         peak = closes[idx_cut]; dd_min = 0.0
         for v in closes[idx_cut:]:
             if v > peak: peak = v
