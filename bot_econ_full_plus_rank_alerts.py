@@ -2450,16 +2450,14 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         prev = closes[idx_last-1] if idx_last >= 1 else None
         last_chg = ((last/prev - 1.0)*100.0) if (prev is not None and prev > 0) else None
 
-        def first_on_or_after(tcut):
-            for i, t in enumerate(ts):
-                if t >= tcut: return closes[i]
-            return closes[0]
-
+        # Retornos close-to-close por ruedas desde el último cierre (21/63/126).
         t6 = t_last - 180*24*3600; t3 = t_last - 90*24*3600; t1 = t_last - 30*24*3600
-        base6 = first_on_or_after(t6); base3 = first_on_or_after(t3); base1 = first_on_or_after(t1)
-        ret6 = (last/base6 - 1.0)*100.0 if base6 else None
-        ret3 = (last/base3 - 1.0)*100.0 if base3 else None
+        base1 = closes[idx_last-21] if idx_last >= 21 else None
+        base3 = closes[idx_last-63] if idx_last >= 63 else None
+        base6 = closes[idx_last-126] if idx_last >= 126 else None
         ret1 = (last/base1 - 1.0)*100.0 if base1 else None
+        ret3 = (last/base3 - 1.0)*100.0 if base3 else None
+        ret6 = (last/base6 - 1.0)*100.0 if base6 else None
 
         rets_d = []
         for i in range(1, len(closes)):
