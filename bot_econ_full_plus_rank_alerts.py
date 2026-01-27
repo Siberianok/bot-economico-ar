@@ -7,6 +7,7 @@ import urllib.request
 import urllib.error
 from time import time
 from math import sqrt, floor
+from bisect import bisect_left
 from datetime import datetime, timedelta, time as dtime, date
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Tuple, Any, Optional, Set, Callable, Awaitable, Iterable
@@ -2754,11 +2755,28 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
         prev = closes[idx_last-1] if idx_last >= 1 else None
         last_chg = ((last/prev - 1.0)*100.0) if (prev is not None and prev > 0) else None
 
-        # Retornos close-to-close por ruedas desde el último cierre (21/63/126).
+        def _closest_index(ts_vals: List[int], target: int) -> int:
+            if not ts_vals:
+                return 0
+            pos = bisect_left(ts_vals, target)
+            if pos <= 0:
+                return 0
+            if pos >= len(ts_vals):
+                return len(ts_vals) - 1
+            before = pos - 1
+            after = pos
+            if abs(ts_vals[after] - target) < abs(ts_vals[before] - target):
+                return after
+            return before
+
+        # Retornos close-to-close por tiempo calendario desde el último cierre.
         t6 = t_last - 180*24*3600; t3 = t_last - 90*24*3600; t1 = t_last - 30*24*3600
-        base1 = closes[idx_last-21] if idx_last >= 21 else None
-        base3 = closes[idx_last-63] if idx_last >= 63 else None
-        base6 = closes[idx_last-126] if idx_last >= 126 else None
+        idx_1m = _closest_index(ts, t1)
+        idx_3m = _closest_index(ts, t3)
+        idx_6m = _closest_index(ts, t6)
+        base1 = closes[idx_1m] if idx_1m is not None else None
+        base3 = closes[idx_3m] if idx_3m is not None else None
+        base6 = closes[idx_6m] if idx_6m is not None else None
         ret1 = (last/base1 - 1.0)*100.0 if base1 else None
         ret3 = (last/base3 - 1.0)*100.0 if base3 else None
         ret6 = (last/base6 - 1.0)*100.0 if base6 else None
@@ -2802,9 +2820,40 @@ def _metrics_from_chart(res: Dict[str, Any]) -> Optional[Dict[str, Optional[floa
     except Exception:
         return None
 
+_INTERVAL_VALIDATED = False
+
+def _validate_interval_independence() -> None:
+    global _INTERVAL_VALIDATED
+    if _INTERVAL_VALIDATED or os.getenv("YF_VALIDATE_INTERVAL") != "1":
+        return
+    _INTERVAL_VALIDATED = True
+    start = datetime(2024, 1, 1, tzinfo=TZ)
+    days = 240
+    daily_ts = [int((start + timedelta(days=i)).timestamp()) for i in range(days)]
+    weekly_ts = [daily_ts[i] for i in range(0, days, 7)]
+
+    def _build_res(timestamps: List[int]) -> Dict[str, Any]:
+        base = timestamps[0]
+        closes = [100.0 + 0.1 * ((t - base) / 86400.0) for t in timestamps]
+        return {"timestamp": timestamps, "indicators": {"adjclose": [{"adjclose": closes}]}}
+
+    daily = _metrics_from_chart(_build_res(daily_ts))
+    weekly = _metrics_from_chart(_build_res(weekly_ts))
+    if not daily or not weekly:
+        log.warning("Validación intervalos: métricas no disponibles.")
+        return
+    for horizon in ("1m", "3m", "6m"):
+        d_val = daily.get(horizon)
+        w_val = weekly.get(horizon)
+        if d_val is None or w_val is None:
+            continue
+        if abs(d_val - w_val) > 0.75:
+            log.warning("Validación intervalos: %s diff=%.3f", horizon, abs(d_val - w_val))
+
 async def _yf_metrics_1y(session: ClientSession, symbol: str) -> Dict[str, Optional[float]]:
     out = {"6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None, "dd6m": None, "hi52": None, "slope50": None,
            "trend_flag": None, "last_px": None, "prev_px": None, "last_chg": None}
+    _validate_interval_independence()
     for interval in ("1d", "1wk"):
         res = await _yf_chart_1y(session, symbol, interval)
         if res:
