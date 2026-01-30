@@ -1868,6 +1868,10 @@ FX_DOLARAPI_PATHS = {
     "mep": "/dolares/bolsa",
     "ccl": "/dolares/contadoconliqui",
 }
+FX_YAHOO_FALLBACK = {
+    "mep": "USDARS=X",
+    "ccl": "USDARS=X",
+}
 
 def _pick_fx_value(compra: Optional[float], venta: Optional[float]) -> Optional[float]:
     if venta is not None:
@@ -1954,7 +1958,25 @@ async def _fx_metrics_series(
         prev_val = await _fx_value_at(session, fx_type, today - timedelta(days=days))
         if prev_val and prev_val > 0:
             out[key] = (cur_val / prev_val - 1.0) * 100.0
+    if _fx_returns_look_empty(out):
+        fallback_symbol = FX_YAHOO_FALLBACK.get(fx_type)
+        if fallback_symbol:
+            fallback = await _yf_metrics_1y(session, fallback_symbol)
+            if fallback:
+                for horizon in ("1m", "3m", "6m"):
+                    if fallback.get(horizon) is not None:
+                        out[horizon] = fallback.get(horizon)
+                for key in ("last_ts", "last_px", "prev_px", "last_chg"):
+                    if fallback.get(key) is not None:
+                        out[key] = fallback.get(key)
     return out
+
+def _fx_returns_look_empty(metrics: Dict[str, Optional[float]]) -> bool:
+    values = [metrics.get("1m"), metrics.get("3m"), metrics.get("6m")]
+    if not any(v is not None for v in values):
+        return True
+    non_zero = [v for v in values if v is not None and abs(float(v)) > 0.01]
+    return len(non_zero) == 0
 
 async def get_tc_value(session: ClientSession, tc_name: Optional[str]) -> Optional[float]:
     if not tc_name: return None
