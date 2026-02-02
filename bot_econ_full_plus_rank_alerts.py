@@ -5444,6 +5444,7 @@ ALERTS_SILENT_UNTIL: Dict[int, float] = {}
 ALERTS_PAUSED: Set[int] = set()
 ALERT_PRICE_TOLERANCE_PCT = 0.002  # 0.2% de margen alrededor del umbral
 ALERT_PRICE_TOLERANCE_ABS = 0.0005  # margen mínimo absoluto para precios muy bajos
+ALERT_REARM_COOLDOWN_SECS = 15 * 60
 
 
 def _float_equals(a: Any, b: Any, abs_tol: float = 1e-6) -> bool:
@@ -5466,6 +5467,60 @@ def _matches_with_tolerance(cur: Any, target: Any, op: str) -> bool:
     if op in (">", "<"):
         return target_f - margin <= cur_f <= target_f + margin
     return False
+
+
+def _alert_rearm_ready(cur: Any, target: Any, op: str) -> bool:
+    try:
+        cur_f = float(cur)
+        target_f = float(target)
+    except Exception:
+        return False
+    margin = max(abs(target_f) * ALERT_PRICE_TOLERANCE_PCT, ALERT_PRICE_TOLERANCE_ABS)
+    if op == ">":
+        return cur_f <= target_f - margin
+    if op == "<":
+        return cur_f >= target_f + margin
+    return False
+
+
+def _alert_can_trigger(rule: Dict[str, Any], cur: Any, now_ts: float) -> Tuple[bool, bool]:
+    state_changed = False
+    if cur is None:
+        return False, state_changed
+    op = rule.get("op")
+    target = rule.get("value")
+    if op not in {">", "<"} or target is None:
+        return False, state_changed
+    armed = rule.get("armed")
+    if armed is None:
+        rule["armed"] = True
+        armed = True
+        state_changed = True
+    if not armed:
+        last_ts = rule.get("last_trigger_ts")
+        if last_ts is None:
+            rule["armed"] = True
+            return False, True
+        try:
+            last_ts_f = float(last_ts)
+        except Exception:
+            rule["armed"] = True
+            return False, True
+        if now_ts - last_ts_f < ALERT_REARM_COOLDOWN_SECS:
+            return False, state_changed
+        if _alert_rearm_ready(cur, target, op):
+            rule["armed"] = True
+            state_changed = True
+        return False, state_changed
+    last_ts = rule.get("last_trigger_ts")
+    if last_ts is not None:
+        try:
+            last_ts_f = float(last_ts)
+        except Exception:
+            last_ts_f = None
+        if last_ts_f is not None and now_ts - last_ts_f < ALERT_REARM_COOLDOWN_SECS:
+            return False, state_changed
+    return _matches_with_tolerance(cur, target, op), state_changed
 
 
 def _alerts_match(existing: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
@@ -7018,6 +7073,9 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "op": al["op"],
                 "value": float(thr),
                 "mode": al.get("mode"),
+                "armed": True,
+                "last_trigger_ts": None,
+                "last_trigger_price": None,
             }
             if _has_duplicate_alert(rules, candidate, skip_idx=edit_idx if is_edit else None):
                 await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
@@ -7055,6 +7113,9 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "op": al["op"],
                 "value": float(thr),
                 "mode": al.get("mode"),
+                "armed": True,
+                "last_trigger_ts": None,
+                "last_trigger_price": None,
             }
             if _has_duplicate_alert(rules, candidate, skip_idx=edit_idx if is_edit else None):
                 await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
@@ -7098,6 +7159,9 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "mode": al.get("mode"),
                 "base": (base or "").upper(),
                 "quote": (quote or "").upper(),
+                "armed": True,
+                "last_trigger_ts": None,
+                "last_trigger_price": None,
             }
             if _has_duplicate_alert(rules, candidate, skip_idx=edit_idx if is_edit else None):
                 await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
@@ -7138,6 +7202,9 @@ async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "value": float(thr),
             "mode": "absolute",
             "segment": al.get("segment"),
+            "armed": True,
+            "last_trigger_ts": None,
+            "last_trigger_price": None,
         }
         if _has_duplicate_alert(rules, candidate, skip_idx=edit_idx if is_edit else None):
             await update.message.reply_text("Ya tenés una alerta igual configurada. Probá con otro valor.")
@@ -7215,24 +7282,63 @@ async def alerts_loop(app: Application):
                                     row = fx.get(r["type"], {}) or {}
                                     cur = _fx_display_value(row, r["side"])
                                     if cur is None: continue
-                                    ok = _matches_with_tolerance(cur, r["value"], r["op"])
-                                    if ok: trig.append(("fx", r["type"], r["side"], r["op"], r["value"], cur))
+                                    ok, changed = _alert_can_trigger(r, cur, now_ts)
+                                    if changed:
+                                        state_dirty = True
+                                    if ok:
+                                        r["last_trigger_ts"] = now_ts
+                                        try:
+                                            r["last_trigger_price"] = float(cur)
+                                        except Exception:
+                                            r["last_trigger_price"] = None
+                                        r["armed"] = False
+                                        state_dirty = True
+                                        trig.append(("fx", r["type"], r["side"], r["op"], r["value"], cur))
                                 elif r.get("kind") == "metric":
                                     cur = vals.get(r["type"])
                                     if cur is None: continue
-                                    ok = _matches_with_tolerance(cur, r["value"], r["op"])
-                                    if ok: trig.append(("metric", r["type"], r["op"], r["value"], cur))
+                                    ok, changed = _alert_can_trigger(r, cur, now_ts)
+                                    if changed:
+                                        state_dirty = True
+                                    if ok:
+                                        r["last_trigger_ts"] = now_ts
+                                        try:
+                                            r["last_trigger_price"] = float(cur)
+                                        except Exception:
+                                            r["last_trigger_price"] = None
+                                        r["armed"] = False
+                                        state_dirty = True
+                                        trig.append(("metric", r["type"], r["op"], r["value"], cur))
                                 elif r.get("kind") == "ticker":
                                     sym = r["symbol"]; m = metmap.get(sym, {}); cur = m.get("last_px")
                                     if cur is None: continue
-                                    ok = _matches_with_tolerance(cur, r["value"], r["op"])
-                                    if ok: trig.append(("ticker_px", sym, r["op"], r["value"], cur))
+                                    ok, changed = _alert_can_trigger(r, cur, now_ts)
+                                    if changed:
+                                        state_dirty = True
+                                    if ok:
+                                        r["last_trigger_ts"] = now_ts
+                                        try:
+                                            r["last_trigger_price"] = float(cur)
+                                        except Exception:
+                                            r["last_trigger_price"] = None
+                                        r["armed"] = False
+                                        state_dirty = True
+                                        trig.append(("ticker_px", sym, r["op"], r["value"], cur))
                                 elif r.get("kind") == "crypto":
                                     sym = (r.get("symbol") or "").upper()
                                     cur = crypto_prices.get(sym)
                                     if cur is None: continue
-                                    ok = _matches_with_tolerance(cur, r["value"], r["op"])
+                                    ok, changed = _alert_can_trigger(r, cur, now_ts)
+                                    if changed:
+                                        state_dirty = True
                                     if ok:
+                                        r["last_trigger_ts"] = now_ts
+                                        try:
+                                            r["last_trigger_price"] = float(cur)
+                                        except Exception:
+                                            r["last_trigger_price"] = None
+                                        r["armed"] = False
+                                        state_dirty = True
                                         trig.append(("crypto_px", sym, r.get("op"), r.get("value"), cur, r.get("base"), r.get("quote")))
                             if trig:
                                 lines = [f"<b>🔔 Alertas</b>"]
