@@ -5463,10 +5463,8 @@ def _matches_with_tolerance(cur: Any, target: Any, op: str) -> bool:
         return False
 
     margin = max(abs(target_f) * ALERT_PRICE_TOLERANCE_PCT, ALERT_PRICE_TOLERANCE_ABS)
-    if op == ">":
-        return cur_f >= target_f - margin
-    if op == "<":
-        return cur_f <= target_f + margin
+    if op in (">", "<"):
+        return target_f - margin <= cur_f <= target_f + margin
     return False
 
 
