@@ -251,7 +251,26 @@ def _clean_alerts(raw: Any) -> Dict[int, List[Dict[str, Any]]]:
                 continue
             kind = rule.get("kind")
             if kind in {"fx", "metric", "ticker", "crypto"}:
-                clean_rules.append(dict(rule))
+                cleaned = dict(rule)
+                if "last_trigger_ts" in cleaned:
+                    if cleaned["last_trigger_ts"] is None:
+                        pass
+                    else:
+                        try:
+                            cleaned["last_trigger_ts"] = float(cleaned["last_trigger_ts"])
+                        except Exception:
+                            cleaned.pop("last_trigger_ts", None)
+                if "last_trigger_price" in cleaned:
+                    if cleaned["last_trigger_price"] is None:
+                        pass
+                    else:
+                        try:
+                            cleaned["last_trigger_price"] = float(cleaned["last_trigger_price"])
+                        except Exception:
+                            cleaned.pop("last_trigger_price", None)
+                if "armed" in cleaned:
+                    cleaned["armed"] = bool(cleaned["armed"])
+                clean_rules.append(cleaned)
         if clean_rules:
             result[cid] = clean_rules
     return result
