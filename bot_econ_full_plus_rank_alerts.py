@@ -468,7 +468,13 @@ async def _fci_metrics(session: ClientSession, symbol: str) -> Dict[str, Optiona
     if records:
         picked = _pick_fci_record(symbol, records)
         if picked:
-            return _fci_metrics_from_record(picked)
+            base = _fci_metrics_from_record(picked)
+            if base.get("last_px") is None:
+                fallback = _fci_metrics_from_series(symbol)
+                for key in ("last_px", "prev_px", "last_chg", "last_ts"):
+                    if fallback.get(key) is not None:
+                        base[key] = fallback.get(key)
+            return base
     return _fci_metrics_from_series(symbol)
 
 
@@ -2689,8 +2695,8 @@ async def _rava_metrics(session: ClientSession, symbol: str) -> Dict[str, Option
 
     quotes = data.get("cotizaciones") or []
     history = data.get("coti_hist") or []
-    metrics = _metrics_from_rava_history(history)
-    base.update(metrics)
+    history_metrics = _metrics_from_rava_history(history)
+    base.update(history_metrics)
 
     if quotes:
         row = quotes[0]
@@ -2719,6 +2725,10 @@ async def _rava_metrics(session: ClientSession, symbol: str) -> Dict[str, Option
                 base["last_ts"] = int(dt.timestamp())
             except Exception:
                 pass
+
+    for key in ("last_px", "prev_px", "last_chg", "last_ts"):
+        if base.get(key) is None and history_metrics.get(key) is not None:
+            base[key] = history_metrics.get(key)
 
     if symbol in screenermatic:
         fallback = screenermatic[symbol]
