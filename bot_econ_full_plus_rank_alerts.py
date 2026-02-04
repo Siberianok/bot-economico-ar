@@ -8337,11 +8337,13 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         tc_ts = None
     state_updated = False
     async with ClientSession() as session:
-        if tc_name and (tc_val is None or tc_val <= 0):
+        now_ts = int(time())
+        tc_stale = tc_ts is None or (now_ts - tc_ts) > 24 * 60 * 60
+        if tc_name and (tc_val is None or tc_val <= 0 or tc_stale):
             fetched_tc = await get_tc_value(session, tc_name)
             if fetched_tc is not None:
                 tc_val = float(fetched_tc)
-                tc_ts = int(time())
+                tc_ts = now_ts
                 base_conf["tc_valor"] = tc_val
                 base_conf["tc_timestamp"] = tc_ts
                 state_updated = True
