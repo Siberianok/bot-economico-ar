@@ -2984,7 +2984,7 @@ RSS_FEEDS = [
 RSS_FEEDS_EXTENDED = [
     "https://www.clarin.com/rss/mundo/",
     "https://www.cronista.com/rss/finanzas-mercados/",
-    "https://www.pagina12.com.ar/rss/economia/",
+    "https://www.pagina12.com.ar/arc/outboundfeeds/rss/?outputType=xml",
     "https://www.telam.com.ar/rss2/economia.xml",
 ]
 NATIONAL_NEWS_DOMAINS: Set[str] = {
@@ -3682,7 +3682,30 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[News
     async def _collect_feed_entries(feed_urls: Iterable[str]) -> List[RawNewsEntry]:
         collected: List[RawNewsEntry] = []
         for url in feed_urls:
-            xml = await fetch_text(session, url, headers={"Accept": "application/rss+xml, application/atom+xml, */*"})
+            try:
+                xml = await fetch_text(
+                    session,
+                    url,
+                    headers={"Accept": "application/rss+xml, application/atom+xml, */*"},
+                )
+            except RuntimeError as exc:
+                log.error(
+                    "RSS fetch error",
+                    extra={"url": url, "event": "rss_fetch_error", "error": str(exc)},
+                )
+                continue
+            except SourceSuspendedError as exc:
+                log.error(
+                    "RSS fetch error",
+                    extra={"url": url, "event": "rss_fetch_error", "error": str(exc)},
+                )
+                continue
+            except Exception as exc:
+                log.error(
+                    "RSS fetch error",
+                    extra={"url": url, "event": "rss_fetch_error", "error": str(exc)},
+                )
+                continue
             if not xml:
                 continue
             try:
