@@ -8787,7 +8787,21 @@ def _bar_image_from_rank(
     return buf.read()
 
 
-def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, Any]]] = None) -> Optional[bytes]:
+def _truncate_chart_label(label: str, max_len: int = 18) -> str:
+    if max_len <= 0:
+        return label
+    label = label.strip()
+    if len(label) <= max_len:
+        return label
+    return label[: max_len - 1].rstrip() + "…"
+
+
+def _pie_image_from_items(
+    pf: Dict[str, Any],
+    snapshot: Optional[List[Dict[str, Any]]] = None,
+    top_n: int = 8,
+    label_max_len: int = 18,
+) -> Optional[bytes]:
     if not HAS_MPL:
         return None
 
@@ -8832,13 +8846,9 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
 
     selected_details: List[Dict[str, Any]] = []
     otros_bucket: List[Dict[str, Any]] = []
-    if len(pair_details) > 6:
-        for detail in pair_details:
-            fraction = detail["valor_actual"] / total if total else 0.0
-            if fraction < 0.03:
-                otros_bucket.append(detail)
-            else:
-                selected_details.append(detail)
+    if top_n > 0 and len(pair_details) > top_n:
+        selected_details = list(pair_details[:top_n])
+        otros_bucket = list(pair_details[top_n:])
     else:
         selected_details = list(pair_details)
 
@@ -8851,7 +8861,7 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
             }
         )
 
-    labels2 = [detail["label"] for detail in selected_details]
+    labels2 = [_truncate_chart_label(detail["label"], label_max_len) for detail in selected_details]
     vals2 = [detail["valor_actual"] for detail in selected_details]
 
     fig, (ax_pie, ax_info) = plt.subplots(
@@ -8870,9 +8880,9 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
         value = total * pct / 100.0
         return f"{pct_plain(pct, 1)}\n{f_money(value)}"
 
-    _, _, autotexts = ax_pie.pie(
+    wedges, _, autotexts = ax_pie.pie(
         vals2,
-        labels=labels2,
+        labels=None,
         autopct=autopct_fmt,
         pctdistance=0.75,
         startangle=90,
@@ -8883,6 +8893,19 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
     for text in autotexts:
         text.set_color("#1a1a1a")
         text.set_fontsize(8)
+
+    legend_labels = [
+        f"{label} ({pct_plain(val / total * 100.0, 1)})" if total else label for label, val in zip(labels2, vals2)
+    ]
+    ax_pie.legend(
+        wedges,
+        legend_labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, -0.08),
+        ncol=2,
+        fontsize=8,
+        frameon=False,
+    )
 
     ax_pie.text(
         0,
@@ -8934,7 +8957,14 @@ def _pie_image_from_items(pf: Dict[str, Any], snapshot: Optional[List[Dict[str, 
         invertido = detail.get("invertido", 0.0)
         variacion = detail["valor_actual"] - invertido
         ax_info.scatter(0.03, start_y, color=color, s=70, marker="s")
-        ax_info.text(0.08, start_y, detail["label"], fontsize=8.5, va="center", ha="left")
+        ax_info.text(
+            0.08,
+            start_y,
+            _truncate_chart_label(detail["label"], label_max_len),
+            fontsize=8.5,
+            va="center",
+            ha="left",
+        )
         ax_info.text(0.38, start_y, pct_plain(pct_value, 1), fontsize=8.5, va="center", ha="center")
         ax_info.text(0.72, start_y, f_money(detail["valor_actual"]), fontsize=8.5, va="center", ha="right")
         ax_info.text(1.04, start_y, f_money(invertido), fontsize=8.5, va="center", ha="right")
@@ -9287,6 +9317,8 @@ def _return_bar_image(
     title: str,
     subtitle: Optional[str] = None,
     formatter: Optional[Callable[[float], str]] = None,
+    top_n: int = 8,
+    label_max_len: int = 16,
 ) -> Optional[bytes]:
     if not HAS_MPL:
         return None
@@ -9302,6 +9334,16 @@ def _return_bar_image(
 
     if not cleaned:
         return None
+
+    cleaned.sort(key=lambda item: abs(item[1]), reverse=True)
+
+    if top_n > 0 and len(cleaned) > top_n:
+        selected = cleaned[:top_n]
+        remainder = cleaned[top_n:]
+        remainder_vals = [val for _, val in remainder]
+        remainder_avg = sum(remainder_vals) / len(remainder_vals) if remainder_vals else 0.0
+        selected.append(("Otros", remainder_avg))
+        cleaned = selected
 
     labels = [label for label, _ in cleaned]
     values = [val for _, val in cleaned]
@@ -9361,8 +9403,9 @@ def _return_bar_image(
             color=color,
         )
 
+    display_labels = [_truncate_chart_label(label, label_max_len) for label in labels]
     ax.set_xticks(range(len(labels)))
-    ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=8)
+    ax.set_xticklabels(display_labels, rotation=20, ha="right", fontsize=8)
     ax.margins(x=0.05)
     ax.axhline(0, color="#4a4a4a", linewidth=0.8)
     ax.set_ylabel("Variación %")
@@ -9373,6 +9416,19 @@ def _return_bar_image(
 
     ylim = max_abs * 1.25
     ax.set_ylim(-ylim, ylim)
+
+    legend_labels = [
+        f"{label} ({(formatter(val) if formatter else f'{val:+.1f}%')})" for label, val in zip(display_labels, values)
+    ]
+    ax.legend(
+        bars,
+        legend_labels,
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.18),
+        ncol=2,
+        fontsize=7,
+        frameon=False,
+    )
 
     fig.tight_layout()
     buf = io.BytesIO()
@@ -9451,7 +9507,7 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
         lines.append("ℹ️ Instalá matplotlib para ver la composición en gráficos.")
     await _send_below_menu(context, chat_id, text="\n".join(lines))
     # torta
-    img = _pie_image_from_items(pf, snapshot)
+    img = _pie_image_from_items(pf, snapshot, top_n=top_n)
     if img:
         await _send_below_menu(context, chat_id, photo_bytes=img)
     await pf_refresh_menu(context, chat_id, force_new=True)
@@ -9610,6 +9666,7 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             "Variación diaria",
             "Cambios porcentuales del día",
             formatter=lambda v: f"{v:+.2f}%",
+            top_n=top_n,
         )
         if daily_img:
             await _send_below_menu(context, chat_id, photo_bytes=daily_img)
@@ -9620,6 +9677,7 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             "Rendimiento por instrumento",
             "Variación acumulada vs. invertido",
             formatter=lambda v: f"{v:+.1f}%",
+            top_n=top_n,
         )
         if img:
             await _send_below_menu(context, chat_id, photo_bytes=img)
