@@ -7526,6 +7526,7 @@ def kb_pf_main(chat_id: Optional[int] = None) -> InlineKeyboardMarkup:
             # El botón «Proyección» muestra las gráficas de proyección vs. rendimiento
             # (barras vs. línea) calculadas en pf_show_projection_below.
             [InlineKeyboardButton("Rendimiento", callback_data="PF:RET"), InlineKeyboardButton("Proyección", callback_data="PF:PROJ")],
+            [InlineKeyboardButton("Rebalanceo/Simulación", callback_data="PF:REBAL")],
             [InlineKeyboardButton("Exportar", callback_data="PF:EXPORT")],
             [InlineKeyboardButton("Eliminar portafolio", callback_data="PF:CLEAR")],
         ])
@@ -7707,6 +7708,60 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_below_menu(context, chat_id, text="¿Qué querés agregar?", reply_markup=kb_add)
         else:
             await q.edit_message_text("¿Qué querés agregar?", reply_markup=kb_add)
+        return
+
+    if data == "PF:REBAL":
+        kb_rebal = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Objetivo por %", callback_data="PF:REBAL:PCT")],
+            [InlineKeyboardButton("Simular aporte único", callback_data="PF:REBAL:SIM:ONE"),
+             InlineKeyboardButton("Simular aporte mensual", callback_data="PF:REBAL:SIM:MONTH")],
+            [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
+        ])
+        await _send_below_menu(context, chat_id, text="Rebalanceo y simulación:")
+        await context.bot.send_message(chat_id, " ", reply_markup=kb_rebal)
+        return
+
+    if data == "PF:REBAL:PCT":
+        pf = pf_get(chat_id)
+        if not pf.get("items"):
+            await _send_below_menu(context, chat_id, text="No hay instrumentos cargados."); return
+        lines = ["<b>Elegí instrumento para fijar objetivo</b>"]
+        buttons = []
+        for i, it in enumerate(pf["items"], 1):
+            sym = it.get("simbolo") or ""
+            label = _label_long(sym) if sym else (it.get("tipo", "").upper() or "Instrumento")
+            obj_pct = it.get("objetivo_pct")
+            try:
+                obj_pct_val = float(obj_pct) if obj_pct is not None else None
+            except (TypeError, ValueError):
+                obj_pct_val = None
+            pct_str = f" · objetivo: {pct_plain(obj_pct_val, 1)}" if obj_pct_val is not None else ""
+            lines.append(f"{i}. {label}{pct_str}")
+            buttons.append([InlineKeyboardButton(f"{i}. {label}", callback_data=f"PF:REBAL:PICK:{i-1}")])
+        buttons.append([InlineKeyboardButton("Volver", callback_data="PF:BACK")])
+        await _send_below_menu(
+            context,
+            chat_id,
+            text="\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    if data.startswith("PF:REBAL:PICK:"):
+        idx = int(data.split(":")[3])
+        context.user_data["pf_rebal_idx"] = idx
+        context.user_data["pf_mode"] = "pf_rebal_pct"
+        await _send_below_menu(context, chat_id, text="Ingresá el <b>porcentaje objetivo</b> (solo número). Ej: 12.5")
+        return
+
+    if data == "PF:REBAL:SIM:ONE":
+        context.user_data["pf_mode"] = "pf_rebal_sim_one"
+        await _send_below_menu(context, chat_id, text="Ingresá el <b>monto del aporte único</b> (solo número).")
+        return
+
+    if data == "PF:REBAL:SIM:MONTH":
+        context.user_data["pf_mode"] = "pf_rebal_sim_month"
+        await _send_below_menu(context, chat_id, text="Ingresá el <b>monto del aporte mensual</b> (solo número).")
         return
 
     if data == "PF:SEARCH":
@@ -8219,6 +8274,56 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pf_refresh_menu(context, chat_id, force_new=True)
         context.user_data["pf_mode"]=None; return
 
+    if mode == "pf_rebal_pct":
+        v = _parse_num_text(text)
+        if v is None:
+            await update.message.reply_text("Ingresá solo número (sin símbolos)."); return
+        idx = context.user_data.get("pf_rebal_idx", -1)
+        if not (0 <= idx < len(pf["items"])):
+            await update.message.reply_text("Índice inválido."); context.user_data["pf_mode"]=None; return
+        pct_val = max(0.0, float(v))
+        pf["items"][idx]["objetivo_pct"] = pct_val
+        await save_state()
+        sym = pf["items"][idx].get("simbolo") or ""
+        label = _label_long(sym) if sym else (pf["items"][idx].get("tipo", "").upper() or "Instrumento")
+        await update.message.reply_text(f"Objetivo fijado para {label}: {pct_plain(pct_val, 1)}")
+        context.user_data["pf_mode"]=None; return
+
+    if mode in ("pf_rebal_sim_one", "pf_rebal_sim_month"):
+        v = _parse_num_text(text)
+        if v is None:
+            await update.message.reply_text("Ingresá solo número (sin símbolos)."); return
+        aporte = max(0.0, float(v))
+        snapshot, _, _, total_actual, _, _ = await pf_market_snapshot(pf)
+        if not snapshot:
+            await update.message.reply_text("No hay instrumentos para simular."); context.user_data["pf_mode"]=None; return
+        base_conf = pf.get("base", {})
+        base_currency = (base_conf.get("moneda") or "ARS").upper()
+        f_money = fmt_money_ars if base_currency == "ARS" else fmt_money_usd
+        suggestions, target_total = pf_rebalance_suggestions(snapshot, total_actual, aporte)
+        new_total = total_actual + aporte
+        heading = "Simulación de aporte único" if mode == "pf_rebal_sim_one" else "Simulación de aporte mensual"
+        lines = [
+            f"<b>{heading}</b>",
+            f"💼 Valor actual: {f_money(total_actual)}",
+            f"➕ Aporte: {f_money(aporte)}",
+            f"🎯 Total objetivo: {f_money(new_total)}",
+            "",
+            "<b>Sugerencias por instrumento</b>",
+        ]
+        for entry in suggestions:
+            action = "Comprar" if entry["delta"] >= 0 else "Vender"
+            delta_abs = abs(entry["delta"])
+            lines.append(
+                f"• {entry['label']}: {action} {f_money(delta_abs)} "
+                f"(peso: {pct_plain(entry['peso_actual'], 1)} → {pct_plain(entry['peso_objetivo'], 1)})"
+            )
+        if target_total is not None and abs(target_total - 100.0) > 0.1:
+            lines.append("")
+            lines.append(f"ℹ️ Objetivos normalizados (suma: {pct_plain(target_total, 1)}).")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        context.user_data["pf_mode"]=None; return
+
     # Ediciones
     if mode in ("edit_addq","edit_subq","edit_amt"):
         v = _parse_num_text(text)
@@ -8309,6 +8414,52 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["pf_mode"]=None; return
 
 # --- Composición: texto + torta (debajo del menú) ---
+
+def pf_rebalance_suggestions(
+    snapshot: List[Dict[str, Any]],
+    total_actual: float,
+    aporte: float,
+) -> Tuple[List[Dict[str, Any]], Optional[float]]:
+    if not snapshot:
+        return [], None
+    target_pcts: List[float] = []
+    any_target = False
+    for entry in snapshot:
+        raw = entry.get("raw", {})
+        obj_pct_raw = raw.get("objetivo_pct")
+        try:
+            obj_pct = float(obj_pct_raw) if obj_pct_raw is not None else None
+        except (TypeError, ValueError):
+            obj_pct = None
+        if obj_pct is not None and obj_pct >= 0:
+            any_target = True
+            target_pcts.append(obj_pct)
+        else:
+            target_pcts.append(entry.get("peso", 0.0) * 100.0)
+
+    if not any_target:
+        target_pcts = [entry.get("peso", 0.0) * 100.0 for entry in snapshot]
+
+    total_target_pct = sum(target_pcts)
+    normalization = 100.0 / total_target_pct if total_target_pct > 0 else 1.0
+    new_total = total_actual + aporte
+    suggestions: List[Dict[str, Any]] = []
+    for entry, raw_pct in zip(snapshot, target_pcts):
+        target_pct = raw_pct * normalization if total_target_pct > 0 else 0.0
+        target_value = new_total * target_pct / 100.0 if new_total > 0 else 0.0
+        current_value = float(entry.get("valor_actual") or 0.0)
+        delta = target_value - current_value
+        suggestions.append(
+            {
+                "label": entry.get("label") or entry.get("symbol") or "Instrumento",
+                "peso_actual": entry.get("peso", 0.0) * 100.0,
+                "peso_objetivo": target_pct,
+                "valor_objetivo": target_value,
+                "valor_actual": current_value,
+                "delta": delta,
+            }
+        )
+    return suggestions, (total_target_pct if any_target else None)
 
 async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[int], float, float, Optional[float], Optional[int]]:
     items = pf.get("items", [])
