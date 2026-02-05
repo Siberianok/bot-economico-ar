@@ -7523,6 +7523,7 @@ def kb_pf_main(chat_id: Optional[int] = None) -> InlineKeyboardMarkup:
     if has_instruments:
         rows.extend([
             [InlineKeyboardButton("Ver composición", callback_data="PF:LIST"), InlineKeyboardButton("Editar instrumento", callback_data="PF:EDIT")],
+            [InlineKeyboardButton("Vista FX", callback_data="PF:VIEW:FX")],
             # El botón «Proyección» muestra las gráficas de proyección vs. rendimiento
             # (barras vs. línea) calculadas en pf_show_projection_below.
             [InlineKeyboardButton("Rendimiento", callback_data="PF:RET"), InlineKeyboardButton("Proyección", callback_data="PF:PROJ")],
@@ -7758,6 +7759,11 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "PF:LIST":
         await pf_send_composition(context, chat_id)
+        return
+
+    if data == "PF:VIEW:FX":
+        await pf_send_composition(context, chat_id, view_fx=True)
+        await pf_show_return_below(context, chat_id, view_fx=True)
         return
 
     if data == "PF:EDIT":
@@ -8384,6 +8390,9 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         valor_actual = invertido
         if qty is not None and price_base is not None:
             valor_actual = float(qty) * float(price_base)
+        valor_actual_nativo = None
+        if qty is not None and price_native is not None:
+            valor_actual_nativo = float(qty) * float(price_native)
         total_invertido += invertido
         total_actual += valor_actual
         label = _label_long(sym) if sym else (tipo.upper() if tipo else "Instrumento")
@@ -8396,11 +8405,14 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             "cantidad_derivada": derived_qty,
             "invertido": invertido,
             "valor_actual": valor_actual,
+            "valor_actual_nativo": valor_actual_nativo,
             "precio_base": price_base,
+            "precio_nativo": price_native,
             "metrics": met,
             "inst_currency": inst_cur,
             "daily_change": met.get("last_chg") if met else None,
             "fx_rate": effective_tc,
+            "fx_rate_item": fx_rate_item,
             "fx_ts": effective_ts,
             "added_ts": added_ts,
         })
@@ -9030,10 +9042,18 @@ def _return_bar_image(
     buf.seek(0)
     return buf.read()
 
-async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, view_fx: bool = False):
     pf = pf_get(chat_id)
     pf_base = pf["base"]["moneda"].upper()
     f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
+    def _fmt_native(value: Optional[float], currency: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if currency == "ARS":
+            return fmt_money_ars(value)
+        if currency == "USD":
+            return fmt_money_usd(value)
+        return f"{fmt_money_usd(value)} {currency}" if currency else fmt_money_usd(value)
     if not pf["items"]:
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Usá «Agregar instrumento»."); return
     snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
@@ -9060,6 +9080,10 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             lines.append("")
         linea = f"{i}. {entry['label']}"
         linea += f" · 💰 Valor: {f_money(entry['valor_actual'])}"
+        if view_fx:
+            native_val = _fmt_native(entry.get("valor_actual_nativo"), entry.get("inst_currency"))
+            if native_val:
+                linea += f" / {native_val}"
         if entry['invertido'] > 0:
             r_ind = (entry['valor_actual']/entry['invertido']-1.0)*100.0
             linea += f" ({pct(r_ind,2)} vs {f_money(entry['invertido'])})"
@@ -9084,12 +9108,20 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 # --- Rendimiento (debajo del menú) ---
 
-async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, view_fx: bool = False):
     pf = pf_get(chat_id)
     if not pf["items"]:
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Agregá instrumentos primero."); return
     pf_base = pf["base"]["moneda"].upper()
     f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
+    def _fmt_native(value: Optional[float], currency: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        if currency == "ARS":
+            return fmt_money_ars(value)
+        if currency == "USD":
+            return fmt_money_usd(value)
+        return f"{fmt_money_usd(value)} {currency}" if currency else fmt_money_usd(value)
     snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     header = "<b>📈 Rendimiento del portafolio</b>"
@@ -9130,6 +9162,10 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
             detail += f" · 📦 Cant: {qty_txt}"
         if entry.get('precio_base') is not None:
             detail += f" · 💵 Px: {f_money(entry['precio_base'])}"
+        if view_fx:
+            native_val = _fmt_native(entry.get("valor_actual_nativo"), entry.get("inst_currency"))
+            if native_val:
+                detail += f" · 🧾 Nativo: {native_val}"
         daily = entry.get('daily_change')
         if daily is not None:
             detail += f" · 🌅 Día: {pct(daily,2)}"
@@ -9147,11 +9183,51 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
             daily_points.append((short_label, daily if daily is not None else None))
 
     delta_t = total_actual - total_invertido
+    fx_price_effect = 0.0
+    fx_fx_effect = 0.0
+    fx_has_data = False
+    if view_fx:
+        for entry in snapshot:
+            qty = entry.get("cantidad")
+            if qty is None or entry.get("cantidad_derivada"):
+                continue
+            invertido = float(entry.get("invertido") or 0.0)
+            inst_cur = entry.get("inst_currency")
+            price_native = entry.get("precio_nativo")
+            if inst_cur == pf_base:
+                fx_price_effect += float(entry.get("valor_actual") or 0.0) - invertido
+                fx_has_data = True
+                continue
+            fx_rate_purchase = entry.get("fx_rate_item")
+            fx_rate_current = entry.get("fx_rate")
+            if fx_rate_purchase is None or fx_rate_current is None or price_native is None:
+                continue
+            fx_factor_purchase = price_to_base(1.0, inst_cur, pf_base, fx_rate_purchase)
+            fx_factor_current = price_to_base(1.0, inst_cur, pf_base, fx_rate_current)
+            if not fx_factor_purchase or not fx_factor_current:
+                continue
+            purchase_price_native = invertido / (float(qty) * float(fx_factor_purchase)) if qty else None
+            if purchase_price_native is None:
+                continue
+            fx_price_effect += float(qty) * (float(price_native) - float(purchase_price_native)) * float(fx_factor_purchase)
+            fx_fx_effect += float(qty) * float(price_native) * (float(fx_factor_current) - float(fx_factor_purchase))
+            fx_has_data = True
     lines.append("")
     lines.append(f"💸 Invertido: {f_money(total_invertido)}")
     lines.append(f"🧮 Valor actual estimado: {f_money(total_actual)}")
     if total_invertido > 0:
-        lines.append(f"📊 Variación total: {f_money(delta_t)} ({pct((delta_t/total_invertido)*100.0,2)})")
+        total_pct = pct((delta_t/total_invertido)*100.0,2)
+        if view_fx and fx_has_data:
+            price_pct = pct((fx_price_effect/total_invertido)*100.0,2)
+            fx_pct = pct((fx_fx_effect/total_invertido)*100.0,2)
+            lines.append(
+                "📊 Variación total: "
+                + f"{f_money(delta_t)} ({total_pct})"
+                + f" → Precio {f_money(fx_price_effect)} ({price_pct})"
+                + f" | FX {f_money(fx_fx_effect)} ({fx_pct})"
+            )
+        else:
+            lines.append(f"📊 Variación total: {f_money(delta_t)} ({total_pct})")
     else:
         lines.append(f"📊 Variación total: {f_money(delta_t)}")
 
