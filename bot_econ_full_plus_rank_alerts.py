@@ -61,6 +61,7 @@ LINK_PREVIEWS_PREFER_SMALL = config.link_previews_prefer_small
 ALERTS_PAGE_SIZE = config.alerts_page_size
 RANK_TOP_LIMIT = config.rank_top_limit
 RANK_PROJ_LIMIT = config.rank_proj_limit
+PORTFOLIO_STALE_HOURS = config.portfolio_stale_hours
 TELEGRAM_TOKEN = config.telegram_token
 WEBHOOK_SECRET = config.webhook_secret
 PORT = config.port
@@ -468,7 +469,13 @@ async def _fci_metrics(session: ClientSession, symbol: str) -> Dict[str, Optiona
     if records:
         picked = _pick_fci_record(symbol, records)
         if picked:
-            return _fci_metrics_from_record(picked)
+            base = _fci_metrics_from_record(picked)
+            if base.get("last_px") is None:
+                fallback = _fci_metrics_from_series(symbol)
+                for key in ("last_px", "prev_px", "last_chg", "last_ts"):
+                    if fallback.get(key) is not None:
+                        base[key] = fallback.get(key)
+            return base
     return _fci_metrics_from_series(symbol)
 
 
@@ -1278,6 +1285,15 @@ def format_added_date(ts: Optional[int]) -> Optional[str]:
     except Exception:
         return None
     return dt.strftime("%d/%m/%Y")
+
+def format_last_data_date(ts: Optional[int]) -> Optional[str]:
+    if ts in (None, 0):
+        return None
+    try:
+        dt = datetime.fromtimestamp(int(ts), TZ)
+    except Exception:
+        return None
+    return dt.strftime("%d/%m %H")
 
 def anchor(href: str, text: str) -> str: return f'<a href="{_html.escape(href, True)}">{_html.escape(text)}</a>'
 def html_op(op: str) -> str: return "↑" if op == ">" else "↓"
@@ -2689,8 +2705,8 @@ async def _rava_metrics(session: ClientSession, symbol: str) -> Dict[str, Option
 
     quotes = data.get("cotizaciones") or []
     history = data.get("coti_hist") or []
-    metrics = _metrics_from_rava_history(history)
-    base.update(metrics)
+    history_metrics = _metrics_from_rava_history(history)
+    base.update(history_metrics)
 
     if quotes:
         row = quotes[0]
@@ -2719,6 +2735,10 @@ async def _rava_metrics(session: ClientSession, symbol: str) -> Dict[str, Option
                 base["last_ts"] = int(dt.timestamp())
             except Exception:
                 pass
+
+    for key in ("last_px", "prev_px", "last_chg", "last_ts"):
+        if base.get(key) is None and history_metrics.get(key) is not None:
+            base[key] = history_metrics.get(key)
 
     if symbol in screenermatic:
         fallback = screenermatic[symbol]
@@ -7867,6 +7887,11 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "tipo",
             "cantidad",
             "precio_base",
+            "moneda_nativa",
+            "precio_compra_nativo",
+            "precio_compra_base",
+            "fx_rate_compra",
+            "fx_ts_compra",
             "importe_base",
             "valor_actual_estimado",
             "moneda_base",
@@ -7887,6 +7912,8 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             item_fx_rate = entry.get("fx_rate")
             item_fx_ts = entry.get("fx_ts")
             item_fx_fecha = datetime.fromtimestamp(item_fx_ts, TZ).strftime("%Y-%m-%d %H:%M") if item_fx_ts else ""
+            fx_ts_compra = entry.get("fx_ts_compra")
+            fx_ts_compra_fecha = datetime.fromtimestamp(fx_ts_compra, TZ).strftime("%Y-%m-%d %H:%M") if fx_ts_compra else ""
             added_ts_raw = entry.get("raw", {}).get("added_ts") if entry.get("raw") else entry.get("added_ts")
             try:
                 added_ts = int(added_ts_raw) if added_ts_raw is not None else None
@@ -7899,6 +7926,11 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 entry.get("tipo") or "",
                 qty if qty is not None else "",
                 entry.get("precio_base") if entry.get("precio_base") is not None else "",
+                entry.get("moneda_nativa") or "",
+                entry.get("precio_compra_nativo") if entry.get("precio_compra_nativo") is not None else "",
+                entry.get("precio_compra_base") if entry.get("precio_compra_base") is not None else "",
+                entry.get("fx_rate_compra") if entry.get("fx_rate_compra") is not None else "",
+                fx_ts_compra_fecha,
                 entry.get("invertido"),
                 entry.get("valor_actual"),
                 base,
@@ -8198,9 +8230,20 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if pf["monto"] > 0 and (usado_pre + add_val) > pf["monto"] + 1e-6:
             await update.message.reply_text(f"🚫 Te pasás del presupuesto. Restante: {_restante_str(usado_pre)}"); return
 
-        item = {"tipo":tipo, "simbolo": yfsym if yfsym else sym}
+        item = {
+            "tipo": tipo,
+            "simbolo": yfsym if yfsym else sym,
+            "moneda_nativa": inst_moneda,
+        }
         if cantidad is not None: item["cantidad"] = float(cantidad)
         if importe_base is not None: item["importe"] = float(importe_base)  # en MONEDA BASE
+        if price_native is not None:
+            item["precio_compra_nativo"] = float(price_native)
+        if price_base is not None:
+            item["precio_compra_base"] = float(price_base)
+        if needs_fx:
+            item["fx_rate_compra"] = float(fx_rate_used) if fx_rate_used is not None else tc_val if tc_val is not None else None
+            item["fx_ts_compra"] = fx_ts_used
         if needs_fx:
             item["fx_rate"] = float(fx_rate_used) if fx_rate_used is not None else tc_val if tc_val is not None else None
             item["fx_ts"] = fx_ts_used
@@ -8333,11 +8376,13 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         tc_ts = None
     state_updated = False
     async with ClientSession() as session:
-        if tc_name and (tc_val is None or tc_val <= 0):
+        now_ts = int(time())
+        tc_stale = tc_ts is None or (now_ts - tc_ts) > 24 * 60 * 60
+        if tc_name and (tc_val is None or tc_val <= 0 or tc_stale):
             fetched_tc = await get_tc_value(session, tc_name)
             if fetched_tc is not None:
                 tc_val = float(fetched_tc)
-                tc_ts = int(time())
+                tc_ts = now_ts
                 base_conf["tc_valor"] = tc_val
                 base_conf["tc_timestamp"] = tc_ts
                 state_updated = True
@@ -8356,6 +8401,11 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         invertido = float(it.get("importe") or 0.0)
         met_raw = mets.get(sym, {}) if sym in mets else {}
         met = dict(met_raw) if met_raw else {}
+        price_ts_raw = met_raw.get("last_ts") if met_raw else None
+        try:
+            price_ts = int(price_ts_raw) if price_ts_raw is not None else None
+        except (TypeError, ValueError):
+            price_ts = None
         price_native = metric_last_price(met) if met else None
         if price_native is None:
             met = {}
@@ -8363,8 +8413,12 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             met["last_px"] = price_native
         met_currency = met.get("currency") if met else None
         inst_cur = instrument_currency(sym, tipo) if sym else base_currency
+        moneda_nativa_raw = it.get("moneda_nativa")
+        moneda_nativa = str(moneda_nativa_raw).upper() if moneda_nativa_raw else None
         if met_currency:
             inst_cur = str(met_currency).upper()
+        elif moneda_nativa:
+            inst_cur = moneda_nativa
         fx_rate_raw = it.get("fx_rate")
         try:
             fx_rate_item = float(fx_rate_raw) if fx_rate_raw is not None else None
@@ -8383,9 +8437,35 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         effective_tc = fx_rate_item if fx_rate_item is not None else tc_val
         effective_ts = fx_ts_item if fx_rate_item is not None else tc_ts
         price_base = price_to_base(price_native, inst_cur, base_currency, effective_tc) if price_native is not None else None
+        precio_compra_nativo_raw = it.get("precio_compra_nativo")
+        try:
+            precio_compra_nativo = float(precio_compra_nativo_raw) if precio_compra_nativo_raw is not None else None
+        except (TypeError, ValueError):
+            precio_compra_nativo = None
+        precio_compra_base_raw = it.get("precio_compra_base")
+        try:
+            precio_compra_base = float(precio_compra_base_raw) if precio_compra_base_raw is not None else None
+        except (TypeError, ValueError):
+            precio_compra_base = None
+        fx_rate_compra_raw = it.get("fx_rate_compra")
+        try:
+            fx_rate_compra = float(fx_rate_compra_raw) if fx_rate_compra_raw is not None else None
+        except (TypeError, ValueError):
+            fx_rate_compra = None
+        fx_ts_compra_raw = it.get("fx_ts_compra")
+        try:
+            fx_ts_compra = int(fx_ts_compra_raw) if fx_ts_compra_raw is not None else None
+        except (TypeError, ValueError):
+            fx_ts_compra = None
+        if precio_compra_base is None and precio_compra_nativo is not None:
+            if base_currency == inst_cur:
+                precio_compra_base = float(precio_compra_nativo)
+            elif fx_rate_compra and fx_rate_compra > 0:
+                precio_compra_base = price_to_base(precio_compra_nativo, inst_cur, base_currency, fx_rate_compra)
         derived_qty = False
-        if qty is None and price_base and price_base > 0 and invertido > 0:
-            qty = invertido / price_base
+        price_base_for_qty = price_base if price_base is not None else precio_compra_base
+        if qty is None and price_base_for_qty and price_base_for_qty > 0 and invertido > 0:
+            qty = invertido / price_base_for_qty
             derived_qty = True
         valor_actual = invertido
         if qty is not None and price_base is not None:
@@ -8407,10 +8487,15 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             "valor_actual": valor_actual,
             "valor_actual_nativo": valor_actual_nativo,
             "precio_base": price_base,
-            "precio_nativo": price_native,
+            "moneda_nativa": moneda_nativa or inst_cur,
+            "precio_compra_nativo": precio_compra_nativo,
+            "precio_compra_base": precio_compra_base,
+            "fx_rate_compra": fx_rate_compra,
+            "fx_ts_compra": fx_ts_compra,
             "metrics": met,
             "inst_currency": inst_cur,
             "daily_change": met.get("last_chg") if met else None,
+            "price_ts": price_ts,
             "fx_rate": effective_tc,
             "fx_rate_item": fx_rate_item,
             "fx_ts": effective_ts,
@@ -9061,6 +9146,14 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
     header = f"<b>🎨 Portafolio</b> — Base: {pf['base']['moneda'].upper()}/{pf['base']['tc'].upper()}"
     if fecha:
         header += f" <i>Datos al {fecha}</i>"
+    now_ts = int(time())
+    stale_threshold_sec = PORTFOLIO_STALE_HOURS * 3600
+    stale_entries = [
+        entry for entry in snapshot
+        if entry.get("price_ts") and (now_ts - int(entry["price_ts"])) > stale_threshold_sec
+    ]
+    if stale_entries:
+        header += f" ⚠️ Datos >{PORTFOLIO_STALE_HOURS}h"
     lines = [header, f"🎯 Monto objetivo: {f_money(pf['monto'])}"]
     lines.append(f"💵 Valor invertido: {f_money(total_invertido)}")
     lines.append(f"🧮 Valor actual estimado: {f_money(total_actual)}")
@@ -9095,6 +9188,9 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
         added_str = format_added_date(entry.get('added_ts'))
         if added_str:
             linea += f" · ⏳ Desde: {added_str}"
+        last_data = format_last_data_date(entry.get("price_ts"))
+        if last_data and entry in stale_entries:
+            linea += f" · 🕒 último dato: {last_data}"
         lines.append(linea)
     if not HAS_MPL:
         lines.append("")
@@ -9127,6 +9223,14 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     header = "<b>📈 Rendimiento del portafolio</b>"
     if fecha:
         header += f" <i>Datos al {fecha}</i>"
+    now_ts = int(time())
+    stale_threshold_sec = PORTFOLIO_STALE_HOURS * 3600
+    stale_entries = [
+        entry for entry in snapshot
+        if entry.get("price_ts") and (now_ts - int(entry["price_ts"])) > stale_threshold_sec
+    ]
+    if stale_entries:
+        header += f" ⚠️ Datos >{PORTFOLIO_STALE_HOURS}h"
     lines = [header]
     if tc_val is not None:
         tc_line = f"💱 Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
@@ -9174,6 +9278,9 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         added_str = format_added_date(entry.get('added_ts'))
         if added_str:
             detail += f" · ⏳ Desde: {added_str}"
+        last_data = format_last_data_date(entry.get("price_ts"))
+        if last_data and entry in stale_entries:
+            detail += f" · 🕒 último dato: {last_data}"
         lines.append(detail)
 
         short_label = _label_short(entry['symbol']) if entry.get('symbol') else label

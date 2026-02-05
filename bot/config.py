@@ -39,6 +39,7 @@ class BotConfig:
     alerts_page_size: int
     rank_top_limit: int
     rank_proj_limit: int
+    portfolio_stale_hours: int
 
 
 def _get_first(keys: Iterable[str], default: str = "") -> str:
@@ -115,6 +116,7 @@ def load_config() -> BotConfig:
     alerts_page_size = _get_bounded_int("ALERTS_PAGE_SIZE", 10, min_value=1)
     rank_top_limit = _get_bounded_int("RANK_TOP_LIMIT", 3, min_value=1)
     rank_proj_limit = _get_bounded_int("RANK_PROJ_LIMIT", 5, min_value=1)
+    portfolio_stale_hours = _get_bounded_int("PORTFOLIO_STALE_HOURS", 48, min_value=1)
 
     return BotConfig(
         telegram_token=telegram_token,
@@ -128,6 +130,7 @@ def load_config() -> BotConfig:
         alerts_page_size=alerts_page_size,
         rank_top_limit=rank_top_limit,
         rank_proj_limit=rank_proj_limit,
+        portfolio_stale_hours=portfolio_stale_hours,
     )
 
 
