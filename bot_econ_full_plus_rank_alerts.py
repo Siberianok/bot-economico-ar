@@ -7871,6 +7871,11 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "tipo",
             "cantidad",
             "precio_base",
+            "moneda_nativa",
+            "precio_compra_nativo",
+            "precio_compra_base",
+            "fx_rate_compra",
+            "fx_ts_compra",
             "importe_base",
             "valor_actual_estimado",
             "moneda_base",
@@ -7891,6 +7896,8 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             item_fx_rate = entry.get("fx_rate")
             item_fx_ts = entry.get("fx_ts")
             item_fx_fecha = datetime.fromtimestamp(item_fx_ts, TZ).strftime("%Y-%m-%d %H:%M") if item_fx_ts else ""
+            fx_ts_compra = entry.get("fx_ts_compra")
+            fx_ts_compra_fecha = datetime.fromtimestamp(fx_ts_compra, TZ).strftime("%Y-%m-%d %H:%M") if fx_ts_compra else ""
             added_ts_raw = entry.get("raw", {}).get("added_ts") if entry.get("raw") else entry.get("added_ts")
             try:
                 added_ts = int(added_ts_raw) if added_ts_raw is not None else None
@@ -7903,6 +7910,11 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 entry.get("tipo") or "",
                 qty if qty is not None else "",
                 entry.get("precio_base") if entry.get("precio_base") is not None else "",
+                entry.get("moneda_nativa") or "",
+                entry.get("precio_compra_nativo") if entry.get("precio_compra_nativo") is not None else "",
+                entry.get("precio_compra_base") if entry.get("precio_compra_base") is not None else "",
+                entry.get("fx_rate_compra") if entry.get("fx_rate_compra") is not None else "",
+                fx_ts_compra_fecha,
                 entry.get("invertido"),
                 entry.get("valor_actual"),
                 base,
@@ -8202,9 +8214,20 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if pf["monto"] > 0 and (usado_pre + add_val) > pf["monto"] + 1e-6:
             await update.message.reply_text(f"🚫 Te pasás del presupuesto. Restante: {_restante_str(usado_pre)}"); return
 
-        item = {"tipo":tipo, "simbolo": yfsym if yfsym else sym}
+        item = {
+            "tipo": tipo,
+            "simbolo": yfsym if yfsym else sym,
+            "moneda_nativa": inst_moneda,
+        }
         if cantidad is not None: item["cantidad"] = float(cantidad)
         if importe_base is not None: item["importe"] = float(importe_base)  # en MONEDA BASE
+        if price_native is not None:
+            item["precio_compra_nativo"] = float(price_native)
+        if price_base is not None:
+            item["precio_compra_base"] = float(price_base)
+        if needs_fx:
+            item["fx_rate_compra"] = float(fx_rate_used) if fx_rate_used is not None else tc_val if tc_val is not None else None
+            item["fx_ts_compra"] = fx_ts_used
         if needs_fx:
             item["fx_rate"] = float(fx_rate_used) if fx_rate_used is not None else tc_val if tc_val is not None else None
             item["fx_ts"] = fx_ts_used
@@ -8369,8 +8392,12 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             met["last_px"] = price_native
         met_currency = met.get("currency") if met else None
         inst_cur = instrument_currency(sym, tipo) if sym else base_currency
+        moneda_nativa_raw = it.get("moneda_nativa")
+        moneda_nativa = str(moneda_nativa_raw).upper() if moneda_nativa_raw else None
         if met_currency:
             inst_cur = str(met_currency).upper()
+        elif moneda_nativa:
+            inst_cur = moneda_nativa
         fx_rate_raw = it.get("fx_rate")
         try:
             fx_rate_item = float(fx_rate_raw) if fx_rate_raw is not None else None
@@ -8389,9 +8416,35 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         effective_tc = fx_rate_item if fx_rate_item is not None else tc_val
         effective_ts = fx_ts_item if fx_rate_item is not None else tc_ts
         price_base = price_to_base(price_native, inst_cur, base_currency, effective_tc) if price_native is not None else None
+        precio_compra_nativo_raw = it.get("precio_compra_nativo")
+        try:
+            precio_compra_nativo = float(precio_compra_nativo_raw) if precio_compra_nativo_raw is not None else None
+        except (TypeError, ValueError):
+            precio_compra_nativo = None
+        precio_compra_base_raw = it.get("precio_compra_base")
+        try:
+            precio_compra_base = float(precio_compra_base_raw) if precio_compra_base_raw is not None else None
+        except (TypeError, ValueError):
+            precio_compra_base = None
+        fx_rate_compra_raw = it.get("fx_rate_compra")
+        try:
+            fx_rate_compra = float(fx_rate_compra_raw) if fx_rate_compra_raw is not None else None
+        except (TypeError, ValueError):
+            fx_rate_compra = None
+        fx_ts_compra_raw = it.get("fx_ts_compra")
+        try:
+            fx_ts_compra = int(fx_ts_compra_raw) if fx_ts_compra_raw is not None else None
+        except (TypeError, ValueError):
+            fx_ts_compra = None
+        if precio_compra_base is None and precio_compra_nativo is not None:
+            if base_currency == inst_cur:
+                precio_compra_base = float(precio_compra_nativo)
+            elif fx_rate_compra and fx_rate_compra > 0:
+                precio_compra_base = price_to_base(precio_compra_nativo, inst_cur, base_currency, fx_rate_compra)
         derived_qty = False
-        if qty is None and price_base and price_base > 0 and invertido > 0:
-            qty = invertido / price_base
+        price_base_for_qty = price_base if price_base is not None else precio_compra_base
+        if qty is None and price_base_for_qty and price_base_for_qty > 0 and invertido > 0:
+            qty = invertido / price_base_for_qty
             derived_qty = True
         valor_actual = invertido
         if qty is not None and price_base is not None:
@@ -8409,6 +8462,11 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             "invertido": invertido,
             "valor_actual": valor_actual,
             "precio_base": price_base,
+            "moneda_nativa": moneda_nativa or inst_cur,
+            "precio_compra_nativo": precio_compra_nativo,
+            "precio_compra_base": precio_compra_base,
+            "fx_rate_compra": fx_rate_compra,
+            "fx_ts_compra": fx_ts_compra,
             "metrics": met,
             "inst_currency": inst_cur,
             "daily_change": met.get("last_chg") if met else None,
