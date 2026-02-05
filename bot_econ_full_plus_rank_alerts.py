@@ -7506,6 +7506,7 @@ def pf_get(chat_id: int) -> Dict[str, Any]:
     base_conf.setdefault("tc", "mep")
     base_conf.setdefault("tc_valor", None)
     base_conf.setdefault("tc_timestamp", None)
+    base_conf.setdefault("benchmark", None)
     if not isinstance(pf.get("items"), list):
         pf["items"] = []
     return pf
@@ -7517,6 +7518,7 @@ def kb_pf_main(chat_id: Optional[int] = None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("Ayuda", callback_data="PF:HELP")],
         [InlineKeyboardButton("Fijar base", callback_data="PF:SETBASE"), InlineKeyboardButton("Fijar monto", callback_data="PF:SETMONTO")],
+        [InlineKeyboardButton("Benchmark", callback_data="PF:SETBENCH")],
         [InlineKeyboardButton("Agregar instrumento", callback_data="PF:ADD")],
     ]
 
@@ -7544,12 +7546,19 @@ async def pf_main_menu_text(chat_id: int) -> str:
     base_conf = pf.get("base", {})
     base = (base_conf.get("moneda") or "ARS").upper()
     tc = (base_conf.get("tc") or "oficial").upper()
+    bench = (base_conf.get("benchmark") or "").lower()
+    bench_label = None
+    if bench == "merval":
+        bench_label = "Merval"
+    elif bench in ("usd", "dolar", "dólar"):
+        bench_label = "Dólar"
     monto = float(pf.get("monto") or 0.0)
     f_money = fmt_money_ars if base == "ARS" else fmt_money_usd
-    _, _, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
+    _, _, total_invertido, total_actual, tc_val, tc_ts, _ = await pf_market_snapshot(pf)
     restante = max(0.0, monto - total_invertido)
     lines = ["<b>📦 Menú Portafolio</b>"]
     lines.append(f"💱 Base: {base} / {tc}")
+    lines.append(f"📈 Benchmark: {bench_label or 'Sin benchmark'}")
     lines.append(f"🎯 Monto objetivo: {f_money(monto)}")
     lines.append(f"💸 Valor invertido: {f_money(total_invertido)}")
     lines.append(f"🪙 Restante: {f_money(restante)}")
@@ -7664,6 +7673,31 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("Volver", callback_data="PF:BACK")]
         ])
         await q.edit_message_text("Elegí base del portafolio:", reply_markup=kb_base); return
+
+    if data == "PF:SETBENCH":
+        kb_bench = InlineKeyboardMarkup([
+            [InlineKeyboardButton("Merval", callback_data="PF:BENCH:merval"),
+             InlineKeyboardButton("Dólar", callback_data="PF:BENCH:usd")],
+            [InlineKeyboardButton("Sin benchmark", callback_data="PF:BENCH:none")],
+            [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
+        ])
+        await q.edit_message_text("Elegí benchmark de comparación:", reply_markup=kb_bench); return
+
+    if data.startswith("PF:BENCH:"):
+        bench = data.split(":", 2)[2]
+        pf = pf_get(chat_id)
+        base_conf = pf.get("base", {})
+        base_conf["benchmark"] = None if bench == "none" else bench
+        pf["base"] = base_conf
+        await save_state()
+        bench_label = "Sin benchmark"
+        if bench == "merval":
+            bench_label = "Merval"
+        elif bench in ("usd", "dolar", "dólar"):
+            bench_label = "Dólar"
+        await pf_refresh_menu(context, chat_id)
+        await _send_below_menu(context, chat_id, text=f"Benchmark fijado: {bench_label}.")
+        return
 
     if data.startswith("PF:BASE:"):
         _,_,mon,tc = data.split(":")
@@ -7849,7 +7883,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pf.get("items"):
             await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. No hay datos para exportar.")
             return
-        snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
+        snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts, _ = await pf_market_snapshot(pf)
         base_conf = pf.get("base", {})
         base = (base_conf.get("moneda") or "ARS").upper()
         tc_name = (base_conf.get("tc") or "oficial").upper()
@@ -8310,11 +8344,104 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Composición: texto + torta (debajo del menú) ---
 
-async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[int], float, float, Optional[float], Optional[int]]:
+def _calc_basic_twr(snapshot: List[Dict[str, Any]], end_ts: int) -> Optional[float]:
+    log_sum = 0.0
+    time_weight = 0.0
+    for entry in snapshot:
+        added_ts = entry.get("added_ts")
+        invertido = float(entry.get("invertido") or 0.0)
+        valor_actual = float(entry.get("valor_actual") or 0.0)
+        if added_ts is None or invertido <= 0:
+            continue
+        holding_seconds = max(0, end_ts - int(added_ts))
+        holding_days = max(1.0, holding_seconds / 86400.0)
+        if holding_days <= 0:
+            continue
+        if invertido <= 0:
+            continue
+        gross_return = valor_actual / invertido if invertido > 0 else None
+        if gross_return is None or gross_return <= 0:
+            continue
+        if gross_return <= 1e-6:
+            continue
+        log_sum += math.log(gross_return) * holding_days
+        time_weight += holding_days
+    if time_weight <= 0:
+        return None
+    return math.exp(log_sum / time_weight) - 1.0
+
+
+def _calc_basic_mwr(cash_flows: List[Tuple[int, float]], end_ts: int, end_value: float) -> Optional[float]:
+    flows = [(ts, -float(amount)) for ts, amount in cash_flows if amount > 0]
+    if not flows or end_value <= 0:
+        return None
+    flows.append((end_ts, float(end_value)))
+    base_ts = min(ts for ts, _ in flows)
+    if base_ts == end_ts:
+        return None
+
+    def _npv(rate: float) -> float:
+        total = 0.0
+        for ts, amount in flows:
+            years = (ts - base_ts) / (365.0 * 86400.0)
+            total += amount / ((1.0 + rate) ** years) if rate > -0.9999 else 0.0
+        return total
+
+    guess = 0.1
+    for _ in range(40):
+        npv = _npv(guess)
+        if abs(npv) < 1e-6:
+            return guess
+        deriv = 0.0
+        for ts, amount in flows:
+            years = (ts - base_ts) / (365.0 * 86400.0)
+            if years == 0:
+                continue
+            deriv -= years * amount / ((1.0 + guess) ** (years + 1))
+        if deriv == 0:
+            break
+        guess_next = guess - npv / deriv
+        if guess_next <= -0.9999:
+            break
+        if abs(guess_next - guess) < 1e-6:
+            return guess_next
+        guess = guess_next
+
+    low, high = -0.9, 5.0
+    npv_low = _npv(low)
+    npv_high = _npv(high)
+    if npv_low * npv_high > 0:
+        return None
+    for _ in range(60):
+        mid = (low + high) / 2
+        npv_mid = _npv(mid)
+        if abs(npv_mid) < 1e-6:
+            return mid
+        if npv_low * npv_mid <= 0:
+            high = mid
+            npv_high = npv_mid
+        else:
+            low = mid
+            npv_low = npv_mid
+    return (low + high) / 2
+
+
+async def pf_market_snapshot(
+    pf: Dict[str, Any]
+) -> Tuple[
+    List[Dict[str, Any]],
+    Optional[int],
+    float,
+    float,
+    Optional[float],
+    Optional[int],
+    Dict[str, Any],
+]:
     items = pf.get("items", [])
     base_conf = pf.get("base", {})
     base_currency = (base_conf.get("moneda") or "ARS").upper()
     tc_name = (base_conf.get("tc") or "").lower()
+    benchmark = (base_conf.get("benchmark") or "").lower()
     tc_val_raw = base_conf.get("tc_valor")
     try:
         tc_val = float(tc_val_raw) if tc_val_raw is not None else None
@@ -8336,6 +8463,14 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
                 base_conf["tc_timestamp"] = tc_ts
                 state_updated = True
         symbols = sorted({it.get("simbolo") for it in items if it.get("simbolo")})
+        benchmark_symbol = None
+        if benchmark == "merval":
+            benchmark_symbol = "^MERV"
+        elif benchmark in ("usd", "dolar", "dólar"):
+            benchmark_symbol = "USDARS=X" if base_currency == "ARS" else "ARSUSD=X"
+        if benchmark_symbol:
+            symbols.append(benchmark_symbol)
+            symbols = sorted(set(symbols))
         mets, last_ts = await metrics_for_symbols(session, symbols) if symbols else ({}, None)
     if state_updated:
         await save_state()
@@ -8408,7 +8543,46 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
     for entry in enriched:
         entry["peso"] = (entry["valor_actual"] / total_actual) if total_actual > 0 else 0.0
 
-    return enriched, last_ts, total_invertido, total_actual, tc_val, tc_ts
+    end_ts = int(last_ts) if last_ts else int(time())
+    cash_flows = [
+        (entry.get("added_ts"), float(entry.get("invertido") or 0.0))
+        for entry in enriched
+        if entry.get("added_ts") is not None and float(entry.get("invertido") or 0.0) > 0
+    ]
+    clean_flows = [(int(ts), amount) for ts, amount in cash_flows if ts is not None]
+    twr = _calc_basic_twr(enriched, end_ts) if clean_flows else None
+    mwr = _calc_basic_mwr(clean_flows, end_ts, total_actual) if clean_flows else None
+
+    benchmark_label = None
+    benchmark_change = None
+    benchmark_last_px = None
+    if benchmark:
+        if benchmark == "merval":
+            benchmark_label = "Merval"
+            bench_metrics = mets.get("^MERV", {}) if isinstance(mets, dict) else {}
+        elif benchmark in ("usd", "dolar", "dólar"):
+            benchmark_label = "Dólar"
+            bench_symbol = "USDARS=X" if base_currency == "ARS" else "ARSUSD=X"
+            bench_metrics = mets.get(bench_symbol, {}) if isinstance(mets, dict) else {}
+        else:
+            bench_metrics = {}
+        if bench_metrics:
+            benchmark_change = bench_metrics.get("last_chg")
+            benchmark_last_px = bench_metrics.get("last_px")
+
+    perf_summary = {
+        "twr": twr,
+        "mwr": mwr,
+        "benchmark": {
+            "label": benchmark_label,
+            "change": benchmark_change,
+            "last_px": benchmark_last_px,
+        }
+        if benchmark_label
+        else None,
+    }
+
+    return enriched, last_ts, total_invertido, total_actual, tc_val, tc_ts, perf_summary
 
 def _bar_image_from_rank(
     rows: List[Tuple[str, List[Optional[float]]]],
@@ -9036,7 +9210,7 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
     if not pf["items"]:
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Usá «Agregar instrumento»."); return
-    snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
+    snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts, _ = await pf_market_snapshot(pf)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     header = f"<b>🎨 Portafolio</b> — Base: {pf['base']['moneda'].upper()}/{pf['base']['tc'].upper()}"
     if fecha:
@@ -9090,7 +9264,7 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Agregá instrumentos primero."); return
     pf_base = pf["base"]["moneda"].upper()
     f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
-    snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
+    snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts, perf_summary = await pf_market_snapshot(pf)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     header = "<b>📈 Rendimiento del portafolio</b>"
     if fecha:
@@ -9107,6 +9281,29 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
     if port_daily_vals:
         daily_sum = sum(port_daily_vals)
         lines.append(f"⚡ Variación diaria estimada: {pct(daily_sum,2)}")
+
+    summary_lines = []
+    summary_points: List[Tuple[str, Optional[float]]] = []
+    if perf_summary:
+        twr = perf_summary.get("twr")
+        mwr = perf_summary.get("mwr")
+        benchmark = perf_summary.get("benchmark") or {}
+        if twr is not None:
+            summary_lines.append(f"📌 TWR básico: {pct(twr * 100.0, 2)}")
+            summary_points.append(("TWR", twr * 100.0))
+        if mwr is not None:
+            summary_lines.append(f"📌 MWR básico: {pct(mwr * 100.0, 2)}")
+            summary_points.append(("MWR", mwr * 100.0))
+        bench_label = benchmark.get("label")
+        bench_change = benchmark.get("change")
+        if bench_label and bench_change is not None:
+            summary_lines.append(f"📌 Benchmark {bench_label}: {pct(bench_change, 2)}")
+            summary_points.append((bench_label, bench_change))
+
+    if summary_lines:
+        lines.append("")
+        lines.append("<b>Resumen TWR/MWR + benchmark</b>")
+        lines.extend(summary_lines)
 
     has_daily_data = any(entry.get('daily_change') is not None for entry in snapshot)
     return_points: List[Tuple[str, Optional[float]]] = []
@@ -9186,6 +9383,16 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         )
         if img:
             await _send_below_menu(context, chat_id, photo_bytes=img)
+
+    if summary_points:
+        summary_img = _return_bar_image(
+            summary_points,
+            "TWR / MWR / Benchmark",
+            "Resumen comparativo",
+            formatter=lambda v: f"{v:+.1f}%",
+        )
+        if summary_img:
+            await _send_below_menu(context, chat_id, photo_bytes=summary_img)
     await pf_refresh_menu(context, chat_id, force_new=True)
 
 # --- Proyección (debajo del menú) ---
@@ -9195,7 +9402,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     pf = pf_get(chat_id)
     if not pf["items"]:
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Agregá instrumentos primero."); return
-    snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
+    snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts, _ = await pf_market_snapshot(pf)
     if total_actual <= 0:
         await _send_below_menu(context, chat_id, text="Sin valores suficientes para proyectar."); return
 
