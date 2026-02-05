@@ -61,6 +61,7 @@ LINK_PREVIEWS_PREFER_SMALL = config.link_previews_prefer_small
 ALERTS_PAGE_SIZE = config.alerts_page_size
 RANK_TOP_LIMIT = config.rank_top_limit
 RANK_PROJ_LIMIT = config.rank_proj_limit
+PORTFOLIO_STALE_HOURS = config.portfolio_stale_hours
 TELEGRAM_TOKEN = config.telegram_token
 WEBHOOK_SECRET = config.webhook_secret
 PORT = config.port
@@ -1284,6 +1285,15 @@ def format_added_date(ts: Optional[int]) -> Optional[str]:
     except Exception:
         return None
     return dt.strftime("%d/%m/%Y")
+
+def format_last_data_date(ts: Optional[int]) -> Optional[str]:
+    if ts in (None, 0):
+        return None
+    try:
+        dt = datetime.fromtimestamp(int(ts), TZ)
+    except Exception:
+        return None
+    return dt.strftime("%d/%m %H")
 
 def anchor(href: str, text: str) -> str: return f'<a href="{_html.escape(href, True)}">{_html.escape(text)}</a>'
 def html_op(op: str) -> str: return "↑" if op == ">" else "↓"
@@ -8385,6 +8395,11 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         invertido = float(it.get("importe") or 0.0)
         met_raw = mets.get(sym, {}) if sym in mets else {}
         met = dict(met_raw) if met_raw else {}
+        price_ts_raw = met_raw.get("last_ts") if met_raw else None
+        try:
+            price_ts = int(price_ts_raw) if price_ts_raw is not None else None
+        except (TypeError, ValueError):
+            price_ts = None
         price_native = metric_last_price(met) if met else None
         if price_native is None:
             met = {}
@@ -8470,6 +8485,7 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             "metrics": met,
             "inst_currency": inst_cur,
             "daily_change": met.get("last_chg") if met else None,
+            "price_ts": price_ts,
             "fx_rate": effective_tc,
             "fx_ts": effective_ts,
             "added_ts": added_ts,
@@ -9111,6 +9127,14 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     header = f"<b>🎨 Portafolio</b> — Base: {pf['base']['moneda'].upper()}/{pf['base']['tc'].upper()}"
     if fecha:
         header += f" <i>Datos al {fecha}</i>"
+    now_ts = int(time())
+    stale_threshold_sec = PORTFOLIO_STALE_HOURS * 3600
+    stale_entries = [
+        entry for entry in snapshot
+        if entry.get("price_ts") and (now_ts - int(entry["price_ts"])) > stale_threshold_sec
+    ]
+    if stale_entries:
+        header += f" ⚠️ Datos >{PORTFOLIO_STALE_HOURS}h"
     lines = [header, f"🎯 Monto objetivo: {f_money(pf['monto'])}"]
     lines.append(f"💵 Valor invertido: {f_money(total_invertido)}")
     lines.append(f"🧮 Valor actual estimado: {f_money(total_actual)}")
@@ -9141,6 +9165,9 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         added_str = format_added_date(entry.get('added_ts'))
         if added_str:
             linea += f" · ⏳ Desde: {added_str}"
+        last_data = format_last_data_date(entry.get("price_ts"))
+        if last_data and entry in stale_entries:
+            linea += f" · 🕒 último dato: {last_data}"
         lines.append(linea)
     if not HAS_MPL:
         lines.append("")
@@ -9165,6 +9192,14 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
     header = "<b>📈 Rendimiento del portafolio</b>"
     if fecha:
         header += f" <i>Datos al {fecha}</i>"
+    now_ts = int(time())
+    stale_threshold_sec = PORTFOLIO_STALE_HOURS * 3600
+    stale_entries = [
+        entry for entry in snapshot
+        if entry.get("price_ts") and (now_ts - int(entry["price_ts"])) > stale_threshold_sec
+    ]
+    if stale_entries:
+        header += f" ⚠️ Datos >{PORTFOLIO_STALE_HOURS}h"
     lines = [header]
     if tc_val is not None:
         tc_line = f"💱 Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
@@ -9208,6 +9243,9 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int)
         added_str = format_added_date(entry.get('added_ts'))
         if added_str:
             detail += f" · ⏳ Desde: {added_str}"
+        last_data = format_last_data_date(entry.get("price_ts"))
+        if last_data and entry in stale_entries:
+            detail += f" · 🕒 último dato: {last_data}"
         lines.append(detail)
 
         short_label = _label_short(entry['symbol']) if entry.get('symbol') else label
