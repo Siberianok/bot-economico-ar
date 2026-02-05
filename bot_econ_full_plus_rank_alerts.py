@@ -797,6 +797,7 @@ else:
 ALERTS: Dict[int, List[Dict[str, Any]]] = {}
 SUBS: Dict[int, Dict[str, Any]] = {}
 PF: Dict[int, Dict[str, Any]] = {}
+PF_HISTORY: Dict[int, List[Dict[str, Any]]] = {}
 ALERT_USAGE: Dict[int, Dict[str, Dict[str, Any]]] = {}
 PROJECTION_RECORDS: List[Dict[str, Any]] = []
 PROJECTION_BATCHES: List[Dict[str, Any]] = []
@@ -837,7 +838,7 @@ def is_throttled(command: str, chat_id: Optional[int], user_id: Optional[int], t
 
 
 async def load_state():
-    global ALERTS, SUBS, PF, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE, RIESGO_CACHE, RESERVAS_CACHE, DOLAR_CACHE
+    global ALERTS, SUBS, PF, PF_HISTORY, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE, RIESGO_CACHE, RESERVAS_CACHE, DOLAR_CACHE
     global PROJ_HISTORY, PROJ_CALIBRATION
     data: Optional[Dict[str, Any]] = None
     try:
@@ -877,6 +878,7 @@ async def load_state():
         ALERTS = {int(k): v for k, v in data.get("alerts", {}).items()}
         SUBS = {int(k): v for k, v in data.get("subs", {}).items()}
         PF = {int(k): v for k, v in data.get("pf", {}).items()}
+        PF_HISTORY = _clean_pf_history(data.get("pf_history"))
         ALERT_USAGE = {int(k): v for k, v in data.get("alert_usage", {}).items()}
         projection_records = data.get("projection_records", [])
         projection_batches = data.get("projection_batches", [])
@@ -1024,6 +1026,44 @@ def _clean_proj_history(raw: Any) -> List[Dict[str, Any]]:
     return cleaned
 
 
+def _clean_pf_history(raw: Any) -> Dict[int, List[Dict[str, Any]]]:
+    cleaned: Dict[int, List[Dict[str, Any]]] = {}
+    if not isinstance(raw, dict):
+        return cleaned
+    for chat_key, entries in raw.items():
+        try:
+            chat_id = int(chat_key)
+        except Exception:
+            continue
+        if not isinstance(entries, list):
+            continue
+        valid_entries: List[Dict[str, Any]] = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            snapshot = entry.get("snapshot")
+            ts = entry.get("ts")
+            if not isinstance(snapshot, list):
+                continue
+            try:
+                ts_val = float(ts) if ts is not None else None
+            except Exception:
+                ts_val = None
+            valid_entries.append(
+                {
+                    "ts": ts_val,
+                    "snapshot": snapshot,
+                    "base": entry.get("base") if isinstance(entry.get("base"), dict) else {},
+                    "tc_val": entry.get("tc_val"),
+                    "tc_ts": entry.get("tc_ts"),
+                    "last_ts": entry.get("last_ts"),
+                }
+            )
+        if valid_entries:
+            cleaned[chat_id] = valid_entries
+    return cleaned
+
+
 def _clean_proj_calibration(raw: Any) -> Dict[str, Dict[str, float]]:
     cleaned: Dict[str, Dict[str, float]] = {}
     if not isinstance(raw, dict):
@@ -1166,6 +1206,7 @@ async def save_state():
             "alerts": ALERTS,
             "subs": SUBS,
             "pf": PF,
+            "pf_history": PF_HISTORY,
             "alert_usage": ALERT_USAGE,
             "projection_records": PROJECTION_RECORDS,
             "projection_batches": PROJECTION_BATCHES,
@@ -7510,6 +7551,121 @@ def pf_get(chat_id: int) -> Dict[str, Any]:
         pf["items"] = []
     return pf
 
+
+PF_EXPORT_PROJ_HORIZONS = ("3m", "6m")
+
+
+def _pf_export_horizon_label() -> str:
+    return ", ".join(PF_EXPORT_PROJ_HORIZONS)
+
+
+def _pf_snapshot_for_history(snapshot: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cleaned: List[Dict[str, Any]] = []
+    for entry in snapshot:
+        cleaned.append(
+            {
+                "symbol": entry.get("symbol"),
+                "label": entry.get("label"),
+                "tipo": entry.get("tipo"),
+                "cantidad": entry.get("cantidad"),
+                "precio_base": entry.get("precio_base"),
+                "invertido": entry.get("invertido"),
+                "valor_actual": entry.get("valor_actual"),
+                "fx_rate": entry.get("fx_rate"),
+                "fx_ts": entry.get("fx_ts"),
+                "added_ts": entry.get("added_ts"),
+            }
+        )
+    return cleaned
+
+
+def _pf_export_write_rows(
+    writer: csv.writer,
+    snapshot: List[Dict[str, Any]],
+    base: str,
+    tc_name: str,
+    tc_val: Optional[float],
+    tc_ts: Optional[int],
+    last_ts: Optional[int],
+    snapshot_ts: Optional[float],
+) -> Tuple[float, float]:
+    fecha_val = datetime.fromtimestamp(last_ts, TZ).strftime("%Y-%m-%d") if last_ts else ""
+    tc_fecha = datetime.fromtimestamp(tc_ts, TZ).strftime("%Y-%m-%d %H:%M") if tc_ts else ""
+    snapshot_fecha = (
+        datetime.fromtimestamp(snapshot_ts, TZ).strftime("%Y-%m-%d %H:%M") if snapshot_ts else ""
+    )
+    config_horizon = _pf_export_horizon_label()
+    total_invertido = 0.0
+    total_actual = 0.0
+    for entry in snapshot:
+        sym = entry.get("symbol") or ""
+        qty = entry.get("cantidad")
+        item_fx_rate = entry.get("fx_rate")
+        item_fx_ts = entry.get("fx_ts")
+        item_fx_fecha = datetime.fromtimestamp(item_fx_ts, TZ).strftime("%Y-%m-%d %H:%M") if item_fx_ts else ""
+        added_ts_raw = entry.get("added_ts")
+        try:
+            added_ts = int(added_ts_raw) if added_ts_raw is not None else None
+        except (TypeError, ValueError):
+            added_ts = None
+        added_fecha = datetime.fromtimestamp(added_ts, TZ).strftime("%Y-%m-%d %H:%M") if added_ts else ""
+        invertido = entry.get("invertido")
+        valor_actual = entry.get("valor_actual")
+        try:
+            total_invertido += float(invertido or 0.0)
+            total_actual += float(valor_actual or 0.0)
+        except Exception:
+            pass
+        writer.writerow([
+            sym,
+            entry.get("label") or sym or entry.get("tipo") or "",
+            entry.get("tipo") or "",
+            qty if qty is not None else "",
+            entry.get("precio_base") if entry.get("precio_base") is not None else "",
+            invertido if invertido is not None else "",
+            valor_actual if valor_actual is not None else "",
+            base,
+            tc_name,
+            tc_val if tc_val is not None else "",
+            tc_fecha,
+            fecha_val,
+            item_fx_rate if item_fx_rate is not None else "",
+            item_fx_fecha,
+            added_fecha,
+            added_ts if added_ts is not None else "",
+            base,
+            tc_name,
+            config_horizon,
+            snapshot_ts if snapshot_ts is not None else "",
+            snapshot_fecha,
+        ])
+    return total_invertido, total_actual
+
+
+PF_EXPORT_HEADERS = [
+    "symbol",
+    "nombre",
+    "tipo",
+    "cantidad",
+    "precio_base",
+    "importe_base",
+    "valor_actual_estimado",
+    "moneda_base",
+    "tc_nombre",
+    "tc_valor",
+    "tc_timestamp",
+    "fecha_valuacion",
+    "item_fx_rate",
+    "item_fx_timestamp",
+    "fecha_alta",
+    "added_timestamp",
+    "config_base_moneda",
+    "config_tc_nombre",
+    "config_horizonte_proyeccion",
+    "snapshot_log_timestamp",
+    "snapshot_log_fecha",
+]
+
 def kb_pf_main(chat_id: Optional[int] = None) -> InlineKeyboardMarkup:
     pf = pf_get(chat_id) if chat_id is not None else None
     has_instruments = bool(pf and pf.get("items"))
@@ -7538,6 +7694,136 @@ def kb_pf_add_methods() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Por % del monto", callback_data="PF:ADDPCT")],
         [InlineKeyboardButton("Volver", callback_data="PF:ADD")],
     ])
+
+
+async def pf_export_current(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    pf = pf_get(chat_id)
+    if not pf.get("items"):
+        await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. No hay datos para exportar.")
+        return
+    snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
+    base_conf = pf.get("base", {})
+    base = (base_conf.get("moneda") or "ARS").upper()
+    tc_name = (base_conf.get("tc") or "oficial").upper()
+    export_ts = time()
+    history_entry = {
+        "ts": export_ts,
+        "snapshot": _pf_snapshot_for_history(snapshot),
+        "base": copy.deepcopy(base_conf),
+        "tc_val": tc_val,
+        "tc_ts": tc_ts,
+        "last_ts": last_ts,
+    }
+    PF_HISTORY.setdefault(chat_id, []).append(history_entry)
+    await save_state()
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(PF_EXPORT_HEADERS)
+    _pf_export_write_rows(writer, snapshot, base, tc_name, tc_val, tc_ts, last_ts, export_ts)
+    csv_bytes = buf.getvalue().encode("utf-8")
+    filename = f"portafolio_{datetime.now(TZ).strftime('%Y%m%d_%H%M')}.csv"
+    f_money = fmt_money_ars if base == "ARS" else fmt_money_usd
+    caption_lines = [f"Exportación actual ({len(snapshot)} instrumentos)"]
+    caption_lines.append(f"Base {base}/{tc_name}")
+    caption_lines.append(f"Valor invertido: {f_money(total_invertido)}")
+    caption_lines.append(f"Valor actual estimado: {f_money(total_actual)}")
+    caption_lines.append(f"Horizonte de proyección: {_pf_export_horizon_label()}")
+    if tc_val is not None:
+        tc_caption = f"TC ref.: {fmt_money_ars(tc_val)} por USD"
+        if tc_ts:
+            tc_caption += f" (al {datetime.fromtimestamp(tc_ts, TZ).strftime('%d/%m/%Y %H:%M')})"
+        caption_lines.append(tc_caption)
+    if last_ts:
+        caption_lines.append(f"Datos al {datetime.fromtimestamp(last_ts, TZ).strftime('%Y-%m-%d')}")
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=io.BytesIO(csv_bytes),
+        filename=filename,
+        caption="\n".join(caption_lines),
+    )
+
+
+async def pf_export_history(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    entries = PF_HISTORY.get(chat_id, [])
+    entries = [entry for entry in entries if isinstance(entry, dict) and isinstance(entry.get("snapshot"), list)]
+    if not entries:
+        await _send_below_menu(context, chat_id, text="No hay historial de snapshots para exportar.")
+        return
+    entries_sorted = sorted(entries, key=lambda e: e.get("ts") or 0)
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(PF_EXPORT_HEADERS)
+    total_snapshots = 0
+    last_totals = (0.0, 0.0)
+    last_snapshot = None
+    last_base = None
+    last_tc_name = None
+    last_tc_val = None
+    last_tc_ts = None
+    last_ts = None
+    for entry in entries_sorted:
+        snapshot = entry.get("snapshot", [])
+        if not snapshot:
+            continue
+        base_conf = entry.get("base", {})
+        base = (base_conf.get("moneda") or "ARS").upper()
+        tc_name = (base_conf.get("tc") or "oficial").upper()
+        tc_val = entry.get("tc_val")
+        tc_ts = entry.get("tc_ts")
+        last_ts = entry.get("last_ts")
+        snapshot_ts = entry.get("ts")
+        last_totals = _pf_export_write_rows(
+            writer,
+            snapshot,
+            base,
+            tc_name,
+            tc_val,
+            tc_ts,
+            last_ts,
+            snapshot_ts,
+        )
+        total_snapshots += 1
+        last_snapshot = snapshot
+        last_base = base
+        last_tc_name = tc_name
+        last_tc_val = tc_val
+        last_tc_ts = tc_ts
+    if total_snapshots == 0:
+        await _send_below_menu(context, chat_id, text="No hay snapshots válidos para exportar.")
+        return
+    csv_bytes = buf.getvalue().encode("utf-8")
+    filename = f"portafolio_historico_{datetime.now(TZ).strftime('%Y%m%d_%H%M')}.csv"
+    caption_lines = [f"Exportación histórica ({total_snapshots} snapshots)"]
+    if entries_sorted:
+        first_ts = entries_sorted[0].get("ts")
+        last_ts_log = entries_sorted[-1].get("ts")
+        if first_ts and last_ts_log:
+            caption_lines.append(
+                "Rango: "
+                + f"{datetime.fromtimestamp(first_ts, TZ).strftime('%d/%m/%Y %H:%M')} → "
+                + f"{datetime.fromtimestamp(last_ts_log, TZ).strftime('%d/%m/%Y %H:%M')}"
+            )
+    if last_snapshot is not None and last_base and last_tc_name:
+        f_money = fmt_money_ars if last_base == "ARS" else fmt_money_usd
+        caption_lines.append(f"Base último snapshot: {last_base}/{last_tc_name}")
+        caption_lines.append(f"Instrumentos (último snapshot): {len(last_snapshot)}")
+        caption_lines.append(f"Valor invertido (último): {f_money(last_totals[0])}")
+        caption_lines.append(f"Valor actual estimado (último): {f_money(last_totals[1])}")
+        caption_lines.append(f"Horizonte de proyección: {_pf_export_horizon_label()}")
+        if last_tc_val is not None:
+            tc_caption = f"TC ref. último: {fmt_money_ars(last_tc_val)} por USD"
+            if last_tc_ts:
+                tc_caption += f" (al {datetime.fromtimestamp(last_tc_ts, TZ).strftime('%d/%m/%Y %H:%M')})"
+            caption_lines.append(tc_caption)
+        if last_ts:
+            caption_lines.append(f"Datos último snapshot al {datetime.fromtimestamp(last_ts, TZ).strftime('%Y-%m-%d')}")
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=io.BytesIO(csv_bytes),
+        filename=filename,
+        caption="\n".join(caption_lines),
+    )
 
 async def pf_main_menu_text(chat_id: int) -> str:
     pf = pf_get(chat_id)
@@ -7849,82 +8135,25 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pf.get("items"):
             await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. No hay datos para exportar.")
             return
-        snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
-        base_conf = pf.get("base", {})
-        base = (base_conf.get("moneda") or "ARS").upper()
-        tc_name = (base_conf.get("tc") or "oficial").upper()
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow([
-            "symbol",
-            "nombre",
-            "tipo",
-            "cantidad",
-            "precio_base",
-            "importe_base",
-            "valor_actual_estimado",
-            "moneda_base",
-            "tc_nombre",
-            "tc_valor",
-            "tc_timestamp",
-            "fecha_valuacion",
-            "item_fx_rate",
-            "item_fx_timestamp",
-            "fecha_alta",
-            "added_timestamp",
-        ])
-        fecha_val = datetime.fromtimestamp(last_ts, TZ).strftime("%Y-%m-%d") if last_ts else ""
-        tc_fecha = datetime.fromtimestamp(tc_ts, TZ).strftime("%Y-%m-%d %H:%M") if tc_ts else ""
-        for entry in snapshot:
-            sym = entry.get("symbol") or ""
-            qty = entry.get("cantidad")
-            item_fx_rate = entry.get("fx_rate")
-            item_fx_ts = entry.get("fx_ts")
-            item_fx_fecha = datetime.fromtimestamp(item_fx_ts, TZ).strftime("%Y-%m-%d %H:%M") if item_fx_ts else ""
-            added_ts_raw = entry.get("raw", {}).get("added_ts") if entry.get("raw") else entry.get("added_ts")
-            try:
-                added_ts = int(added_ts_raw) if added_ts_raw is not None else None
-            except (TypeError, ValueError):
-                added_ts = None
-            added_fecha = datetime.fromtimestamp(added_ts, TZ).strftime("%Y-%m-%d %H:%M") if added_ts else ""
-            writer.writerow([
-                sym,
-                entry.get("label") or sym or entry.get("tipo") or "",
-                entry.get("tipo") or "",
-                qty if qty is not None else "",
-                entry.get("precio_base") if entry.get("precio_base") is not None else "",
-                entry.get("invertido"),
-                entry.get("valor_actual"),
-                base,
-                tc_name,
-                tc_val if tc_val is not None else "",
-                tc_fecha,
-                fecha_val,
-                item_fx_rate if item_fx_rate is not None else "",
-                item_fx_fecha,
-                added_fecha,
-                added_ts if added_ts is not None else "",
+        history_entries = PF_HISTORY.get(chat_id, [])
+        has_history = any(isinstance(entry, dict) and entry.get("snapshot") for entry in history_entries)
+        if has_history:
+            kb_export = InlineKeyboardMarkup([
+                [InlineKeyboardButton("Exportar actual", callback_data="PF:EXPORT:NOW")],
+                [InlineKeyboardButton("Exportar histórico", callback_data="PF:EXPORT:HISTORY")],
+                [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
             ])
-        csv_bytes = buf.getvalue().encode("utf-8")
-        filename = f"portafolio_{datetime.now(TZ).strftime('%Y%m%d_%H%M')}.csv"
-        f_money = fmt_money_ars if base == "ARS" else fmt_money_usd
-        caption_lines = [f"Base {base}/{tc_name}"]
-        caption_lines.append(f"Valor invertido: {f_money(total_invertido)}")
-        caption_lines.append(f"Valor actual estimado: {f_money(total_actual)}")
-        caption_lines.append(f"Instrumentos: {len(snapshot)}")
-        if tc_val is not None:
-            tc_caption = f"TC ref.: {fmt_money_ars(tc_val)} por USD"
-            if tc_ts:
-                tc_caption += f" (al {datetime.fromtimestamp(tc_ts, TZ).strftime('%d/%m/%Y %H:%M')})"
-            caption_lines.append(tc_caption)
-        if fecha_val:
-            caption_lines.append(f"Datos al {fecha_val}")
-        await context.bot.send_document(
-            chat_id=chat_id,
-            document=io.BytesIO(csv_bytes),
-            filename=filename,
-            caption="\n".join(caption_lines),
-        )
+            await _send_below_menu(context, chat_id, text="¿Qué querés exportar?", reply_markup=kb_export)
+            return
+        await pf_export_current(context, chat_id)
+        return
+
+    if data == "PF:EXPORT:NOW":
+        await pf_export_current(context, chat_id)
+        return
+
+    if data == "PF:EXPORT:HISTORY":
+        await pf_export_history(context, chat_id)
         return
 
     if data == "PF:CLEAR":
