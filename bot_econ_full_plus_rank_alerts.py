@@ -4477,6 +4477,13 @@ def projection_6m(m: Dict[str, Optional[float]]) -> ProjectionRange:
     center = calibrate_projection(raw, "6m")
     return _projection_range_from_center(center, m, WINDOW_DAYS[6])
 
+def projection_by_horizon(m: Dict[str, Optional[float]], horizon_months: int) -> ProjectionRange:
+    if horizon_months == 3:
+        return projection_3m(m)
+    if horizon_months == 6:
+        return projection_6m(m)
+    return _projection_range(m, WINDOW_DAYS[horizon_months])
+
 
 def _format_projection_date(ts: float) -> str:
     try:
@@ -7561,6 +7568,16 @@ def kb_pf_add_methods() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("Volver", callback_data="PF:ADD")],
     ])
 
+def kb_pf_projection_horizons(selected: int) -> InlineKeyboardMarkup:
+    horizons = [1, 3, 6, 12]
+    buttons = []
+    for h in horizons:
+        label = f"{h}M"
+        if h == selected:
+            label = f"✅ {label}"
+        buttons.append(InlineKeyboardButton(label, callback_data=f"PF:PROJ:H:{h}"))
+    return InlineKeyboardMarkup([buttons])
+
 async def pf_main_menu_text(chat_id: int) -> str:
     pf = pf_get(chat_id)
     base_conf = pf.get("base", {})
@@ -7922,7 +7939,19 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pf_show_return_below(context, chat_id)
         return
     if data == "PF:PROJ":
-        await pf_show_projection_below(context, chat_id)
+        horizon = context.user_data.get("pf_proj_horizon") if context else None
+        if horizon not in (1, 3, 6, 12):
+            horizon = 3
+        await pf_show_projection_below(context, chat_id, horizon)
+        return
+    if data.startswith("PF:PROJ:H:"):
+        try:
+            horizon = int(data.split(":")[3])
+        except (IndexError, ValueError):
+            horizon = 3
+        if horizon not in (1, 3, 6, 12):
+            horizon = 3
+        await pf_show_projection_below(context, chat_id, horizon)
         return
 
     if data == "PF:EXPORT":
@@ -9178,6 +9207,80 @@ def _projection_by_instrument_image(
     buf.seek(0)
     return buf.read()
 
+def _projection_by_instrument_single_image(
+    points: List[Tuple[str, ProjectionRange]],
+    title: str,
+    subtitle: Optional[str] = None,
+) -> Optional[bytes]:
+    if not HAS_MPL:
+        return None
+
+    cleaned: List[Tuple[str, ProjectionRange]] = []
+    for label, val in points:
+        if val[0] is None:
+            continue
+        cleaned.append((label, val))
+
+    if not cleaned:
+        return None
+
+    labels: List[str] = []
+    values: List[float] = []
+    value_labels: List[str] = []
+    for label, val in cleaned:
+        center, _, _ = _projection_bounds(val)
+        if center is None:
+            continue
+        labels.append(label)
+        values.append(center)
+        value_labels.append(_format_projection_range(val, 1))
+
+    if not values:
+        return None
+
+    max_abs = max(abs(v) for v in values) if values else 0.0
+    if max_abs <= 0:
+        max_abs = 1.0
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.6), dpi=160)
+    palette = ["#3478bc", "#34a853", "#fbbc04", "#a142f4", "#f26f5e"]
+    colors = [palette[idx % len(palette)] for idx in range(len(values))]
+    bars = ax.bar(range(len(values)), values, color=colors)
+
+    ax.axhline(0, color="#999999", linewidth=0.8)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=0)
+    ax.set_title(title + (f"\n{subtitle}" if subtitle else ""))
+    ax.set_ylabel("Variación porcentual esperada")
+    ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.5)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+
+    margin = max_abs * 0.15
+    ax.set_ylim(-max_abs - margin, max_abs + margin)
+
+    for bar, label in zip(bars, value_labels):
+        height = bar.get_height()
+        y = height + (margin * 0.2 if height >= 0 else -margin * 0.2)
+        va = "bottom" if height >= 0 else "top"
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            y,
+            label,
+            ha="center",
+            va=va,
+            fontsize=8,
+            rotation=0,
+            color="#1a1a1a",
+        )
+
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
+
 
 def _return_bar_image(
     points: List[Tuple[str, Optional[float]]],
@@ -9524,7 +9627,7 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
 
 # --- Proyección (debajo del menú) ---
 
-async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int, horizon_months: int = 3):
     """Renderiza y envía las comparativas de proyección vs. rendimiento."""
     pf = pf_get(chat_id)
     if not pf["items"]:
@@ -9532,19 +9635,21 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
     if total_actual <= 0:
         await _send_below_menu(context, chat_id, text="Sin valores suficientes para proyectar."); return
+    if horizon_months not in (1, 3, 6, 12):
+        horizon_months = 3
+    if context:
+        context.user_data["pf_proj_horizon"] = horizon_months
 
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     pf_base = pf["base"]["moneda"].upper()
     f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
 
-    w3 = 0.0
-    w6 = 0.0
-    w3_low = 0.0
-    w3_high = 0.0
-    w6_low = 0.0
-    w6_high = 0.0
+    horizon_label = f"{horizon_months}M"
+    w = 0.0
+    w_low = 0.0
+    w_high = 0.0
     detail: List[str] = []
-    per_instrument_points: List[Tuple[str, ProjectionRange, ProjectionRange]] = []
+    per_instrument_points: List[Tuple[str, ProjectionRange]] = []
     history_added = False
     for entry in snapshot:
         metrics = entry.get("metrics") or {}
@@ -9559,19 +9664,14 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
             register_projection_history(symbol, "3m", raw3, metrics)
             register_projection_history(symbol, "6m", raw6, metrics)
             history_added = True
-        p3 = projection_3m(metrics)
-        p6 = projection_6m(metrics)
-        c3, l3, h3 = _projection_bounds(p3)
-        c6, l6, h6 = _projection_bounds(p6)
-        w3 += weight * (c3 or 0.0)
-        w6 += weight * (c6 or 0.0)
-        w3_low += weight * (l3 or c3 or 0.0)
-        w3_high += weight * (h3 or c3 or 0.0)
-        w6_low += weight * (l6 or c6 or 0.0)
-        w6_high += weight * (h6 or c6 or 0.0)
+        proj = projection_by_horizon(metrics, horizon_months)
+        center, low, high = _projection_bounds(proj)
+        w += weight * (center or 0.0)
+        w_low += weight * (low or center or 0.0)
+        w_high += weight * (high or center or 0.0)
 
         short_label = _label_short(entry["symbol"]) if entry.get("symbol") else entry["label"]
-        per_instrument_points.append((short_label, p3, p6))
+        per_instrument_points.append((short_label, proj))
 
         if detail:
             detail.append("")
@@ -9585,7 +9685,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         delta = valor_actual - invertido
         actual_pct = (delta / invertido) * 100.0 if invertido > 0 else None
         actual_txt = pct(actual_pct, 2)
-        proj_txt = f"🔭 3M {_format_projection_range(p3, 2)} | 6M {_format_projection_range(p6, 2)}"
+        proj_txt = f"🔭 {horizon_label} {_format_projection_range(proj, 2)}"
         delta_txt = f"📈 Δ {f_money(delta)}"
 
         detail.append(
@@ -9596,33 +9696,29 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
             + ")"
         )
 
-    forecast3 = total_actual * (1.0 + w3/100.0)
-    forecast6 = total_actual * (1.0 + w6/100.0)
-    forecast3_low = total_actual * (1.0 + w3_low/100.0)
-    forecast3_high = total_actual * (1.0 + w3_high/100.0)
-    forecast6_low = total_actual * (1.0 + w6_low/100.0)
-    forecast6_high = total_actual * (1.0 + w6_high/100.0)
-    total_pct = ((total_actual / total_invertido) - 1.0) * 100.0 if total_invertido > 0 else math.nan
-
+    forecast = total_actual * (1.0 + w/100.0)
+    forecast_low = total_actual * (1.0 + w_low/100.0)
+    forecast_high = total_actual * (1.0 + w_high/100.0)
     header = "<b>🔮 Proyección del Portafolio</b>"
     if fecha:
         header += f" <i>Datos al {fecha}</i>"
     lines = [header, f"🧮 Valor actual estimado: {f_money(total_actual)}"]
     lines.append(
-        "✨ Proyección 3M (rango estimado): "
-        + f"{pct(w3,2)} ({pct(w3_low,2)} a {pct(w3_high,2)}) → "
-        + f"{f_money(forecast3)} ({f_money(forecast3_low)} a {f_money(forecast3_high)})"
-    )
-    lines.append(
-        "🌟 Proyección 6M (rango estimado): "
-        + f"{pct(w6,2)} ({pct(w6_low,2)} a {pct(w6_high,2)}) → "
-        + f"{f_money(forecast6)} ({f_money(forecast6_low)} a {f_money(forecast6_high)})"
+        f"✨ Proyección {horizon_label} (rango estimado): "
+        + f"{pct(w,2)} ({pct(w_low,2)} a {pct(w_high,2)}) → "
+        + f"{f_money(forecast)} ({f_money(forecast_low)} a {f_money(forecast_high)})"
     )
     if tc_val is not None:
         tc_line = f"💱 Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
         if tc_ts:
             tc_line += f" (al {datetime.fromtimestamp(tc_ts, TZ).strftime('%d/%m/%Y %H:%M')})"
         lines.append(tc_line)
+
+    lines.append("")
+    lines.append("<b>Supuestos</b>")
+    lines.append("• Métricas: retornos y volatilidad recientes (ventanas 1M/3M/6M).")
+    lines.append(f"• Horizonte: {horizon_label} (~{WINDOW_DAYS[horizon_months]} ruedas).")
+    lines.append("• Metodología: retorno esperado ajustado por volatilidad; rango P25–P75.")
 
     if detail:
         lines.append("")
@@ -9641,26 +9737,34 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         lines.append("")
         lines.append("ℹ️ Instalá matplotlib para ver la proyección en gráficos.")
 
-    await _send_below_menu(context, chat_id, text="\n".join(lines))
+    await _send_below_menu(
+        context,
+        chat_id,
+        text="\n".join(lines),
+        reply_markup=kb_pf_projection_horizons(horizon_months),
+    )
     if history_added:
         asyncio.create_task(save_state())
 
     img = _projection_bar_image(
         [
             ("Actual", total_actual, f_money(total_actual)),
-            ("3M", forecast3, f"{f_money(forecast3)} ({f_money(forecast3_low)} a {f_money(forecast3_high)})"),
-            ("6M", forecast6, f"{f_money(forecast6)} ({f_money(forecast6_low)} a {f_money(forecast6_high)})"),
+            (
+                horizon_label,
+                forecast,
+                f"{f_money(forecast)} ({f_money(forecast_low)} a {f_money(forecast_high)})",
+            ),
         ],
         lambda value, label: label or f_money(value),
-        "Proyección del portafolio",
+        f"Proyección del portafolio ({horizon_label})",
         "Valores estimados",
     )
     if img:
         await _send_below_menu(context, chat_id, photo_bytes=img)
 
-    per_instrument_img = _projection_by_instrument_image(
+    per_instrument_img = _projection_by_instrument_single_image(
         per_instrument_points,
-        "Proyección por instrumento",
+        f"Proyección por instrumento ({horizon_label})",
         "Variación porcentual esperada",
     )
     if per_instrument_img:
