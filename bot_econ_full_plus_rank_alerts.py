@@ -9757,7 +9757,7 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         if currency == "USD":
             return fmt_money_usd(value)
         return f"{fmt_money_usd(value)} {currency}" if currency else fmt_money_usd(value)
-    snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts = await pf_market_snapshot(pf)
+    snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts, perf_summary = await pf_market_snapshot(pf)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     header = "<b>📈 Rendimiento del portafolio</b>"
     if fecha:
