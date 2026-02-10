@@ -20,6 +20,7 @@ from bot.services.cache import RateLimiter, ShortCache
 from bot.services.http import SourceSuspendedError, http_service
 
 # ====== matplotlib opcional (no rompe si no está instalado) ======
+LOGGER = logging.getLogger(__name__)
 HAS_MPL = False
 try:
     import matplotlib
@@ -28,6 +29,7 @@ try:
     import numpy as np
     HAS_MPL = True
 except Exception:
+    LOGGER.exception("No se pudo importar matplotlib/numpy; se desactiva HAS_MPL.")
     plt = None
     np = None
 
