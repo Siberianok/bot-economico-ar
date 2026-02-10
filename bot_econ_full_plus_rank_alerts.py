@@ -64,6 +64,7 @@ ALERTS_PAGE_SIZE = config.alerts_page_size
 RANK_TOP_LIMIT = config.rank_top_limit
 RANK_PROJ_LIMIT = config.rank_proj_limit
 PORTFOLIO_STALE_HOURS = config.portfolio_stale_hours
+PORTFOLIO_CHART_TOP_N = max(1, int(getattr(config, "portfolio_chart_top_n", 8)))
 TELEGRAM_TOKEN = config.telegram_token
 WEBHOOK_SECRET = config.webhook_secret
 PORT = config.port
@@ -9695,6 +9696,7 @@ def _return_bar_image(
 
 async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     pf = pf_get(chat_id)
+    composition_top_n = PORTFOLIO_CHART_TOP_N
     pf_base = pf["base"]["moneda"].upper()
     f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
     def _fmt_native(value: Optional[float], currency: Optional[str]) -> Optional[str]:
@@ -9797,16 +9799,20 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         lines.append("")
         lines.append("ℹ️ Instalá matplotlib para ver la composición en gráficos.")
     await _send_below_menu(context, chat_id, text="\n".join(lines))
-    # torta
-    img = _pie_image_from_items(pf, snapshot, top_n=top_n)
-    if img:
-        await _send_below_menu(context, chat_id, photo_bytes=img)
-    await pf_refresh_menu(context, chat_id, force_new=True)
+    try:
+        img = _pie_image_from_items(pf, snapshot, top_n=composition_top_n)
+        if img:
+            await _send_below_menu(context, chat_id, photo_bytes=img)
+    except Exception:
+        LOGGER.exception("No se pudo generar el gráfico de composición del portafolio.")
+    finally:
+        await pf_refresh_menu(context, chat_id, force_new=True)
 
 # --- Rendimiento (debajo del menú) ---
 
 async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, view_fx: bool = False):
     pf = pf_get(chat_id)
+    return_top_n = PORTFOLIO_CHART_TOP_N
     if not pf["items"]:
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Agregá instrumentos primero."); return
     pf_base = pf["base"]["moneda"].upper()
@@ -9972,40 +9978,43 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         lines.append("ℹ️ Instalá matplotlib para ver el gráfico de rendimiento.")
 
     await _send_below_menu(context, chat_id, text="\n".join(lines))
+    try:
+        cleaned_daily = [pt for pt in daily_points if pt[1] is not None]
+        if cleaned_daily:
+            daily_img = _return_bar_image(
+                cleaned_daily,
+                "Variación diaria",
+                "Cambios porcentuales del día",
+                formatter=lambda v: f"{v:+.2f}%",
+                top_n=return_top_n,
+            )
+            if daily_img:
+                await _send_below_menu(context, chat_id, photo_bytes=daily_img)
 
-    cleaned_daily = [pt for pt in daily_points if pt[1] is not None]
-    if cleaned_daily:
-        daily_img = _return_bar_image(
-            cleaned_daily,
-            "Variación diaria",
-            "Cambios porcentuales del día",
-            formatter=lambda v: f"{v:+.2f}%",
-            top_n=top_n,
-        )
-        if daily_img:
-            await _send_below_menu(context, chat_id, photo_bytes=daily_img)
+        if return_points:
+            img = _return_bar_image(
+                return_points,
+                "Rendimiento por instrumento",
+                "Variación acumulada vs. invertido",
+                formatter=lambda v: f"{v:+.1f}%",
+                top_n=return_top_n,
+            )
+            if img:
+                await _send_below_menu(context, chat_id, photo_bytes=img)
 
-    if return_points:
-        img = _return_bar_image(
-            return_points,
-            "Rendimiento por instrumento",
-            "Variación acumulada vs. invertido",
-            formatter=lambda v: f"{v:+.1f}%",
-            top_n=top_n,
-        )
-        if img:
-            await _send_below_menu(context, chat_id, photo_bytes=img)
-
-    if summary_points:
-        summary_img = _return_bar_image(
-            summary_points,
-            "TWR / MWR / Benchmark",
-            "Resumen comparativo",
-            formatter=lambda v: f"{v:+.1f}%",
-        )
-        if summary_img:
-            await _send_below_menu(context, chat_id, photo_bytes=summary_img)
-    await pf_refresh_menu(context, chat_id, force_new=True)
+        if summary_points:
+            summary_img = _return_bar_image(
+                summary_points,
+                "TWR / MWR / Benchmark",
+                "Resumen comparativo",
+                formatter=lambda v: f"{v:+.1f}%",
+            )
+            if summary_img:
+                await _send_below_menu(context, chat_id, photo_bytes=summary_img)
+    except Exception:
+        LOGGER.exception("No se pudieron generar los gráficos de rendimiento del portafolio.")
+    finally:
+        await pf_refresh_menu(context, chat_id, force_new=True)
 
 # --- Proyección (debajo del menú) ---
 
