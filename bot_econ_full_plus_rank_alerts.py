@@ -33,7 +33,7 @@ except Exception:
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 from telegram import (
-    Update, LinkPreviewOptions, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton,
+    Update, LinkPreviewOptions, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton, InputFile,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -7694,6 +7694,109 @@ PF_EXPORT_HEADERS = [
     "snapshot_log_fecha",
 ]
 
+kb_export = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("Exportar actual", callback_data="PF:EXPORT:NOW"),
+            InlineKeyboardButton("Histórico", callback_data="PF:EXPORT:HISTORY"),
+        ]
+    ]
+)
+
+async def pf_export_current(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    pf = pf_get(chat_id)
+    if not pf.get("items"):
+        await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. No hay datos para exportar.")
+        return
+    snapshot, last_ts, _, _, tc_val, tc_ts, _ = await pf_market_snapshot(pf)
+    if not snapshot:
+        await _send_below_menu(context, chat_id, text="No hay datos actuales para exportar.")
+        return
+    base_conf = pf.get("base", {})
+    base = (base_conf.get("moneda") or "ARS").upper()
+    tc_name = (base_conf.get("tc") or "oficial").upper()
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(PF_EXPORT_HEADERS)
+    _pf_export_write_rows(
+        writer,
+        snapshot,
+        base,
+        tc_name,
+        tc_val,
+        tc_ts,
+        last_ts,
+        snapshot_ts=time(),
+    )
+    filename = f"portafolio_actual_{datetime.now(TZ).strftime('%Y%m%d_%H%M')}.csv"
+    output = io.BytesIO(buf.getvalue().encode("utf-8"))
+    output.seek(0)
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=InputFile(output, filename=filename),
+        caption="Exportación actual del portafolio.",
+    )
+
+async def pf_export_history(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    history_entries = PF_HISTORY.get(chat_id, [])
+    if not history_entries:
+        await _send_below_menu(context, chat_id, text="No hay historial guardado para exportar.")
+        return
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(PF_EXPORT_HEADERS)
+    rows_written = 0
+    for entry in history_entries:
+        raw_snapshot = entry.get("snapshot", [])
+        if not isinstance(raw_snapshot, list) or not raw_snapshot:
+            continue
+        snapshot = _pf_snapshot_for_history(raw_snapshot)
+        base_conf = entry.get("base", {}) if isinstance(entry.get("base"), dict) else {}
+        base = (base_conf.get("moneda") or "ARS").upper()
+        tc_name = (base_conf.get("tc") or "oficial").upper()
+        tc_val_raw = entry.get("tc_val")
+        try:
+            tc_val = float(tc_val_raw) if tc_val_raw is not None else None
+        except (TypeError, ValueError):
+            tc_val = None
+        tc_ts_raw = entry.get("tc_ts")
+        try:
+            tc_ts = int(tc_ts_raw) if tc_ts_raw is not None else None
+        except (TypeError, ValueError):
+            tc_ts = None
+        last_ts_raw = entry.get("last_ts")
+        try:
+            last_ts = int(last_ts_raw) if last_ts_raw is not None else None
+        except (TypeError, ValueError):
+            last_ts = None
+        snapshot_ts_raw = entry.get("ts")
+        try:
+            snapshot_ts = float(snapshot_ts_raw) if snapshot_ts_raw is not None else None
+        except (TypeError, ValueError):
+            snapshot_ts = None
+        _pf_export_write_rows(
+            writer,
+            snapshot,
+            base,
+            tc_name,
+            tc_val,
+            tc_ts,
+            last_ts,
+            snapshot_ts,
+        )
+        rows_written += len(snapshot)
+    if rows_written == 0:
+        await _send_below_menu(context, chat_id, text="No hay datos históricos válidos para exportar.")
+        return
+    filename = f"portafolio_historico_{datetime.now(TZ).strftime('%Y%m%d_%H%M')}.csv"
+    output = io.BytesIO(buf.getvalue().encode("utf-8"))
+    output.seek(0)
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=InputFile(output, filename=filename),
+        caption="Histórico del portafolio.",
+    )
+
 def kb_pf_main(chat_id: Optional[int] = None) -> InlineKeyboardMarkup:
     pf = pf_get(chat_id) if chat_id is not None else None
     has_instruments = bool(pf and pf.get("items"))
@@ -8149,77 +8252,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not pf.get("items"):
             await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. No hay datos para exportar.")
             return
-        snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts, _ = await pf_market_snapshot(pf)
-        base_conf = pf.get("base", {})
-        base = (base_conf.get("moneda") or "ARS").upper()
-        tc_name = (base_conf.get("tc") or "oficial").upper()
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow([
-            "symbol",
-            "nombre",
-            "tipo",
-            "cantidad",
-            "precio_base",
-            "moneda_nativa",
-            "precio_compra_nativo",
-            "precio_compra_base",
-            "fx_rate_compra",
-            "fx_ts_compra",
-            "importe_base",
-            "valor_actual_estimado",
-            "moneda_base",
-            "tc_nombre",
-            "tc_valor",
-            "tc_timestamp",
-            "fecha_valuacion",
-            "item_fx_rate",
-            "item_fx_timestamp",
-            "fecha_alta",
-            "added_timestamp",
-        ])
-        fecha_val = datetime.fromtimestamp(last_ts, TZ).strftime("%Y-%m-%d") if last_ts else ""
-        tc_fecha = datetime.fromtimestamp(tc_ts, TZ).strftime("%Y-%m-%d %H:%M") if tc_ts else ""
-        for entry in snapshot:
-            sym = entry.get("symbol") or ""
-            qty = entry.get("cantidad")
-            item_fx_rate = entry.get("fx_rate")
-            item_fx_ts = entry.get("fx_ts")
-            item_fx_fecha = datetime.fromtimestamp(item_fx_ts, TZ).strftime("%Y-%m-%d %H:%M") if item_fx_ts else ""
-            fx_ts_compra = entry.get("fx_ts_compra")
-            fx_ts_compra_fecha = datetime.fromtimestamp(fx_ts_compra, TZ).strftime("%Y-%m-%d %H:%M") if fx_ts_compra else ""
-            added_ts_raw = entry.get("raw", {}).get("added_ts") if entry.get("raw") else entry.get("added_ts")
-            try:
-                added_ts = int(added_ts_raw) if added_ts_raw is not None else None
-            except (TypeError, ValueError):
-                added_ts = None
-            added_fecha = datetime.fromtimestamp(added_ts, TZ).strftime("%Y-%m-%d %H:%M") if added_ts else ""
-            writer.writerow([
-                sym,
-                entry.get("label") or sym or entry.get("tipo") or "",
-                entry.get("tipo") or "",
-                qty if qty is not None else "",
-                entry.get("precio_base") if entry.get("precio_base") is not None else "",
-                entry.get("moneda_nativa") or "",
-                entry.get("precio_compra_nativo") if entry.get("precio_compra_nativo") is not None else "",
-                entry.get("precio_compra_base") if entry.get("precio_compra_base") is not None else "",
-                entry.get("fx_rate_compra") if entry.get("fx_rate_compra") is not None else "",
-                fx_ts_compra_fecha,
-                entry.get("invertido"),
-                entry.get("valor_actual"),
-                base,
-                tc_name,
-                tc_val if tc_val is not None else "",
-                tc_fecha,
-                fecha_val,
-                item_fx_rate if item_fx_rate is not None else "",
-                item_fx_fecha,
-                added_fecha,
-                added_ts if added_ts is not None else "",
-            ])
-            await _send_below_menu(context, chat_id, text="¿Qué querés exportar?", reply_markup=kb_export)
-            return
-        await pf_export_current(context, chat_id)
+        await _send_below_menu(context, chat_id, text="¿Qué querés exportar?", reply_markup=kb_export)
         return
 
     if data == "PF:EXPORT:NOW":
