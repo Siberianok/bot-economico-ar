@@ -7708,7 +7708,6 @@ def kb_pf_main(chat_id: Optional[int] = None) -> InlineKeyboardMarkup:
     if has_instruments:
         rows.extend([
             [InlineKeyboardButton("Ver composición", callback_data="PF:LIST"), InlineKeyboardButton("Editar instrumento", callback_data="PF:EDIT")],
-            [InlineKeyboardButton("Vista FX", callback_data="PF:VIEW:FX")],
             # El botón «Proyección» muestra las gráficas de proyección vs. rendimiento
             # (barras vs. línea) calculadas en pf_show_projection_below.
             [InlineKeyboardButton("Rendimiento", callback_data="PF:RET"), InlineKeyboardButton("Proyección", callback_data="PF:PROJ")],
@@ -8041,11 +8040,6 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "PF:LIST":
         await pf_send_composition(context, chat_id)
-        return
-
-    if data == "PF:VIEW:FX":
-        await pf_send_composition(context, chat_id, view_fx=True)
-        await pf_show_return_below(context, chat_id, view_fx=True)
         return
 
     if data == "PF:EDIT":
@@ -9666,7 +9660,7 @@ def _return_bar_image(
     buf.seek(0)
     return buf.read()
 
-async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, view_fx: bool = False):
+async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     pf = pf_get(chat_id)
     pf_base = pf["base"]["moneda"].upper()
     f_money = fmt_money_ars if pf_base=="ARS" else fmt_money_usd
@@ -9699,6 +9693,41 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
     delta = total_actual - total_invertido
     if total_invertido > 0:
         lines.append(f"📊 Variación estimada: {f_money(delta)} ({pct(delta/total_invertido*100.0,2)})")
+    fx_price_effect = 0.0
+    fx_fx_effect = 0.0
+    fx_has_data = False
+    if total_invertido > 0:
+        for entry in snapshot:
+            qty = entry.get("cantidad")
+            if qty is None or entry.get("cantidad_derivada"):
+                continue
+            inst_cur = entry.get("inst_currency")
+            if inst_cur is None or inst_cur == pf_base:
+                continue
+            fx_rate_purchase = entry.get("fx_rate_item")
+            fx_rate_current = entry.get("fx_rate")
+            price_native = entry.get("precio_nativo")
+            if fx_rate_purchase is None or fx_rate_current is None or price_native is None:
+                continue
+            fx_factor_purchase = price_to_base(1.0, inst_cur, pf_base, fx_rate_purchase)
+            fx_factor_current = price_to_base(1.0, inst_cur, pf_base, fx_rate_current)
+            if not fx_factor_purchase or not fx_factor_current:
+                continue
+            invertido = float(entry.get("invertido") or 0.0)
+            purchase_price_native = invertido / (float(qty) * float(fx_factor_purchase)) if qty else None
+            if purchase_price_native is None:
+                continue
+            fx_price_effect += float(qty) * (float(price_native) - float(purchase_price_native)) * float(fx_factor_purchase)
+            fx_fx_effect += float(qty) * float(price_native) * (float(fx_factor_current) - float(fx_factor_purchase))
+            fx_has_data = True
+    if fx_has_data:
+        price_pct = pct((fx_price_effect / total_invertido) * 100.0, 2)
+        fx_pct = pct((fx_fx_effect / total_invertido) * 100.0, 2)
+        lines.append(
+            "💱 Efecto FX estimado: "
+            + f"Precio {f_money(fx_price_effect)} ({price_pct})"
+            + f" | FX {f_money(fx_fx_effect)} ({fx_pct})"
+        )
     restante = max(0.0, pf['monto'] - total_invertido)
     lines.append(f"🪙 Restante del objetivo: {f_money(restante)}")
     if tc_val is not None:
@@ -9712,10 +9741,10 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
             lines.append("")
         linea = f"{i}. {entry['label']}"
         linea += f" · 💰 Valor: {f_money(entry['valor_actual'])}"
-        if view_fx:
-            native_val = _fmt_native(entry.get("valor_actual_nativo"), entry.get("inst_currency"))
-            if native_val:
-                linea += f" / {native_val}"
+        inst_currency = entry.get("inst_currency")
+        native_val = _fmt_native(entry.get("valor_actual_nativo"), inst_currency)
+        if native_val and inst_currency and inst_currency != pf_base:
+            linea += f" · 🧾 Nativo: {native_val}"
         if entry['invertido'] > 0:
             r_ind = (entry['valor_actual']/entry['invertido']-1.0)*100.0
             linea += f" ({pct(r_ind,2)} vs {f_money(entry['invertido'])})"
