@@ -8280,10 +8280,12 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "PF:EXPORT:NOW":
         await pf_export_current(context, chat_id)
+        await pf_refresh_menu(context, chat_id, force_new=True)
         return
 
     if data == "PF:EXPORT:HISTORY":
         await pf_export_history(context, chat_id)
+        await pf_refresh_menu(context, chat_id, force_new=True)
         return
 
     if data == "PF:CLEAR":
