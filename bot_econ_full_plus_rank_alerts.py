@@ -7949,6 +7949,36 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = q.message.chat_id; data = q.data
     context.user_data["pf_menu_msg_id"] = q.message.message_id
 
+    async def _edit_active_menu(text: str, reply_markup: Optional[InlineKeyboardMarkup] = None):
+        try:
+            await q.edit_message_text(
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception:
+            pass
+
+        msg_id = context.user_data.get("pf_menu_msg_id")
+        if msg_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True,
+                )
+                context.user_data["pf_menu_msg_id"] = msg_id
+                return
+            except Exception:
+                pass
+
+        await pf_refresh_menu(context, chat_id, force_new=True)
+
     if data == "PF:MENU":
         await cmd_portafolio(update, context)
         return
@@ -8049,13 +8079,14 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("Simular aporte mensual", callback_data="PF:REBAL:SIM:MONTH")],
             [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
         ])
-        await _send_below_menu(context, chat_id, text="Rebalanceo y simulación:", reply_markup=kb_rebal)
+        await _edit_active_menu("Rebalanceo y simulación:", reply_markup=kb_rebal)
         return
 
     if data == "PF:REBAL:PCT":
         pf = pf_get(chat_id)
         if not pf.get("items"):
-            await _send_below_menu(context, chat_id, text="No hay instrumentos cargados."); return
+            kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:REBAL"), InlineKeyboardButton("Cancelar", callback_data="PF:BACK")]])
+            await _edit_active_menu("No hay instrumentos cargados.", reply_markup=kb_back); return
         lines = ["<b>Elegí instrumento para fijar objetivo</b>"]
         buttons = []
         for i, it in enumerate(pf["items"], 1):
@@ -8069,11 +8100,9 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pct_str = f" · objetivo: {pct_plain(obj_pct_val, 1)}" if obj_pct_val is not None else ""
             lines.append(f"{i}. {label}{pct_str}")
             buttons.append([InlineKeyboardButton(f"{i}. {label}", callback_data=f"PF:REBAL:PICK:{i-1}")])
-        buttons.append([InlineKeyboardButton("Volver", callback_data="PF:BACK")])
-        await _send_below_menu(
-            context,
-            chat_id,
-            text="\n".join(lines),
+        buttons.append([InlineKeyboardButton("Volver", callback_data="PF:REBAL"), InlineKeyboardButton("Cancelar", callback_data="PF:BACK")])
+        await _edit_active_menu(
+            "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
@@ -8082,17 +8111,20 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx = int(data.split(":")[3])
         context.user_data["pf_rebal_idx"] = idx
         context.user_data["pf_mode"] = "pf_rebal_pct"
-        await _send_below_menu(context, chat_id, text="Ingresá el <b>porcentaje objetivo</b> (solo número). Ej: 12.5")
+        kb_step = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:REBAL:PCT"), InlineKeyboardButton("Cancelar", callback_data="PF:BACK")]])
+        await _edit_active_menu("Ingresá el <b>porcentaje objetivo</b> (solo número). Ej: 12.5", reply_markup=kb_step)
         return
 
     if data == "PF:REBAL:SIM:ONE":
         context.user_data["pf_mode"] = "pf_rebal_sim_one"
-        await _send_below_menu(context, chat_id, text="Ingresá el <b>monto del aporte único</b> (solo número).")
+        kb_step = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:REBAL"), InlineKeyboardButton("Cancelar", callback_data="PF:BACK")]])
+        await _edit_active_menu("Ingresá el <b>monto del aporte único</b> (solo número).", reply_markup=kb_step)
         return
 
     if data == "PF:REBAL:SIM:MONTH":
         context.user_data["pf_mode"] = "pf_rebal_sim_month"
-        await _send_below_menu(context, chat_id, text="Ingresá el <b>monto del aporte mensual</b> (solo número).")
+        kb_step = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:REBAL"), InlineKeyboardButton("Cancelar", callback_data="PF:BACK")]])
+        await _edit_active_menu("Ingresá el <b>monto del aporte mensual</b> (solo número).", reply_markup=kb_step)
         return
 
     if data == "PF:SEARCH":
@@ -8149,7 +8181,8 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "PF:EDIT":
         pf = pf_get(chat_id)
         if not pf["items"]:
-            await _send_below_menu(context, chat_id, text="No hay instrumentos para editar."); return
+            kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:BACK"), InlineKeyboardButton("Cancelar", callback_data="PF:BACK")]])
+            await _edit_active_menu("No hay instrumentos para editar.", reply_markup=kb_back); return
         base_conf = pf.get("base", {})
         base_currency = (base_conf.get("moneda") or "ARS").upper()
         f_money = fmt_money_ars if base_currency == "ARS" else fmt_money_usd
@@ -8183,11 +8216,9 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 line_detail += f" — {extra}"
             lines.append(line_detail)
             buttons.append([InlineKeyboardButton(f"{i}. {label}", callback_data=f"PF:EDIT:{i-1}")])
-        buttons.append([InlineKeyboardButton("Volver", callback_data="PF:BACK")])
-        await _send_below_menu(
-            context,
-            chat_id,
-            text="\n".join(lines),
+        buttons.append([InlineKeyboardButton("Volver", callback_data="PF:BACK"), InlineKeyboardButton("Cancelar", callback_data="PF:BACK")])
+        await _edit_active_menu(
+            "\n".join(lines),
             reply_markup=InlineKeyboardMarkup(buttons),
         )
         return
@@ -8199,20 +8230,23 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("+ Cantidad", callback_data="PF:ED:ADDQ"), InlineKeyboardButton("- Cantidad", callback_data="PF:ED:SUBQ")],
             [InlineKeyboardButton("Cambiar importe", callback_data="PF:ED:AMT")],
             [InlineKeyboardButton("Eliminar este", callback_data="PF:ED:DEL")],
-            [InlineKeyboardButton("Volver", callback_data="PF:EDIT")]
+            [InlineKeyboardButton("Volver", callback_data="PF:EDIT"), InlineKeyboardButton("Cancelar", callback_data="PF:BACK")]
         ])
-        await _send_below_menu(context, chat_id, text="¿Qué querés hacer?", reply_markup=kb_ed)
+        await _edit_active_menu("¿Qué querés hacer?", reply_markup=kb_ed)
         return
 
     if data == "PF:ED:ADDQ":
         context.user_data["pf_mode"] = "edit_addq"
-        await _send_below_menu(context, chat_id, text="Ingresá la <b>cantidad a sumar</b>."); return
+        kb_step = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:EDIT"), InlineKeyboardButton("Cancelar", callback_data="PF:BACK")]])
+        await _edit_active_menu("Ingresá la <b>cantidad a sumar</b>.", reply_markup=kb_step); return
     if data == "PF:ED:SUBQ":
         context.user_data["pf_mode"] = "edit_subq"
-        await _send_below_menu(context, chat_id, text="Ingresá la <b>cantidad a restar</b>."); return
+        kb_step = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:EDIT"), InlineKeyboardButton("Cancelar", callback_data="PF:BACK")]])
+        await _edit_active_menu("Ingresá la <b>cantidad a restar</b>.", reply_markup=kb_step); return
     if data == "PF:ED:AMT":
         context.user_data["pf_mode"] = "edit_amt"
-        await _send_below_menu(context, chat_id, text="Ingresá el <b>nuevo importe</b> (moneda BASE)."); return
+        kb_step = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:EDIT"), InlineKeyboardButton("Cancelar", callback_data="PF:BACK")]])
+        await _edit_active_menu("Ingresá el <b>nuevo importe</b> (moneda BASE).", reply_markup=kb_step); return
     if data == "PF:ED:DEL":
         pf = pf_get(chat_id); idx = context.user_data.get("pf_edit_idx", -1)
         if 0 <= idx < len(pf["items"]):
@@ -8244,17 +8278,27 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "PF:EXPORT":
         pf = pf_get(chat_id)
         if not pf.get("items"):
-            await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. No hay datos para exportar.")
+            kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:BACK"), InlineKeyboardButton("Cancelar", callback_data="PF:BACK")]])
+            await _edit_active_menu("Tu portafolio está vacío. No hay datos para exportar.", reply_markup=kb_back)
             return
-        await _send_below_menu(context, chat_id, text="¿Qué querés exportar?", reply_markup=kb_export)
+        kb_export_menu = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Exportar actual", callback_data="PF:EXPORT:NOW"),
+                InlineKeyboardButton("Histórico", callback_data="PF:EXPORT:HISTORY"),
+            ],
+            [InlineKeyboardButton("Volver", callback_data="PF:BACK"), InlineKeyboardButton("Cancelar", callback_data="PF:BACK")],
+        ])
+        await _edit_active_menu("¿Qué querés exportar?", reply_markup=kb_export_menu)
         return
 
     if data == "PF:EXPORT:NOW":
         await pf_export_current(context, chat_id)
+        await pf_refresh_menu(context, chat_id, force_new=True)
         return
 
     if data == "PF:EXPORT:HISTORY":
         await pf_export_history(context, chat_id)
+        await pf_refresh_menu(context, chat_id, force_new=True)
         return
 
     if data == "PF:CLEAR":
@@ -8271,21 +8315,17 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("Eliminar todo", callback_data="PF:CLEAR:ALL"),
                 InlineKeyboardButton("Deshacer", callback_data="PF:CLEAR:UNDO"),
             ])
-            rows.append([InlineKeyboardButton("Cancelar", callback_data="PF:CLEAR:CANCEL")])
+            rows.append([InlineKeyboardButton("Volver", callback_data="PF:BACK"), InlineKeyboardButton("Cancelar", callback_data="PF:CLEAR:CANCEL")])
             return InlineKeyboardMarkup(rows)
 
         if not items:
-            await _send_below_menu(
-                context,
-                chat_id,
-                text="Tu portafolio está vacío. Podés usar <b>Deshacer</b> si eliminaste algo recientemente.",
+            await _edit_active_menu(
+                "Tu portafolio está vacío. Podés usar <b>Deshacer</b> si eliminaste algo recientemente.",
                 reply_markup=_pf_clear_keyboard(),
             )
         else:
-            await _send_below_menu(
-                context,
-                chat_id,
-                text="Elegí qué instrumento eliminar:",
+            await _edit_active_menu(
+                "Elegí qué instrumento eliminar:",
                 reply_markup=_pf_clear_keyboard(),
             )
         return
@@ -8295,26 +8335,21 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         stack: List[Dict[str, Any]] = context.user_data.setdefault("pf_deleted_stack", [])
         action = data.split(":", 2)[2]
 
-        try:
-            await q.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
         if action == "ALL":
             items = pf.get("items", [])
             if not items:
-                await _send_below_menu(context, chat_id, text="No hay instrumentos para eliminar.")
+                kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:CLEAR"), InlineKeyboardButton("Cancelar", callback_data="PF:CLEAR:CANCEL")]])
+                await _edit_active_menu("No hay instrumentos para eliminar.", reply_markup=kb_back)
                 return
             kb_confirm = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("Sí, eliminar todo", callback_data="PF:CLEAR:ALLCONFIRM"),
                     InlineKeyboardButton("Cancelar", callback_data="PF:CLEAR:CANCEL"),
-                ]
+                ],
+                [InlineKeyboardButton("Volver", callback_data="PF:CLEAR")],
             ])
-            await _send_below_menu(
-                context,
-                chat_id,
-                text="¿Seguro que querés eliminar todos los instrumentos? Podés deshacer luego.",
+            await _edit_active_menu(
+                "¿Seguro que querés eliminar todos los instrumentos? Podés deshacer luego.",
                 reply_markup=kb_confirm,
             )
             return
@@ -8322,7 +8357,8 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if action == "ALLCONFIRM":
             items = pf.get("items", [])
             if not items:
-                await _send_below_menu(context, chat_id, text="No había instrumentos para eliminar.")
+                kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:CLEAR"), InlineKeyboardButton("Cancelar", callback_data="PF:CLEAR:CANCEL")]])
+                await _edit_active_menu("No había instrumentos para eliminar.", reply_markup=kb_back)
                 return
             for idx, entry in reversed(list(enumerate(items))):
                 stack.append({"index": idx, "item": copy.deepcopy(entry)})
@@ -8354,13 +8390,15 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "CANCEL":
+            await pf_refresh_menu(context, chat_id, force_new=True)
             await _send_below_menu(context, chat_id, text="Operación cancelada.")
             return
 
         try:
             idx = int(action)
         except Exception:
-            await _send_below_menu(context, chat_id, text="Acción inválida.")
+            kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:CLEAR"), InlineKeyboardButton("Cancelar", callback_data="PF:CLEAR:CANCEL")]])
+            await _edit_active_menu("Acción inválida.", reply_markup=kb_back)
             return
 
         items = pf.get("items", [])
@@ -8377,14 +8415,12 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=f"Instrumento eliminado: {label}. Podés usar <b>Deshacer</b> para revertir.",
             )
         else:
-            await _send_below_menu(context, chat_id, text="Índice inválido.")
+            kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("Volver", callback_data="PF:CLEAR"), InlineKeyboardButton("Cancelar", callback_data="PF:CLEAR:CANCEL")]])
+            await _edit_active_menu("Índice inválido.", reply_markup=kb_back)
         return
 
     if data == "PF:BACK":
-        try:
-            await q.delete_message()
-        except Exception:
-            await q.edit_message_reply_markup(reply_markup=None)
+        await pf_refresh_menu(context, chat_id, force_new=True)
         return
 
 def _parse_num_text(s: str) -> Optional[float]:
