@@ -7702,7 +7702,8 @@ kb_export = InlineKeyboardMarkup(
         [
             InlineKeyboardButton("Exportar actual", callback_data="PF:EXPORT:NOW"),
             InlineKeyboardButton("Histórico", callback_data="PF:EXPORT:HISTORY"),
-        ]
+        ],
+        [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
     ]
 )
 
@@ -7966,6 +7967,24 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = q.message.chat_id; data = q.data
     context.user_data["pf_menu_msg_id"] = q.message.message_id
 
+    async def _pf_cancel_to_menu(msg: str = "Operación cancelada."):
+        try:
+            await q.delete_message()
+        except Exception:
+            try:
+                await q.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        await pf_refresh_menu(context, chat_id, force_new=True)
+        await _send_below_menu(context, chat_id, text=msg)
+
+    if data == "PF:BACK":
+        await _pf_cancel_to_menu("Volviste al menú principal.")
+        return
+
+    if data.startswith("PF:BACK:"):
+        data = f"PF:{data.split(':', 2)[2]}"
+
     if data == "PF:MENU":
         context.user_data["pf_mode"] = None
         await q.edit_message_text(await pf_main_menu_text(chat_id), reply_markup=kb_pf_main(chat_id), parse_mode=ParseMode.HTML)
@@ -8120,17 +8139,17 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tipo = data.split(":")[2]
         context.user_data["pf_add_tipo"] = tipo
         if tipo == "accion":
-            await q.edit_message_text("Elegí la acción:", reply_markup=kb_pick_generic(ACCIONES_BA, "PF:ADD", "PF:PICK"))
+            await q.edit_message_text("Elegí la acción:", reply_markup=kb_pick_generic(ACCIONES_BA, "ADD", "PF:PICK"))
         elif tipo == "cedear":
-            await q.edit_message_text("Elegí el cedear:", reply_markup=kb_pick_generic(CEDEARS_BA, "PF:ADD", "PF:PICK"))
+            await q.edit_message_text("Elegí el cedear:", reply_markup=kb_pick_generic(CEDEARS_BA, "ADD", "PF:PICK"))
         elif tipo == "bono":
-            await q.edit_message_text("Elegí el bono:", reply_markup=kb_pick_generic(BONOS_AR, "PF:ADD", "PF:PICK"))
+            await q.edit_message_text("Elegí el bono:", reply_markup=kb_pick_generic(BONOS_AR, "ADD", "PF:PICK"))
         elif tipo == "fci":
-            await q.edit_message_text("Elegí el FCI:", reply_markup=kb_pick_generic(FCI_LIST, "PF:ADD", "PF:PICK"))
+            await q.edit_message_text("Elegí el FCI:", reply_markup=kb_pick_generic(FCI_LIST, "ADD", "PF:PICK"))
         elif tipo == "lete":
-            await q.edit_message_text("Elegí la Letra:", reply_markup=kb_pick_generic(LETES_LIST, "PF:ADD", "PF:PICK"))
+            await q.edit_message_text("Elegí la Letra:", reply_markup=kb_pick_generic(LETES_LIST, "ADD", "PF:PICK"))
         else:
-            await q.edit_message_text("Elegí la cripto:", reply_markup=kb_pick_generic(CRIPTO_TOP_NAMES, "PF:ADD", "PF:PICK"))
+            await q.edit_message_text("Elegí la cripto:", reply_markup=kb_pick_generic(CRIPTO_TOP_NAMES, "ADD", "PF:PICK"))
         context.user_data["pf_add_message_id"] = q.message.message_id
         return
 
