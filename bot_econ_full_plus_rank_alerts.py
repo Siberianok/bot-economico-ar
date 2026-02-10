@@ -7701,7 +7701,8 @@ kb_export = InlineKeyboardMarkup(
         [
             InlineKeyboardButton("Exportar actual", callback_data="PF:EXPORT:NOW"),
             InlineKeyboardButton("Histórico", callback_data="PF:EXPORT:HISTORY"),
-        ]
+        ],
+        [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
     ]
 )
 
@@ -7827,7 +7828,7 @@ def kb_pf_add_methods() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Por cantidad", callback_data="PF:ADDQTY"), InlineKeyboardButton("Por importe", callback_data="PF:ADDAMT")],
         [InlineKeyboardButton("Por % del monto", callback_data="PF:ADDPCT")],
-        [InlineKeyboardButton("Volver", callback_data="PF:ADD")],
+        [InlineKeyboardButton("Volver", callback_data="PF:BACK:ADD")],
     ])
 
 def kb_pf_projection_horizons(selected: int) -> InlineKeyboardMarkup:
@@ -7915,7 +7916,7 @@ def kb_pick_generic(symbols: List[str], back: str, prefix: str) -> InlineKeyboar
         row.append((label, f"{prefix}:{s}"))
         if len(row) == 2: rows.append(row); row = []
     if row: rows.append(row)
-    rows.append([("Volver","PF:ADD")])
+    rows.append([("Volver",f"PF:BACK:{back}")])
     return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t,d in r] for r in rows])
 
 async def cmd_portafolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7948,6 +7949,24 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     chat_id = q.message.chat_id; data = q.data
     context.user_data["pf_menu_msg_id"] = q.message.message_id
+
+    async def _pf_cancel_to_menu(msg: str = "Operación cancelada."):
+        try:
+            await q.delete_message()
+        except Exception:
+            try:
+                await q.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        await pf_refresh_menu(context, chat_id, force_new=True)
+        await _send_below_menu(context, chat_id, text=msg)
+
+    if data == "PF:BACK":
+        await _pf_cancel_to_menu("Volviste al menú principal.")
+        return
+
+    if data.startswith("PF:BACK:"):
+        data = f"PF:{data.split(':', 2)[2]}"
 
     if data == "PF:MENU":
         await cmd_portafolio(update, context)
@@ -8069,7 +8088,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pct_str = f" · objetivo: {pct_plain(obj_pct_val, 1)}" if obj_pct_val is not None else ""
             lines.append(f"{i}. {label}{pct_str}")
             buttons.append([InlineKeyboardButton(f"{i}. {label}", callback_data=f"PF:REBAL:PICK:{i-1}")])
-        buttons.append([InlineKeyboardButton("Volver", callback_data="PF:BACK")])
+        buttons.append([InlineKeyboardButton("Volver", callback_data="PF:BACK:REBAL")])
         await _send_below_menu(
             context,
             chat_id,
@@ -8105,17 +8124,17 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tipo = data.split(":")[2]
         context.user_data["pf_add_tipo"] = tipo
         if tipo == "accion":
-            await q.edit_message_text("Elegí la acción:", reply_markup=kb_pick_generic(ACCIONES_BA, "PF:ADD", "PF:PICK"))
+            await q.edit_message_text("Elegí la acción:", reply_markup=kb_pick_generic(ACCIONES_BA, "ADD", "PF:PICK"))
         elif tipo == "cedear":
-            await q.edit_message_text("Elegí el cedear:", reply_markup=kb_pick_generic(CEDEARS_BA, "PF:ADD", "PF:PICK"))
+            await q.edit_message_text("Elegí el cedear:", reply_markup=kb_pick_generic(CEDEARS_BA, "ADD", "PF:PICK"))
         elif tipo == "bono":
-            await q.edit_message_text("Elegí el bono:", reply_markup=kb_pick_generic(BONOS_AR, "PF:ADD", "PF:PICK"))
+            await q.edit_message_text("Elegí el bono:", reply_markup=kb_pick_generic(BONOS_AR, "ADD", "PF:PICK"))
         elif tipo == "fci":
-            await q.edit_message_text("Elegí el FCI:", reply_markup=kb_pick_generic(FCI_LIST, "PF:ADD", "PF:PICK"))
+            await q.edit_message_text("Elegí el FCI:", reply_markup=kb_pick_generic(FCI_LIST, "ADD", "PF:PICK"))
         elif tipo == "lete":
-            await q.edit_message_text("Elegí la Letra:", reply_markup=kb_pick_generic(LETES_LIST, "PF:ADD", "PF:PICK"))
+            await q.edit_message_text("Elegí la Letra:", reply_markup=kb_pick_generic(LETES_LIST, "ADD", "PF:PICK"))
         else:
-            await q.edit_message_text("Elegí la cripto:", reply_markup=kb_pick_generic(CRIPTO_TOP_NAMES, "PF:ADD", "PF:PICK"))
+            await q.edit_message_text("Elegí la cripto:", reply_markup=kb_pick_generic(CRIPTO_TOP_NAMES, "ADD", "PF:PICK"))
         context.user_data["pf_add_message_id"] = q.message.message_id
         return
 
@@ -8199,7 +8218,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("+ Cantidad", callback_data="PF:ED:ADDQ"), InlineKeyboardButton("- Cantidad", callback_data="PF:ED:SUBQ")],
             [InlineKeyboardButton("Cambiar importe", callback_data="PF:ED:AMT")],
             [InlineKeyboardButton("Eliminar este", callback_data="PF:ED:DEL")],
-            [InlineKeyboardButton("Volver", callback_data="PF:EDIT")]
+            [InlineKeyboardButton("Volver", callback_data="PF:BACK:EDIT")]
         ])
         await _send_below_menu(context, chat_id, text="¿Qué querés hacer?", reply_markup=kb_ed)
         return
@@ -8354,7 +8373,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if action == "CANCEL":
-            await _send_below_menu(context, chat_id, text="Operación cancelada.")
+            await _pf_cancel_to_menu("Operación cancelada.")
             return
 
         try:
@@ -8378,13 +8397,6 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await _send_below_menu(context, chat_id, text="Índice inválido.")
-        return
-
-    if data == "PF:BACK":
-        try:
-            await q.delete_message()
-        except Exception:
-            await q.edit_message_reply_markup(reply_markup=None)
         return
 
 def _parse_num_text(s: str) -> Optional[float]:
