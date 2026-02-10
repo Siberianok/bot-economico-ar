@@ -7945,8 +7945,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
              InlineKeyboardButton("Simular aporte mensual", callback_data="PF:REBAL:SIM:MONTH")],
             [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
         ])
-        await _send_below_menu(context, chat_id, text="Rebalanceo y simulación:")
-        await context.bot.send_message(chat_id, " ", reply_markup=kb_rebal)
+        await _send_below_menu(context, chat_id, text="Rebalanceo y simulación:", reply_markup=kb_rebal)
         return
 
     if data == "PF:REBAL:PCT":
@@ -8103,8 +8102,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("Eliminar este", callback_data="PF:ED:DEL")],
             [InlineKeyboardButton("Volver", callback_data="PF:EDIT")]
         ])
-        await _send_below_menu(context, chat_id, text="¿Qué querés hacer?")
-        await context.bot.send_message(chat_id, " ", reply_markup=kb_ed)
+        await _send_below_menu(context, chat_id, text="¿Qué querés hacer?", reply_markup=kb_ed)
         return
 
     if data == "PF:ED:ADDQ":
