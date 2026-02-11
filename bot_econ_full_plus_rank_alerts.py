@@ -413,25 +413,10 @@ def _fci_metrics_from_record(record: Dict[str, Any]) -> Dict[str, Optional[float
         "last_chg": None,
     }
 
-    try:
-        base["last_px"] = float(record.get("lastPrice"))
-    except (TypeError, ValueError):
-        base["last_px"] = None
-
-    try:
-        base["last_chg"] = float(record.get("dayPercent"))
-    except (TypeError, ValueError):
-        base["last_chg"] = None
-
-    try:
-        base["1m"] = float(record.get("monthPercent"))
-    except (TypeError, ValueError):
-        base["1m"] = None
-
-    try:
-        base["6m"] = float(record.get("yearPercent"))
-    except (TypeError, ValueError):
-        base["6m"] = None
+    base["last_px"] = _to_float_loose(record.get("lastPrice"))
+    base["last_chg"] = _to_float_loose(record.get("dayPercent"))
+    base["1m"] = _to_float_loose(record.get("monthPercent"))
+    base["6m"] = _to_float_loose(record.get("yearPercent"))
 
     last_ts_raw = record.get("lastPriceDate")
     if isinstance(last_ts_raw, str):
@@ -661,6 +646,35 @@ def price_to_base(price: Optional[float], inst_currency: str, base_currency: str
     return None
 
 
+def _to_float_loose(value: Any) -> Optional[float]:
+    """Best-effort float parsing for heterogeneous market sources."""
+
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    text = text.replace("%", "").replace("\xa0", " ").replace(" ", "")
+    text = text.replace("−", "-")
+
+    if "," in text and "." in text:
+        if text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        else:
+            text = text.replace(",", "")
+    elif "," in text:
+        text = text.replace(",", ".")
+
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
 def metric_last_price(metrics: Dict[str, Any]) -> Optional[float]:
     """Return the last available native price contained in a metrics dict.
 
@@ -675,28 +689,21 @@ def metric_last_price(metrics: Dict[str, Any]) -> Optional[float]:
         return None
 
     last_raw = metrics.get("last_px")
-    if last_raw is not None:
-        try:
-            return float(last_raw)
-        except (TypeError, ValueError):
-            pass
+    last_val = _to_float_loose(last_raw)
+    if last_val is not None:
+        return last_val
 
     prev_raw = metrics.get("prev_px")
     chg_raw = metrics.get("last_chg")
 
-    if prev_raw is not None and chg_raw is not None:
-        try:
-            prev_val = float(prev_raw)
-            chg_val = float(chg_raw)
-            return prev_val * (1.0 + chg_val / 100.0)
-        except (TypeError, ValueError):
-            pass
+    prev_val = _to_float_loose(prev_raw)
+    chg_val = _to_float_loose(chg_raw)
 
-    if prev_raw is not None:
-        try:
-            return float(prev_raw)
-        except (TypeError, ValueError):
-            pass
+    if prev_val is not None and chg_val is not None:
+        return prev_val * (1.0 + chg_val / 100.0)
+
+    if prev_val is not None:
+        return prev_val
 
     return None
 
@@ -2755,22 +2762,15 @@ async def _rava_metrics(session: ClientSession, symbol: str) -> Dict[str, Option
     if quotes:
         row = quotes[0]
         last_raw = row.get("ultimo") if isinstance(row, dict) else None
-        try:
-            last = float(last_raw) if last_raw is not None else None
-        except (TypeError, ValueError):
-            last = None
+        last = _to_float_loose(last_raw)
         if last is not None:
             base["last_px"] = last
         if row.get("variacion") is not None:
-            try:
-                base["last_chg"] = float(row.get("variacion"))
-            except (TypeError, ValueError):
-                base["last_chg"] = None
+            base["last_chg"] = _to_float_loose(row.get("variacion"))
         if row.get("anterior") is not None:
-            try:
-                base["prev_px"] = float(row.get("anterior"))
-            except (TypeError, ValueError):
-                pass
+            prev_val = _to_float_loose(row.get("anterior"))
+            if prev_val is not None:
+                base["prev_px"] = prev_val
         fecha = row.get("fecha")
         hora = row.get("hora") or "00:00:00"
         if fecha:
@@ -7491,6 +7491,19 @@ async def _job_projection_performance(context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception as exc:
         log.warning("performance job error: %s", exc)
 
+
+def _schedule_projection_performance(app: Application) -> None:
+    job_name = "projection_performance_eval"
+    for j in app.job_queue.get_jobs_by_name(job_name):
+        j.schedule_removal()
+    app.job_queue.run_repeating(
+        _job_projection_performance,
+        interval=6 * 3600,
+        first=300,
+        name=job_name,
+    )
+
+
 def _job_name_daily(chat_id: int) -> str: return f"daily_{chat_id}"
 
 def _schedule_daily_for_chat(app: Application, chat_id: int, hhmm: str):
@@ -7562,7 +7575,11 @@ async def subs_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hhmm = data.split(":",2)[2]
         SUBS.setdefault(chat_id, {})["daily"] = hhmm; await save_state()
         _schedule_daily_for_chat(context.application, chat_id, hhmm)
-        await q.edit_message_text(f"Te suscribí al Resumen Diario a las {hhmm} (hora AR)."); return ConversationHandler.END
+        await q.edit_message_text(
+            f"Te suscribí al Resumen Diario a las {hhmm} (hora AR). Te envío uno ahora para confirmar ✅"
+        )
+        await cmd_resumen_diario(update, context)
+        return ConversationHandler.END
     await q.edit_message_text("Acción inválida."); return ConversationHandler.END
 
 # ============================ PORTAFOLIO (salida debajo del menú + torta) ============================
@@ -10207,7 +10224,30 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     evaluated = [b for b in PROJECTION_BATCHES if b.get("evaluated")]
     if not evaluated:
-        await update.effective_message.reply_text("Sin métricas de performance todavía.")
+        pending = [b for b in PROJECTION_BATCHES if not b.get("evaluated")]
+        if not pending:
+            await update.effective_message.reply_text(
+                "Sin métricas de performance todavía. Generá proyecciones (rankings/portafolio) para empezar a medir."
+            )
+            return
+        elapsed_trading_days: List[int] = []
+        for batch in pending:
+            created_date = batch.get("created_date")
+            if not created_date:
+                continue
+            try:
+                created_dt = datetime.strptime(str(created_date), "%Y-%m-%d").date()
+            except Exception:
+                continue
+            elapsed_trading_days.append(
+                _trading_days_between(created_dt, datetime.now(TZ).date())
+            )
+        status = f"Batches pendientes: {len(pending)}"
+        if elapsed_trading_days:
+            status += f" · ruedas transcurridas mín.: {min(elapsed_trading_days)}"
+        await update.effective_message.reply_text(
+            "Sin métricas de performance todavía. " + status
+        )
         return
     batches_3m = [b for b in evaluated if b.get("horizon") == WINDOW_DAYS[3]]
     batches_6m = [b for b in evaluated if b.get("horizon") == WINDOW_DAYS[6]]
@@ -10455,6 +10495,7 @@ async def main():
     application = build_application()
     _schedule_all_subs(application)
     _schedule_projection_calibration(application)
+    _schedule_projection_performance(application)
 
     alerts_task = None
     keepalive_task = None
