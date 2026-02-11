@@ -25,21 +25,30 @@ class HttpService:
         base_backoff: float = 0.4,
         failure_threshold: int = 3,
         suspend_seconds: int = 60,
+        default_headers: Optional[Dict[str, str]] = None,
     ) -> None:
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(timeout), follow_redirects=True
-        )
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(timeout), follow_redirects=True)
+        self._owns_client = True
+        self._default_timeout = timeout
+        self._default_headers = default_headers or {}
         self._max_retries = max_retries
         self._base_backoff = base_backoff
         self._failure_threshold = failure_threshold
         self._suspend_seconds = suspend_seconds
         self._fail_streak: Dict[str, int] = {}
         self._suspended_until: Dict[str, float] = {}
-        self.metrics: Dict[str, Dict[str, int]] = {
-            "success": {},
-            "failure": {},
-        }
+        self.metrics: Dict[str, Dict[str, int]] = {"success": {}, "failure": {}}
         self._lock = asyncio.Lock()
+
+    def configure_client(self, client: httpx.AsyncClient) -> None:
+        self._client = client
+        self._owns_client = False
+
+    def configure_defaults(self, *, headers: Optional[Dict[str, str]] = None, timeout: Optional[float] = None) -> None:
+        if headers is not None:
+            self._default_headers = dict(headers)
+        if timeout is not None:
+            self._default_timeout = timeout
 
     def _source_name(self, url: str, source: Optional[str]) -> str:
         if source:
@@ -61,12 +70,7 @@ class HttpService:
         if self._fail_streak[source] >= self._failure_threshold:
             resume_at = time.time() + self._suspend_seconds
             self._suspended_until[source] = resume_at
-            log.warning(
-                "source_suspended source=%s resume_at=%s failure_streak=%s",
-                source,
-                resume_at,
-                self._fail_streak[source],
-            )
+            log.warning("source_suspended source=%s resume_at=%s failure_streak=%s", source, resume_at, self._fail_streak[source])
 
     def is_suspended(self, source: str) -> Optional[float]:
         resume_at = self._suspended_until.get(source)
@@ -76,36 +80,28 @@ class HttpService:
             self._suspended_until.pop(source, None)
         return None
 
-    async def _request(self, method: str, url: str, *, source: Optional[str] = None, **kwargs: Any) -> httpx.Response:
+    async def _request(self, method: str, url: str, *, source: Optional[str] = None, headers: Optional[Dict[str, str]] = None, **kwargs: Any) -> httpx.Response:
         src = self._source_name(url, source)
         suspended_until = self.is_suspended(src)
         if suspended_until:
             raise SourceSuspendedError(src, suspended_until)
 
+        req_headers = {**self._default_headers, **(headers or {})}
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = self._default_timeout
+
         last_error: Optional[Exception] = None
         for attempt in range(self._max_retries):
             try:
-                resp = await self._client.request(method, url, **kwargs)
+                resp = await self._client.request(method, url, headers=req_headers, **kwargs)
                 if 200 <= resp.status_code < 300:
                     self._mark_success(src)
                     return resp
                 last_error = RuntimeError(f"status={resp.status_code}")
-                log.warning(
-                    "http_request_failed source=%s url=%s status=%s attempt=%s",
-                    src,
-                    url,
-                    resp.status_code,
-                    attempt + 1,
-                )
+                log.warning("http_request_failed source=%s url=%s status=%s attempt=%s", src, url, resp.status_code, attempt + 1)
             except Exception as exc:
                 last_error = exc
-                log.warning(
-                    "http_request_error source=%s url=%s attempt=%s error=%s",
-                    src,
-                    url,
-                    attempt + 1,
-                    exc,
-                )
+                log.warning("http_request_error source=%s url=%s attempt=%s error=%s", src, url, attempt + 1, exc)
             if attempt + 1 < self._max_retries:
                 backoff = self._base_backoff * (2 ** attempt) + random.uniform(0, self._base_backoff)
                 await asyncio.sleep(backoff)
@@ -116,26 +112,20 @@ class HttpService:
         raise RuntimeError(f"request failed for {src}")
 
     async def get_json(self, url: str, *, source: Optional[str] = None, headers: Optional[Dict[str, str]] = None, **kwargs: Any) -> Dict[str, Any]:
-        resp = await self._request(
-            "GET", url, source=source, headers=headers or {}, **kwargs
-        )
+        resp = await self._request("GET", url, source=source, headers=headers, **kwargs)
         return resp.json()
 
     async def get_text(self, url: str, *, source: Optional[str] = None, headers: Optional[Dict[str, str]] = None, **kwargs: Any) -> str:
-        resp = await self._request(
-            "GET", url, source=source, headers=headers or {}, **kwargs
-        )
+        resp = await self._request("GET", url, source=source, headers=headers, **kwargs)
         return resp.text
 
     async def aclose(self) -> None:
         async with self._lock:
-            await self._client.aclose()
+            if self._owns_client:
+                await self._client.aclose()
 
     def snapshot_metrics(self) -> Dict[str, Dict[str, int]]:
-        return {
-            "success": dict(self.metrics.get("success", {})),
-            "failure": dict(self.metrics.get("failure", {})),
-        }
+        return {"success": dict(self.metrics.get("success", {})), "failure": dict(self.metrics.get("failure", {}))}
 
 
 http_service = HttpService()

@@ -1370,9 +1370,11 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
     source = kwargs.pop("source", None)
     http_timeout = timeout.total if isinstance(timeout, ClientTimeout) else timeout
     try:
-        return await http_service.get_json(
+        payload = await http_service.get_json(
             url, source=source, headers={**REQ_HEADERS, **headers}, timeout=http_timeout, **kwargs
         )
+        _record_http_metrics(host, (time() - started) * 1000, success=True)
+        return payload
     except SourceSuspendedError as exc:
         _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning(
@@ -1382,29 +1384,15 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
             url,
         )
         return None
-    except Exception as exc:
-        _record_http_metrics(host, (time() - started) * 1000, success=False)
-        log.warning("fetch_json http_service error %s: %s", url, exc)
-    try:
-        async with session.get(
-            url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs
-        ) as resp:
-            if 200 <= resp.status < 300:
-                payload = await resp.json(content_type=None)
-                _record_http_metrics(host, (time() - started) * 1000, success=True)
-                return payload
-            log.warning("GET %s -> %s", url, resp.status)
-    except asyncio.TimeoutError:
+    except httpx.TimeoutException:
         duration_ms = (time() - started) * 1000
         _record_http_metrics(host, duration_ms, success=False, timeout=True)
         log.error("fetch_json timeout", extra={"url": url, "event": "api_timeout", "duration_ms": duration_ms})
         return None
-    except Exception as e:
+    except Exception as exc:
         _record_http_metrics(host, (time() - started) * 1000, success=False)
-        log.warning("fetch_json error %s: %s", url, e)
+        log.warning("fetch_json http_service error %s: %s", url, exc)
         return None
-    _record_http_metrics(host, (time() - started) * 1000, success=False)
-    return None
 
 
 def build_httpx_client() -> httpx.AsyncClient:
@@ -1458,12 +1446,14 @@ async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str
 
     try:
         http_timeout = timeout.total if isinstance(timeout, ClientTimeout) else timeout
-        return await http_service.get_text(
+        body = await http_service.get_text(
             url,
             headers={**REQ_HEADERS, **headers},
             timeout=http_timeout,
             **kwargs,
         )
+        _record_http_metrics(host, (time() - started) * 1000, success=True)
+        return body
     except SourceSuspendedError as exc:
         _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning(
@@ -1473,14 +1463,7 @@ async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str
             url,
         )
         return None
-    try:
-        async with session.get(url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs) as resp:
-            if resp.status == 200:
-                body = await resp.text()
-                _record_http_metrics(host, (time() - started) * 1000, success=True)
-                return body
-            log.warning("GET %s -> %s", url, resp.status)
-    except asyncio.TimeoutError:
+    except httpx.TimeoutException:
         duration_ms = (time() - started) * 1000
         _record_http_metrics(host, duration_ms, success=False, timeout=True)
         log.error("fetch_text timeout", extra={"url": url, "event": "api_timeout", "duration_ms": duration_ms})
@@ -1489,8 +1472,6 @@ async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str
         _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning("fetch_text error %s: %s", url, e)
         return None
-    _record_http_metrics(host, (time() - started) * 1000, success=False)
-    return None
 
 
 async def get_binance_symbols(session: ClientSession) -> Dict[str, Dict[str, str]]:
@@ -10480,6 +10461,7 @@ async def _shutdown_httpx_client(app: Application) -> None:
     client = app.bot_data.get(HTTPX_CLIENT_KEY)
     if isinstance(client, httpx.AsyncClient):
         await client.aclose()
+    await http_service.aclose()
 
 
 def build_application() -> Application:
@@ -10491,6 +10473,8 @@ def build_application() -> Application:
         .build()
     )
     app.bot_data[HTTPX_CLIENT_KEY] = httpx_client
+    http_service.configure_client(httpx_client)
+    http_service.configure_defaults(headers=REQ_HEADERS, timeout=15)
 
     # Comandos
     app.add_handler(CommandHandler("start", cmd_start))
