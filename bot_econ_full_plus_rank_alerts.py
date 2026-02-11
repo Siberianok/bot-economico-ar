@@ -8781,6 +8781,7 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
     except (TypeError, ValueError):
         tc_ts = None
     state_updated = False
+    items_updated = False
     async with ClientSession() as session:
         now_ts = int(time())
         tc_stale = tc_ts is None or (now_ts - tc_ts) > 24 * 60 * 60
@@ -8802,9 +8803,6 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             symbols.append(benchmark_symbol)
             symbols = sorted(set(symbols))
         mets, last_ts = await metrics_for_symbols(session, symbols) if symbols else ({}, None)
-    if state_updated:
-        await save_state()
-
     enriched: List[Dict[str, Any]] = []
     total_invertido = 0.0
     total_actual = 0.0
@@ -8821,9 +8819,7 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         except (TypeError, ValueError):
             price_ts = None
         price_native = metric_last_price(met) if met else None
-        if price_native is None:
-            met = {}
-        else:
+        if price_native is not None:
             met["last_px"] = price_native
         met_currency = met.get("currency") if met else None
         inst_cur = instrument_currency(sym, tipo) if sym else base_currency
@@ -8881,9 +8877,45 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         if qty is None and price_base_for_qty and price_base_for_qty > 0 and invertido > 0:
             qty = invertido / price_base_for_qty
             derived_qty = True
+        last_valued_base_raw = it.get("last_valued_base")
+        try:
+            last_valued_base = float(last_valued_base_raw) if last_valued_base_raw is not None else None
+        except (TypeError, ValueError):
+            last_valued_base = None
+        last_valued_ts_raw = it.get("last_valued_ts")
+        try:
+            last_valued_ts = int(last_valued_ts_raw) if last_valued_ts_raw is not None else None
+        except (TypeError, ValueError):
+            last_valued_ts = None
+        daily_change_raw = met.get("last_chg") if met else None
+        try:
+            daily_change = float(daily_change_raw) if daily_change_raw is not None else None
+        except (TypeError, ValueError):
+            daily_change = None
+
         valor_actual = invertido
+        valuation_mode = "last_known"
         if qty is not None and price_base is not None:
             valor_actual = float(qty) * float(price_base)
+            valuation_mode = "price"
+            if (
+                last_valued_base is None
+                or not math.isclose(last_valued_base, valor_actual, rel_tol=1e-9, abs_tol=1e-6)
+                or last_valued_ts != now_ts
+            ):
+                it["last_valued_base"] = float(valor_actual)
+                it["last_valued_ts"] = now_ts
+                last_valued_base = float(valor_actual)
+                last_valued_ts = now_ts
+                items_updated = True
+        else:
+            base_value = last_valued_base if last_valued_base is not None else invertido
+            if daily_change is not None:
+                valor_actual = float(base_value) * (1.0 + float(daily_change) / 100.0)
+                valuation_mode = "estimated_from_daily_change"
+            else:
+                valor_actual = float(base_value)
+                valuation_mode = "last_known"
         valor_actual_nativo = None
         if qty is not None and price_native is not None:
             valor_actual_nativo = float(qty) * float(price_native)
@@ -8908,13 +8940,21 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             "fx_ts_compra": fx_ts_compra,
             "metrics": met,
             "inst_currency": inst_cur,
-            "daily_change": met.get("last_chg") if met else None,
+            "daily_change": daily_change,
             "price_ts": price_ts,
             "fx_rate": effective_tc,
             "fx_rate_item": fx_rate_item,
             "fx_ts": effective_ts,
             "added_ts": added_ts,
+            "valuation_mode": valuation_mode,
+            "last_valued_base": last_valued_base,
+            "last_valued_ts": last_valued_ts,
         })
+
+    if items_updated:
+        state_updated = True
+    if state_updated:
+        await save_state()
 
     for entry in enriched:
         entry["peso"] = (entry["valor_actual"] / total_actual) if total_actual > 0 else 0.0
@@ -9799,6 +9839,8 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         if entry['invertido'] > 0:
             r_ind = (entry['valor_actual']/entry['invertido']-1.0)*100.0
             linea += f" ({pct(r_ind,2)} vs {f_money(entry['invertido'])})"
+        if entry.get("valuation_mode") == "estimated_from_daily_change":
+            linea += " · ~estimado"
         qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
         if qty_txt:
             linea += f" · 📦 Cant: {qty_txt}"
@@ -9907,6 +9949,8 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             detail += f" ({pct(ret_pct,2)} | Δ {f_money(delta)})"
         elif invertido > 0:
             detail += f" (Δ {f_money(delta)})"
+        if entry.get("valuation_mode") == "estimated_from_daily_change":
+            detail += " · ~estimado"
         qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
         if qty_txt:
             detail += f" · 📦 Cant: {qty_txt}"
