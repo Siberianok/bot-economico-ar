@@ -43,12 +43,31 @@ class JsonFileStore(StateStore):
             return None
 
     async def save(self, payload: Dict[str, Any]) -> bool:
+        temp_path = f"{self.path}.tmp"
         try:
-            with open(self.path, "w", encoding="utf-8") as fh:
+            with open(temp_path, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temp_path, self.path)
             return True
         except Exception as exc:  # pragma: no cover - logging branch
-            log.warning("No se pudo escribir estado en %s: %s", self.path, exc)
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception as cleanup_exc:
+                log.warning(
+                    "Error limpiando temporal %s tras fallo de escritura en %s: %s",
+                    temp_path,
+                    self.path,
+                    cleanup_exc,
+                )
+            log.warning(
+                "No se pudo escribir estado en %s usando temporal %s: %s",
+                self.path,
+                temp_path,
+                exc,
+            )
             return False
 
 
