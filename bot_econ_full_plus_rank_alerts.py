@@ -10192,7 +10192,7 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
         bandas = await get_bandas_cambiarias(session)
         rp = await get_riesgo_pais(session, httpx_client=httpx_client)
         infl = await get_inflacion_mensual(session, httpx_client=httpx_client)
-        rv = await get_reservas_lamacro(session)
+        rv = await get_reservas_con_variacion(session)
         news = await fetch_rss_entries(session, limit=3)
 
     partes = []
@@ -10207,9 +10207,17 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
             + (f" <i>({parse_iso_ddmmyyyy(rp[1])})</i>" if rp[1] else "")
         )
     if infl:
-        partes.append(f"<b>📉 Inflación Mensual</b> {str(round(infl[0],1)).replace('.',',')}%" + (f" <i>({infl[1]})</i>" if infl[1] else ""))
+        infl_change_txt = _format_inflacion_variation(infl[2])
+        partes.append(
+            f"<b>📉 Inflación Mensual</b> {str(round(infl[0],1)).replace('.',',')}%{infl_change_txt}"
+            + (f" <i>({infl[1]})</i>" if infl[1] else "")
+        )
     if rv:
-        partes.append(f"<b>🏦 Reservas</b> {fmt_number(rv[0],0)} MUS$" + (f" <i>({rv[1]})</i>" if rv[1] else ""))
+        rv_change_txt = _format_reservas_variation(rv[2], rv[0])
+        partes.append(
+            f"<b>🏦 Reservas</b> {fmt_number(rv[0],0)} MUS${rv_change_txt}"
+            + (f" <i>({rv[1]})</i>" if rv[1] else "")
+        )
     if news:
         partes.append(format_news_block(news)[0])
 
