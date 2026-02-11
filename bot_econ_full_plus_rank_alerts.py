@@ -857,7 +857,7 @@ def is_throttled(command: str, chat_id: Optional[int], user_id: Optional[int], t
 
 async def load_state():
     global ALERTS, SUBS, PF, PF_HISTORY, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE, RIESGO_CACHE, RESERVAS_CACHE, DOLAR_CACHE
-    global PROJ_HISTORY, PROJ_CALIBRATION
+    global PROJ_HISTORY, PROJ_CALIBRATION, PROJECTION_RECORDS, PROJECTION_BATCHES
     data: Optional[Dict[str, Any]] = None
     try:
         data = await STATE_STORE.load()
