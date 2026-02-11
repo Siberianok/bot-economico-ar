@@ -64,6 +64,7 @@ ALERTS_PAGE_SIZE = config.alerts_page_size
 RANK_TOP_LIMIT = config.rank_top_limit
 RANK_PROJ_LIMIT = config.rank_proj_limit
 PORTFOLIO_STALE_HOURS = config.portfolio_stale_hours
+PORTFOLIO_ITEM_FX_FRESH_HOURS = int(getattr(config, "portfolio_item_fx_fresh_hours", 24))
 PORTFOLIO_CHART_TOP_N = max(1, int(getattr(config, "portfolio_chart_top_n", 8)))
 TELEGRAM_TOKEN = config.telegram_token
 WEBHOOK_SECRET = config.webhook_secret
@@ -8853,6 +8854,8 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
     enriched: List[Dict[str, Any]] = []
     total_invertido = 0.0
     total_actual = 0.0
+    fx_item_fresh_secs = max(1, PORTFOLIO_ITEM_FX_FRESH_HOURS) * 60 * 60
+    now_ts = int(time())
     for it in items:
         sym = it.get("simbolo", "")
         tipo = it.get("tipo", "")
@@ -8891,8 +8894,14 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             added_ts = int(added_ts_raw) if added_ts_raw is not None else None
         except (TypeError, ValueError):
             added_ts = None
-        effective_tc = fx_rate_item if fx_rate_item is not None else tc_val
-        effective_ts = fx_ts_item if fx_rate_item is not None else tc_ts
+        fx_item_fresh = (
+            fx_rate_item is not None
+            and fx_rate_item > 0
+            and fx_ts_item is not None
+            and (now_ts - fx_ts_item) <= fx_item_fresh_secs
+        )
+        effective_tc = fx_rate_item if fx_item_fresh else tc_val
+        effective_ts = fx_ts_item if fx_item_fresh else tc_ts
         price_base = price_to_base(price_native, inst_cur, base_currency, effective_tc) if price_native is not None else None
         precio_compra_nativo_raw = it.get("precio_compra_nativo")
         try:
@@ -8969,6 +8978,14 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         total_invertido += invertido
         total_actual += valor_actual
         label = _label_long(sym) if sym else (tipo.upper() if tipo else "Instrumento")
+        fx_rate_used = effective_tc if inst_cur != base_currency else None
+        fx_ts_used = effective_ts if inst_cur != base_currency else None
+        if it.get("fx_rate_used") != fx_rate_used:
+            it["fx_rate_used"] = fx_rate_used
+            state_updated = True
+        if it.get("fx_ts_used") != fx_ts_used:
+            it["fx_ts_used"] = fx_ts_used
+            state_updated = True
         enriched.append({
             "raw": it,
             "symbol": sym,
@@ -8993,6 +9010,8 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             "fx_rate": effective_tc,
             "fx_rate_item": fx_rate_item,
             "fx_ts": effective_ts,
+            "fx_rate_used": fx_rate_used,
+            "fx_ts_used": fx_ts_used,
             "added_ts": added_ts,
             "valuation_mode": valuation_mode,
             "last_valued_base": last_valued_base,
@@ -9045,6 +9064,9 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         if benchmark_label
         else None,
     }
+
+    if state_updated:
+        await save_state()
 
     return enriched, last_ts, total_invertido, total_actual, tc_val, tc_ts, perf_summary
 
@@ -9870,6 +9892,9 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             linea += f" · 📦 Cant: {qty_txt}"
         if entry.get('peso'):
             linea += f" · ⚖️ Peso: {pct_plain(entry['peso']*100.0,1)}"
+        fx_ts_used = entry.get("fx_ts_used")
+        if inst_currency and inst_currency != pf_base and fx_ts_used:
+            linea += f" · 💱 TC al {datetime.fromtimestamp(int(fx_ts_used), TZ).strftime('%d/%m/%Y %H:%M')}"
         added_str = format_added_date(entry.get('added_ts'))
         if added_str:
             linea += f" · ⏳ Desde: {added_str}"
@@ -9989,6 +10014,10 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             detail += f" · 🌅 Día: {pct(daily,2)}"
         if entry.get('peso'):
             detail += f" · ⚖️ Peso: {pct_plain(entry['peso']*100.0,1)}"
+        inst_currency = entry.get("inst_currency")
+        fx_ts_used = entry.get("fx_ts_used")
+        if view_fx and inst_currency and inst_currency != pf_base and fx_ts_used:
+            detail += f" · 💱 TC al {datetime.fromtimestamp(int(fx_ts_used), TZ).strftime('%d/%m/%Y %H:%M')}"
         added_str = format_added_date(entry.get('added_ts'))
         if added_str:
             detail += f" · ⏳ Desde: {added_str}"
