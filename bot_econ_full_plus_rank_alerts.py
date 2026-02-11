@@ -8764,6 +8764,53 @@ def pf_rebalance_suggestions(
         )
     return suggestions, (total_target_pct if any_target else None)
 
+
+def _pf_fx_decomposition(
+    snapshot: List[Dict[str, Any]],
+    pf_base: str,
+    *,
+    include_base_currency_price: bool = False,
+) -> Tuple[float, float, bool]:
+    fx_price_effect = 0.0
+    fx_fx_effect = 0.0
+    fx_has_data = False
+
+    for entry in snapshot:
+        qty = entry.get("cantidad")
+        if qty is None or entry.get("cantidad_derivada"):
+            continue
+
+        invertido = float(entry.get("invertido") or 0.0)
+        inst_cur = entry.get("inst_currency")
+        price_native = (
+            entry.get("precio_nativo")
+            if entry.get("precio_nativo") is not None
+            else (entry.get("metrics") or {}).get("last_px")
+        )
+
+        if inst_cur == pf_base:
+            if include_base_currency_price:
+                fx_price_effect += float(entry.get("valor_actual") or 0.0) - invertido
+                fx_has_data = True
+            continue
+
+        fx_rate_purchase = entry.get("fx_rate_item")
+        fx_rate_current = entry.get("fx_rate")
+        if fx_rate_purchase is None or fx_rate_current is None or price_native is None:
+            continue
+        fx_factor_purchase = price_to_base(1.0, inst_cur, pf_base, fx_rate_purchase)
+        fx_factor_current = price_to_base(1.0, inst_cur, pf_base, fx_rate_current)
+        if not fx_factor_purchase or not fx_factor_current:
+            continue
+        purchase_price_native = invertido / (float(qty) * float(fx_factor_purchase)) if qty else None
+        if purchase_price_native is None:
+            continue
+        fx_price_effect += float(qty) * (float(price_native) - float(purchase_price_native)) * float(fx_factor_purchase)
+        fx_fx_effect += float(qty) * float(price_native) * (float(fx_factor_current) - float(fx_factor_purchase))
+        fx_has_data = True
+
+    return fx_price_effect, fx_fx_effect, fx_has_data
+
 async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[int], float, float, Optional[float], Optional[int]]:
     items = pf.get("items", [])
     base_conf = pf.get("base", {})
@@ -8900,6 +8947,7 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             "invertido": invertido,
             "valor_actual": valor_actual,
             "valor_actual_nativo": valor_actual_nativo,
+            "precio_nativo": price_native,
             "precio_base": price_base,
             "moneda_nativa": moneda_nativa or inst_cur,
             "precio_compra_nativo": precio_compra_nativo,
@@ -9744,33 +9792,9 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     delta = total_actual - total_invertido
     if total_invertido > 0:
         lines.append(f"📊 Variación estimada: {f_money(delta)} ({pct(delta/total_invertido*100.0,2)})")
-    fx_price_effect = 0.0
-    fx_fx_effect = 0.0
-    fx_has_data = False
+    fx_price_effect, fx_fx_effect, fx_has_data = (0.0, 0.0, False)
     if total_invertido > 0:
-        for entry in snapshot:
-            qty = entry.get("cantidad")
-            if qty is None or entry.get("cantidad_derivada"):
-                continue
-            inst_cur = entry.get("inst_currency")
-            if inst_cur is None or inst_cur == pf_base:
-                continue
-            fx_rate_purchase = entry.get("fx_rate_item")
-            fx_rate_current = entry.get("fx_rate")
-            price_native = entry.get("precio_nativo")
-            if fx_rate_purchase is None or fx_rate_current is None or price_native is None:
-                continue
-            fx_factor_purchase = price_to_base(1.0, inst_cur, pf_base, fx_rate_purchase)
-            fx_factor_current = price_to_base(1.0, inst_cur, pf_base, fx_rate_current)
-            if not fx_factor_purchase or not fx_factor_current:
-                continue
-            invertido = float(entry.get("invertido") or 0.0)
-            purchase_price_native = invertido / (float(qty) * float(fx_factor_purchase)) if qty else None
-            if purchase_price_native is None:
-                continue
-            fx_price_effect += float(qty) * (float(price_native) - float(purchase_price_native)) * float(fx_factor_purchase)
-            fx_fx_effect += float(qty) * float(price_native) * (float(fx_factor_current) - float(fx_factor_purchase))
-            fx_has_data = True
+        fx_price_effect, fx_fx_effect, fx_has_data = _pf_fx_decomposition(snapshot, pf_base)
     if fx_has_data:
         price_pct = pct((fx_price_effect / total_invertido) * 100.0, 2)
         fx_pct = pct((fx_fx_effect / total_invertido) * 100.0, 2)
@@ -9940,31 +9964,11 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     fx_fx_effect = 0.0
     fx_has_data = False
     if view_fx:
-        for entry in snapshot:
-            qty = entry.get("cantidad")
-            if qty is None or entry.get("cantidad_derivada"):
-                continue
-            invertido = float(entry.get("invertido") or 0.0)
-            inst_cur = entry.get("inst_currency")
-            price_native = entry.get("precio_nativo")
-            if inst_cur == pf_base:
-                fx_price_effect += float(entry.get("valor_actual") or 0.0) - invertido
-                fx_has_data = True
-                continue
-            fx_rate_purchase = entry.get("fx_rate_item")
-            fx_rate_current = entry.get("fx_rate")
-            if fx_rate_purchase is None or fx_rate_current is None or price_native is None:
-                continue
-            fx_factor_purchase = price_to_base(1.0, inst_cur, pf_base, fx_rate_purchase)
-            fx_factor_current = price_to_base(1.0, inst_cur, pf_base, fx_rate_current)
-            if not fx_factor_purchase or not fx_factor_current:
-                continue
-            purchase_price_native = invertido / (float(qty) * float(fx_factor_purchase)) if qty else None
-            if purchase_price_native is None:
-                continue
-            fx_price_effect += float(qty) * (float(price_native) - float(purchase_price_native)) * float(fx_factor_purchase)
-            fx_fx_effect += float(qty) * float(price_native) * (float(fx_factor_current) - float(fx_factor_purchase))
-            fx_has_data = True
+        fx_price_effect, fx_fx_effect, fx_has_data = _pf_fx_decomposition(
+            snapshot,
+            pf_base,
+            include_base_currency_price=True,
+        )
     lines.append("")
     lines.append(f"💸 Invertido: {f_money(total_invertido)}")
     lines.append(f"🧮 Valor actual estimado: {f_money(total_actual)}")
