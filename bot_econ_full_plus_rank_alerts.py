@@ -833,6 +833,10 @@ PROJ_HISTORY_TOLERANCE_DAYS = WINDOW_DAYS[1]
 PROJ_HISTORY_MAX_AGE_DAYS = 400
 PROJ_HISTORY_MAX_ENTRIES = 2000
 PROJ_CALIBRATION_MIN_POINTS = 25
+STATE_SAVE_LOCK = asyncio.Lock()
+STATE_SAVE_DEBOUNCE_SECONDS = 0.2
+_STATE_SAVE_DIRTY = False
+_STATE_SAVE_TASK: Optional[asyncio.Task[Any]] = None
 
 
 def invalidate_rankings_cache() -> None:
@@ -1217,42 +1221,94 @@ async def recalibrate_projection_coeffs() -> None:
 
 
 async def save_state():
-    _prune_news_history()
-    _prune_proj_history()
-    payload = serialize_state_payload(
-        {
-            "alerts": ALERTS,
-            "subs": SUBS,
-            "pf": PF,
-            "pf_history": PF_HISTORY,
-            "alert_usage": ALERT_USAGE,
-            "projection_records": PROJECTION_RECORDS,
-            "projection_batches": PROJECTION_BATCHES,
-            "news_history": NEWS_HISTORY,
-            "news_cache_date": NEWS_CACHE.get("date", ""),
-            "news_cache_items": NEWS_CACHE.get("items", []),
-            "riesgo_cache": RIESGO_CACHE,
-            "reservas_cache": RESERVAS_CACHE,
-            "dolar_cache": DOLAR_CACHE,
-            "proj_history": PROJ_HISTORY,
-            "proj_calibration": PROJ_CALIBRATION,
-        }
-    )
-    stored = await STATE_STORE.save(payload)
-    if stored or FALLBACK_STATE_STORE is None:
-        return
-    path = _ensure_state_path()
-    if not path:
-        log.error("No path available to persist state locally", extra={"event": "persistence_failure"})
-        return
+    start_ts = time()
+    persisted = False
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-    except Exception as e:
-        log.error(
-            "save_state error",
-            extra={"event": "persistence_failure", "path": path, "error": str(e)},
-        )
+        async with STATE_SAVE_LOCK:
+            _prune_news_history()
+            _prune_proj_history()
+            payload = serialize_state_payload(
+                {
+                    "alerts": ALERTS,
+                    "subs": SUBS,
+                    "pf": PF,
+                    "pf_history": PF_HISTORY,
+                    "alert_usage": ALERT_USAGE,
+                    "projection_records": PROJECTION_RECORDS,
+                    "projection_batches": PROJECTION_BATCHES,
+                    "news_history": NEWS_HISTORY,
+                    "news_cache_date": NEWS_CACHE.get("date", ""),
+                    "news_cache_items": NEWS_CACHE.get("items", []),
+                    "riesgo_cache": RIESGO_CACHE,
+                    "reservas_cache": RESERVAS_CACHE,
+                    "dolar_cache": DOLAR_CACHE,
+                    "proj_history": PROJ_HISTORY,
+                    "proj_calibration": PROJ_CALIBRATION,
+                }
+            )
+
+            try:
+                persisted = await STATE_STORE.save(payload)
+            except Exception as exc:
+                log.error(
+                    "save_state error en store principal",
+                    extra={"event": "persistence_failure", "error": str(exc)},
+                )
+                persisted = False
+
+            if not persisted and FALLBACK_STATE_STORE is not None:
+                try:
+                    persisted = await FALLBACK_STATE_STORE.save(payload)
+                except Exception as exc:
+                    log.error(
+                        "save_state error en store de respaldo",
+                        extra={"event": "persistence_failure", "error": str(exc)},
+                    )
+                    persisted = False
+
+            if not persisted and FALLBACK_STATE_STORE is None:
+                path = _ensure_state_path()
+                if path:
+                    try:
+                        with open(path, "w", encoding="utf-8") as f:
+                            json.dump(payload, f, ensure_ascii=False)
+                        persisted = True
+                    except Exception as e:
+                        log.error(
+                            "save_state error",
+                            extra={"event": "persistence_failure", "path": path, "error": str(e)},
+                        )
+                else:
+                    log.error("No path available to persist state locally", extra={"event": "persistence_failure"})
+    finally:
+        duration_ms = (time() - start_ts) * 1000.0
+        metrics.observe_latency_ms("state_persist_latency", duration_ms)
+        if persisted:
+            metrics.increment("state_save_success")
+        else:
+            metrics.increment("state_save_failure")
+
+
+async def _state_save_worker() -> None:
+    global _STATE_SAVE_DIRTY, _STATE_SAVE_TASK
+    try:
+        while True:
+            _STATE_SAVE_DIRTY = False
+            await asyncio.sleep(STATE_SAVE_DEBOUNCE_SECONDS)
+            if _STATE_SAVE_DIRTY:
+                continue
+            await save_state()
+            if not _STATE_SAVE_DIRTY:
+                break
+    finally:
+        _STATE_SAVE_TASK = None
+
+
+def schedule_state_save() -> None:
+    global _STATE_SAVE_DIRTY, _STATE_SAVE_TASK
+    _STATE_SAVE_DIRTY = True
+    if _STATE_SAVE_TASK is None or _STATE_SAVE_TASK.done():
+        _STATE_SAVE_TASK = asyncio.create_task(_state_save_worker())
 
 # ============================ UTILS ============================
 
@@ -1705,7 +1761,7 @@ def _save_dolar_cache(payload: Dict[str, Dict[str, Any]]) -> None:
     if DOLAR_CACHE != new_cache:
         DOLAR_CACHE = new_cache
         try:
-            asyncio.create_task(save_state())
+            schedule_state_save()
         except Exception:
             pass
 
@@ -2105,7 +2161,7 @@ async def get_riesgo_pais(
         if RIESGO_CACHE != new_cache:
             RIESGO_CACHE = new_cache
             try:
-                asyncio.create_task(save_state())
+                schedule_state_save()
             except Exception:
                 pass
 
@@ -2398,7 +2454,7 @@ def _save_reservas_cache(val: float, fecha: Optional[str], prev_val: Optional[fl
     if RESERVAS_CACHE != new_cache:
         RESERVAS_CACHE = new_cache
         try:
-            asyncio.create_task(save_state())
+            schedule_state_save()
         except Exception:
             pass
 
@@ -4928,7 +4984,7 @@ async def _rank_proj5(
         top_rows = [(sym, p3, p6) for sym, p3, p6, _ in rows[: RANK_PROJ_LIMIT]]
         msg = format_proj_dual(title, fecha, top_rows)
         if history_added:
-            asyncio.create_task(save_state())
+            schedule_state_save()
         await update.effective_message.reply_text(
             msg,
             parse_mode=ParseMode.HTML,
@@ -10228,7 +10284,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         reply_markup=kb_pf_projection_horizons(horizon_months),
     )
     if history_added:
-        asyncio.create_task(save_state())
+        schedule_state_save()
 
     img = _projection_bar_image(
         [
