@@ -834,6 +834,10 @@ PROJ_HISTORY_TOLERANCE_DAYS = WINDOW_DAYS[1]
 PROJ_HISTORY_MAX_AGE_DAYS = 400
 PROJ_HISTORY_MAX_ENTRIES = 2000
 PROJ_CALIBRATION_MIN_POINTS = 25
+STATE_SAVE_LOCK = asyncio.Lock()
+STATE_SAVE_DEBOUNCE_SECONDS = 0.2
+_STATE_SAVE_DIRTY = False
+_STATE_SAVE_TASK: Optional[asyncio.Task[Any]] = None
 
 
 def invalidate_rankings_cache() -> None:
@@ -858,8 +862,7 @@ def is_throttled(command: str, chat_id: Optional[int], user_id: Optional[int], t
 
 async def load_state():
     global ALERTS, SUBS, PF, PF_HISTORY, ALERT_USAGE, NEWS_HISTORY, NEWS_CACHE, RIESGO_CACHE, RESERVAS_CACHE, DOLAR_CACHE
-    global QUALITY_CACHE
-    global PROJ_HISTORY, PROJ_CALIBRATION
+    global PROJ_HISTORY, PROJ_CALIBRATION, PROJECTION_RECORDS, PROJECTION_BATCHES
     data: Optional[Dict[str, Any]] = None
     try:
         data = await STATE_STORE.load()
@@ -1235,43 +1238,94 @@ async def recalibrate_projection_coeffs() -> None:
 
 
 async def save_state():
-    _prune_news_history()
-    _prune_proj_history()
-    payload = serialize_state_payload(
-        {
-            "alerts": ALERTS,
-            "subs": SUBS,
-            "pf": PF,
-            "pf_history": PF_HISTORY,
-            "alert_usage": ALERT_USAGE,
-            "projection_records": PROJECTION_RECORDS,
-            "projection_batches": PROJECTION_BATCHES,
-            "news_history": NEWS_HISTORY,
-            "news_cache_date": NEWS_CACHE.get("date", ""),
-            "news_cache_items": NEWS_CACHE.get("items", []),
-            "riesgo_cache": RIESGO_CACHE,
-            "reservas_cache": RESERVAS_CACHE,
-            "dolar_cache": DOLAR_CACHE,
-            "quality_cache": QUALITY_CACHE,
-            "proj_history": PROJ_HISTORY,
-            "proj_calibration": PROJ_CALIBRATION,
-        }
-    )
-    stored = await STATE_STORE.save(payload)
-    if stored or FALLBACK_STATE_STORE is None:
-        return
-    path = _ensure_state_path()
-    if not path:
-        log.error("No path available to persist state locally", extra={"event": "persistence_failure"})
-        return
+    start_ts = time()
+    persisted = False
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-    except Exception as e:
-        log.error(
-            "save_state error",
-            extra={"event": "persistence_failure", "path": path, "error": str(e)},
-        )
+        async with STATE_SAVE_LOCK:
+            _prune_news_history()
+            _prune_proj_history()
+            payload = serialize_state_payload(
+                {
+                    "alerts": ALERTS,
+                    "subs": SUBS,
+                    "pf": PF,
+                    "pf_history": PF_HISTORY,
+                    "alert_usage": ALERT_USAGE,
+                    "projection_records": PROJECTION_RECORDS,
+                    "projection_batches": PROJECTION_BATCHES,
+                    "news_history": NEWS_HISTORY,
+                    "news_cache_date": NEWS_CACHE.get("date", ""),
+                    "news_cache_items": NEWS_CACHE.get("items", []),
+                    "riesgo_cache": RIESGO_CACHE,
+                    "reservas_cache": RESERVAS_CACHE,
+                    "dolar_cache": DOLAR_CACHE,
+                    "proj_history": PROJ_HISTORY,
+                    "proj_calibration": PROJ_CALIBRATION,
+                }
+            )
+
+            try:
+                persisted = await STATE_STORE.save(payload)
+            except Exception as exc:
+                log.error(
+                    "save_state error en store principal",
+                    extra={"event": "persistence_failure", "error": str(exc)},
+                )
+                persisted = False
+
+            if not persisted and FALLBACK_STATE_STORE is not None:
+                try:
+                    persisted = await FALLBACK_STATE_STORE.save(payload)
+                except Exception as exc:
+                    log.error(
+                        "save_state error en store de respaldo",
+                        extra={"event": "persistence_failure", "error": str(exc)},
+                    )
+                    persisted = False
+
+            if not persisted and FALLBACK_STATE_STORE is None:
+                path = _ensure_state_path()
+                if path:
+                    try:
+                        with open(path, "w", encoding="utf-8") as f:
+                            json.dump(payload, f, ensure_ascii=False)
+                        persisted = True
+                    except Exception as e:
+                        log.error(
+                            "save_state error",
+                            extra={"event": "persistence_failure", "path": path, "error": str(e)},
+                        )
+                else:
+                    log.error("No path available to persist state locally", extra={"event": "persistence_failure"})
+    finally:
+        duration_ms = (time() - start_ts) * 1000.0
+        metrics.observe_latency_ms("state_persist_latency", duration_ms)
+        if persisted:
+            metrics.increment("state_save_success")
+        else:
+            metrics.increment("state_save_failure")
+
+
+async def _state_save_worker() -> None:
+    global _STATE_SAVE_DIRTY, _STATE_SAVE_TASK
+    try:
+        while True:
+            _STATE_SAVE_DIRTY = False
+            await asyncio.sleep(STATE_SAVE_DEBOUNCE_SECONDS)
+            if _STATE_SAVE_DIRTY:
+                continue
+            await save_state()
+            if not _STATE_SAVE_DIRTY:
+                break
+    finally:
+        _STATE_SAVE_TASK = None
+
+
+def schedule_state_save() -> None:
+    global _STATE_SAVE_DIRTY, _STATE_SAVE_TASK
+    _STATE_SAVE_DIRTY = True
+    if _STATE_SAVE_TASK is None or _STATE_SAVE_TASK.done():
+        _STATE_SAVE_TASK = asyncio.create_task(_state_save_worker())
 
 # ============================ UTILS ============================
 
@@ -1467,9 +1521,11 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
     source = kwargs.pop("source", None)
     http_timeout = timeout.total if isinstance(timeout, ClientTimeout) else timeout
     try:
-        return await http_service.get_json(
+        payload = await http_service.get_json(
             url, source=source, headers={**REQ_HEADERS, **headers}, timeout=http_timeout, **kwargs
         )
+        _record_http_metrics(host, (time() - started) * 1000, success=True)
+        return payload
     except SourceSuspendedError as exc:
         _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning(
@@ -1479,29 +1535,15 @@ async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dic
             url,
         )
         return None
-    except Exception as exc:
-        _record_http_metrics(host, (time() - started) * 1000, success=False)
-        log.warning("fetch_json http_service error %s: %s", url, exc)
-    try:
-        async with session.get(
-            url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs
-        ) as resp:
-            if 200 <= resp.status < 300:
-                payload = await resp.json(content_type=None)
-                _record_http_metrics(host, (time() - started) * 1000, success=True)
-                return payload
-            log.warning("GET %s -> %s", url, resp.status)
-    except asyncio.TimeoutError:
+    except httpx.TimeoutException:
         duration_ms = (time() - started) * 1000
         _record_http_metrics(host, duration_ms, success=False, timeout=True)
         log.error("fetch_json timeout", extra={"url": url, "event": "api_timeout", "duration_ms": duration_ms})
         return None
-    except Exception as e:
+    except Exception as exc:
         _record_http_metrics(host, (time() - started) * 1000, success=False)
-        log.warning("fetch_json error %s: %s", url, e)
+        log.warning("fetch_json http_service error %s: %s", url, exc)
         return None
-    _record_http_metrics(host, (time() - started) * 1000, success=False)
-    return None
 
 
 def build_httpx_client() -> httpx.AsyncClient:
@@ -1555,12 +1597,14 @@ async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str
 
     try:
         http_timeout = timeout.total if isinstance(timeout, ClientTimeout) else timeout
-        return await http_service.get_text(
+        body = await http_service.get_text(
             url,
             headers={**REQ_HEADERS, **headers},
             timeout=http_timeout,
             **kwargs,
         )
+        _record_http_metrics(host, (time() - started) * 1000, success=True)
+        return body
     except SourceSuspendedError as exc:
         _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning(
@@ -1570,14 +1614,7 @@ async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str
             url,
         )
         return None
-    try:
-        async with session.get(url, timeout=timeout, headers={**REQ_HEADERS, **headers}, **kwargs) as resp:
-            if resp.status == 200:
-                body = await resp.text()
-                _record_http_metrics(host, (time() - started) * 1000, success=True)
-                return body
-            log.warning("GET %s -> %s", url, resp.status)
-    except asyncio.TimeoutError:
+    except httpx.TimeoutException:
         duration_ms = (time() - started) * 1000
         _record_http_metrics(host, duration_ms, success=False, timeout=True)
         log.error("fetch_text timeout", extra={"url": url, "event": "api_timeout", "duration_ms": duration_ms})
@@ -1586,8 +1623,6 @@ async def fetch_text(session: ClientSession, url: str, **kwargs) -> Optional[str
         _record_http_metrics(host, (time() - started) * 1000, success=False)
         log.warning("fetch_text error %s: %s", url, e)
         return None
-    _record_http_metrics(host, (time() - started) * 1000, success=False)
-    return None
 
 
 async def get_binance_symbols(session: ClientSession) -> Dict[str, Dict[str, str]]:
@@ -1802,7 +1837,7 @@ def _save_dolar_cache(payload: Dict[str, Dict[str, Any]]) -> None:
     if DOLAR_CACHE != new_cache:
         DOLAR_CACHE = new_cache
         try:
-            asyncio.create_task(save_state())
+            schedule_state_save()
         except Exception:
             pass
 
@@ -2236,7 +2271,7 @@ async def get_riesgo_pais(
         if RIESGO_CACHE != new_cache:
             RIESGO_CACHE = new_cache
             try:
-                asyncio.create_task(save_state())
+                schedule_state_save()
             except Exception:
                 pass
 
@@ -2542,7 +2577,7 @@ def _save_reservas_cache(val: float, fecha: Optional[str], prev_val: Optional[fl
     if RESERVAS_CACHE != new_cache:
         RESERVAS_CACHE = new_cache
         try:
-            asyncio.create_task(save_state())
+            schedule_state_save()
         except Exception:
             pass
 
@@ -5095,7 +5130,7 @@ async def _rank_proj5(
         top_rows = [(sym, p3, p6) for sym, p3, p6, _ in rows[: RANK_PROJ_LIMIT]]
         msg = format_proj_dual(title, fecha, top_rows)
         if history_added:
-            asyncio.create_task(save_state())
+            schedule_state_save()
         await update.effective_message.reply_text(
             msg,
             parse_mode=ParseMode.HTML,
@@ -10395,7 +10430,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         reply_markup=kb_pf_projection_horizons(horizon_months),
     )
     if history_added:
-        asyncio.create_task(save_state())
+        schedule_state_save()
 
     img = _projection_bar_image(
         [
@@ -10673,6 +10708,7 @@ async def _shutdown_httpx_client(app: Application) -> None:
     client = app.bot_data.get(HTTPX_CLIENT_KEY)
     if isinstance(client, httpx.AsyncClient):
         await client.aclose()
+    await http_service.aclose()
 
 
 def build_application() -> Application:
@@ -10684,6 +10720,8 @@ def build_application() -> Application:
         .build()
     )
     app.bot_data[HTTPX_CLIENT_KEY] = httpx_client
+    http_service.configure_client(httpx_client)
+    http_service.configure_defaults(headers=REQ_HEADERS, timeout=15)
 
     # Comandos
     app.add_handler(CommandHandler("start", cmd_start))
