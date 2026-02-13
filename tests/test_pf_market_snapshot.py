@@ -97,3 +97,84 @@ def test_pf_market_snapshot_without_price_or_daily_change_keeps_last_known(monke
 
     assert snapshot[0]["valuation_mode"] == "last_known"
     assert snapshot[0]["valor_actual"] == pytest.approx(980.0)
+
+
+def test_pf_market_snapshot_bond_derives_qty_from_purchase_base(monkeypatch):
+    async def _metrics(_session, _symbols):
+        return ({"AL30": {"last_px": 55.0, "last_ts": 1700000000}}, 1700000100)
+
+    monkeypatch.setattr(bot, "metrics_for_symbols", _metrics)
+
+    pf = {
+        "base": {"moneda": "ARS"},
+        "items": [
+            {
+                "tipo": "bono",
+                "simbolo": "AL30",
+                "cantidad": None,
+                "importe": 1100.0,
+                "precio_compra_base": 50.0,
+            }
+        ],
+    }
+
+    snapshot, *_ = asyncio.run(bot.pf_market_snapshot(pf))
+
+    assert snapshot[0]["cantidad_derivada"] is True
+    assert snapshot[0]["cantidad"] == pytest.approx(22.0)
+    assert snapshot[0]["valor_actual"] == pytest.approx(1210.0)
+
+
+def test_pf_market_snapshot_fci_without_price_estimates_from_last_change(monkeypatch):
+    async def _metrics(_session, _symbols):
+        return ({"FCI-1": {"last_chg": 3.0, "last_ts": 1700000000}}, 1700000100)
+
+    monkeypatch.setattr(bot, "metrics_for_symbols", _metrics)
+
+    pf = {
+        "base": {"moneda": "ARS"},
+        "items": [
+            {
+                "tipo": "fci",
+                "simbolo": "FCI-1",
+                "cantidad": 10.0,
+                "importe": 1000.0,
+                "last_valued_base": 1200.0,
+                "last_valued_ts": 1699990000,
+            }
+        ],
+    }
+
+    snapshot, *_ = asyncio.run(bot.pf_market_snapshot(pf))
+
+    assert snapshot[0]["precio_base"] is None
+    assert snapshot[0]["valuation_mode"] == "estimated_from_daily_change"
+    assert snapshot[0]["valuation_stale"] is True
+    assert snapshot[0]["valor_actual"] == pytest.approx(1236.0)
+
+
+def test_pf_market_snapshot_fci_without_price_uses_last_valued_stale(monkeypatch):
+    async def _metrics(_session, _symbols):
+        return ({"FCI-2": {"last_ts": 1700000000}}, 1700000100)
+
+    monkeypatch.setattr(bot, "metrics_for_symbols", _metrics)
+
+    pf = {
+        "base": {"moneda": "ARS"},
+        "items": [
+            {
+                "tipo": "fci",
+                "simbolo": "FCI-2",
+                "cantidad": 3.0,
+                "importe": 1000.0,
+                "last_valued_base": 950.0,
+                "last_valued_ts": 1699990000,
+            }
+        ],
+    }
+
+    snapshot, *_ = asyncio.run(bot.pf_market_snapshot(pf))
+
+    assert snapshot[0]["valuation_mode"] == "last_known"
+    assert snapshot[0]["valuation_stale"] is True
+    assert snapshot[0]["valor_actual"] == pytest.approx(950.0)
