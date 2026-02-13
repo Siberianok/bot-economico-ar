@@ -9130,12 +9130,20 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pf_show_projection_below(context, chat_id, horizon)
         return
     if data.startswith("PF:PROJ:H:"):
+        horizon_raw = data.split(":", 3)[3] if data.count(":") >= 3 else ""
         try:
-            horizon = int(data.split(":")[3])
+            horizon = int(horizon_raw)
         except (IndexError, ValueError):
             horizon = 3
         if horizon not in (1, 3, 6, 12):
             horizon = 3
+        LOGGER.info(
+            "PF projection horizon callback | chat_id=%s data=%s horizon_raw=%s parsed_horizon=%s",
+            chat_id,
+            data,
+            horizon_raw,
+            horizon,
+        )
         await pf_show_projection_below(context, chat_id, horizon)
         return
 
