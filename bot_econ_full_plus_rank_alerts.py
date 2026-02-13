@@ -9128,13 +9128,34 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         if precio_compra_base is None and precio_compra_nativo is not None:
             if base_currency == inst_cur:
                 precio_compra_base = float(precio_compra_nativo)
-            elif fx_rate_compra and fx_rate_compra > 0:
-                precio_compra_base = price_to_base(precio_compra_nativo, inst_cur, base_currency, fx_rate_compra)
+            elif (fx_rate_compra and fx_rate_compra > 0) or (tc_val and tc_val > 0):
+                precio_compra_base = price_to_base(
+                    precio_compra_nativo,
+                    inst_cur,
+                    base_currency,
+                    fx_rate_compra if (fx_rate_compra and fx_rate_compra > 0) else tc_val,
+                )
         derived_qty = False
-        price_base_for_qty = price_base if price_base is not None else precio_compra_base
-        if qty is None and price_base_for_qty and price_base_for_qty > 0 and invertido > 0:
-            qty = invertido / price_base_for_qty
-            derived_qty = True
+        is_bond_or_fci = str(tipo).lower() in {"bono", "fci"}
+        qty_candidate_prices: List[float] = []
+        if is_bond_or_fci:
+            qty_candidate_prices.extend([
+                precio_compra_base,
+                price_base,
+            ])
+            if precio_compra_nativo is not None:
+                fx_for_native = fx_rate_compra if (fx_rate_compra and fx_rate_compra > 0) else tc_val
+                converted_purchase = price_to_base(precio_compra_nativo, inst_cur, base_currency, fx_for_native)
+                qty_candidate_prices.append(converted_purchase)
+        else:
+            qty_candidate_prices.extend([price_base, precio_compra_base])
+
+        if qty is None and invertido > 0:
+            for candidate_price in qty_candidate_prices:
+                if candidate_price is not None and candidate_price > 0:
+                    qty = invertido / candidate_price
+                    derived_qty = True
+                    break
         last_valued_base_raw = it.get("last_valued_base")
         try:
             last_valued_base = float(last_valued_base_raw) if last_valued_base_raw is not None else None
@@ -9153,6 +9174,7 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
 
         valor_actual = invertido
         valuation_mode = "last_known"
+        valuation_stale = False
         if qty is not None and price_base is not None:
             valor_actual = float(qty) * float(price_base)
             valuation_mode = "price"
@@ -9167,13 +9189,31 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
                 last_valued_ts = now_ts
                 items_updated = True
         else:
-            base_value = last_valued_base if last_valued_base is not None else invertido
-            if daily_change is not None:
-                valor_actual = float(base_value) * (1.0 + float(daily_change) / 100.0)
-                valuation_mode = "estimated_from_daily_change"
+            if last_valued_base is not None:
+                valuation_stale = True
+                if daily_change is not None:
+                    valor_actual = float(last_valued_base) * (1.0 + float(daily_change) / 100.0)
+                    valuation_mode = "estimated_from_daily_change"
+                else:
+                    valor_actual = float(last_valued_base)
+                    valuation_mode = "last_known"
             else:
-                valor_actual = float(base_value)
-                valuation_mode = "last_known"
+                valor_actual = float(invertido)
+                valuation_mode = "cost_basis_fallback"
+                valuation_stale = is_bond_or_fci or price_base is None
+
+        if price_base is None and valuation_mode != "price":
+            valuation_stale = True
+
+        quality_updates = {
+            "valuation_mode": valuation_mode,
+            "valuation_stale": valuation_stale,
+            "valuation_price_ts": price_ts,
+        }
+        for quality_key, quality_val in quality_updates.items():
+            if it.get(quality_key) != quality_val:
+                it[quality_key] = quality_val
+                items_updated = True
         valor_actual_nativo = None
         if qty is not None and price_native is not None:
             valor_actual_nativo = float(qty) * float(price_native)
@@ -9216,6 +9256,7 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             "fx_ts_used": fx_ts_used,
             "added_ts": added_ts,
             "valuation_mode": valuation_mode,
+            "valuation_stale": valuation_stale,
             "last_valued_base": last_valued_base,
             "last_valued_ts": last_valued_ts,
         })
@@ -10089,6 +10130,8 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             linea += f" ({pct(r_ind,2)} vs {f_money(entry['invertido'])})"
         if entry.get("valuation_mode") == "estimated_from_daily_change":
             linea += " · ~estimado"
+        if entry.get("valuation_stale"):
+            linea += " · ⚠️ stale"
         qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
         if qty_txt:
             linea += f" · 📦 Cant: {qty_txt}"
@@ -10202,6 +10245,8 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             detail += f" (Δ {f_money(delta)})"
         if entry.get("valuation_mode") == "estimated_from_daily_change":
             detail += " · ~estimado"
+        if entry.get("valuation_stale"):
+            detail += " · ⚠️ stale"
         qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
         if qty_txt:
             detail += f" · 📦 Cant: {qty_txt}"
