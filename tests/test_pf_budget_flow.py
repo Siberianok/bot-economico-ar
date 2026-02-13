@@ -84,6 +84,22 @@ def test_pf_setmonto_opens_budget_screen():
     assert kb[-2][0].text == "Volver"
 
 
+def test_kb_pf_budget_usd_contains_expected_presets_and_manual_option():
+    kb = bot.kb_pf_budget("USD").inline_keyboard
+
+    usd_preset_labels = [row[0].text for row in kb[1:8]]
+    assert usd_preset_labels == [
+        "1.000",
+        "10.000",
+        "100.000",
+        "1.000.000",
+        "10.000.000",
+        "50.000.000",
+        "100.000.000",
+    ]
+    assert kb[8][0].text == "Ingresar manual"
+
+
 def test_pf_budget_preset_updates_amount_and_returns_main(monkeypatch):
     async def _fake_main_menu_text(_chat_id):
         return "menu actualizado"
