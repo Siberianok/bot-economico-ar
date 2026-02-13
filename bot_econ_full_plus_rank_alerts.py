@@ -8531,9 +8531,64 @@ kb_export = InlineKeyboardMarkup(
             InlineKeyboardButton("Exportar actual", callback_data="PF:EXPORT:NOW"),
             InlineKeyboardButton("Histórico", callback_data="PF:EXPORT:HISTORY"),
         ],
+        [InlineKeyboardButton("Histórico por fechas", callback_data="PF:EXPORT:HISTORY:RANGE")],
         [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
     ]
 )
+
+
+PF_EXPORT_RANGE_FROM_KEY = "pf_export_history_from_ts"
+PF_EXPORT_RANGE_TO_KEY = "pf_export_history_to_ts"
+PF_EXPORT_RANGE_LABEL_KEY = "pf_export_history_range_label"
+
+
+def _pf_export_range_label(from_ts: Optional[float], to_ts: Optional[float]) -> str:
+    if from_ts is None and to_ts is None:
+        return "Todo"
+    from_txt = datetime.fromtimestamp(from_ts, TZ).strftime("%d/%m/%Y") if from_ts is not None else "inicio"
+    to_txt = datetime.fromtimestamp(to_ts, TZ).strftime("%d/%m/%Y") if to_ts is not None else "hoy"
+    return f"{from_txt} a {to_txt}"
+
+
+def _pf_export_compute_range(preset: str, now_ts: Optional[float] = None) -> Tuple[Optional[float], Optional[float], str]:
+    now_dt = datetime.fromtimestamp(now_ts, TZ) if now_ts is not None else datetime.now(TZ)
+    preset_norm = (preset or "").strip().lower()
+    if preset_norm == "all":
+        return None, None, "Todo"
+    if preset_norm in {"7d", "30d", "90d"}:
+        days = int(preset_norm[:-1])
+        from_dt = now_dt - timedelta(days=days)
+        from_ts = from_dt.timestamp()
+        to_ts = now_dt.timestamp()
+        return from_ts, to_ts, _pf_export_range_label(from_ts, to_ts)
+    if preset_norm == "ytd":
+        from_dt = datetime(now_dt.year, 1, 1, tzinfo=TZ)
+        from_ts = from_dt.timestamp()
+        to_ts = now_dt.timestamp()
+        return from_ts, to_ts, _pf_export_range_label(from_ts, to_ts)
+    return None, None, "Todo"
+
+
+def _pf_export_filter_history_entries(
+    entries: List[Dict[str, Any]],
+    from_ts: Optional[float],
+    to_ts: Optional[float],
+) -> Tuple[List[Dict[str, Any]], int]:
+    filtered: List[Dict[str, Any]] = []
+    invalid_ts_count = 0
+    for entry in entries:
+        ts_raw = entry.get("ts")
+        try:
+            ts_val = float(ts_raw)
+        except (TypeError, ValueError):
+            invalid_ts_count += 1
+            continue
+        if from_ts is not None and ts_val < from_ts:
+            continue
+        if to_ts is not None and ts_val > to_ts:
+            continue
+        filtered.append(entry)
+    return filtered, invalid_ts_count
 
 async def pf_export_current(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     pf = pf_get(chat_id)
@@ -8574,11 +8629,26 @@ async def pf_export_history(context: ContextTypes.DEFAULT_TYPE, chat_id: int) ->
     if not history_entries:
         await _send_below_menu(context, chat_id, text="No hay historial guardado para exportar.")
         return
+    from_ts = context.user_data.get(PF_EXPORT_RANGE_FROM_KEY)
+    to_ts = context.user_data.get(PF_EXPORT_RANGE_TO_KEY)
+    range_label = context.user_data.get(PF_EXPORT_RANGE_LABEL_KEY) or _pf_export_range_label(from_ts, to_ts)
+    if from_ts is not None and to_ts is not None and from_ts > to_ts:
+        await _send_below_menu(context, chat_id, text="Rango inválido: la fecha desde es mayor que la fecha hasta.")
+        return
+
+    filtered_entries, invalid_ts_count = _pf_export_filter_history_entries(history_entries, from_ts, to_ts)
+    if not filtered_entries:
+        msg = f"No hay datos en el rango seleccionado ({range_label})."
+        if invalid_ts_count:
+            msg += f" Se omitieron {invalid_ts_count} entradas con timestamp inválido."
+        await _send_below_menu(context, chat_id, text=msg)
+        return
+
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(PF_EXPORT_HEADERS)
     rows_written = 0
-    for entry in history_entries:
+    for entry in filtered_entries:
         raw_snapshot = entry.get("snapshot", [])
         if not isinstance(raw_snapshot, list) or not raw_snapshot:
             continue
@@ -8618,15 +8688,23 @@ async def pf_export_history(context: ContextTypes.DEFAULT_TYPE, chat_id: int) ->
         )
         rows_written += len(snapshot)
     if rows_written == 0:
-        await _send_below_menu(context, chat_id, text="No hay datos históricos válidos para exportar.")
+        msg = f"No hay datos históricos válidos para exportar en el rango ({range_label})."
+        if invalid_ts_count:
+            msg += f" Se omitieron {invalid_ts_count} entradas con timestamp inválido."
+        await _send_below_menu(context, chat_id, text=msg)
         return
-    filename = f"portafolio_historico_{datetime.now(TZ).strftime('%Y%m%d_%H%M')}.csv"
+    from_slug = datetime.fromtimestamp(from_ts, TZ).strftime("%Y%m%d") if from_ts is not None else "inicio"
+    to_slug = datetime.fromtimestamp(to_ts, TZ).strftime("%Y%m%d") if to_ts is not None else "hoy"
+    filename = f"portafolio_historico_{from_slug}_{to_slug}_{datetime.now(TZ).strftime('%Y%m%d_%H%M')}.csv"
     output = io.BytesIO(buf.getvalue().encode("utf-8"))
     output.seek(0)
+    caption = f"Histórico del portafolio · Rango: {range_label}."
+    if invalid_ts_count:
+        caption += f" Se omitieron {invalid_ts_count} entradas con timestamp inválido."
     await context.bot.send_document(
         chat_id=chat_id,
         document=InputFile(output, filename=filename),
-        caption="Histórico del portafolio.",
+        caption=caption,
     )
 
 def kb_pf_main(chat_id: Optional[int] = None) -> InlineKeyboardMarkup:
@@ -9326,6 +9404,39 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "PF:EXPORT:HISTORY":
+        context.user_data[PF_EXPORT_RANGE_FROM_KEY] = None
+        context.user_data[PF_EXPORT_RANGE_TO_KEY] = None
+        context.user_data[PF_EXPORT_RANGE_LABEL_KEY] = "Todo"
+        await pf_export_history(context, chat_id)
+        await pf_refresh_menu(context, chat_id, force_new=True)
+        return
+
+    if data == "PF:EXPORT:HISTORY:RANGE":
+        kb_history_range = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("7d", callback_data="PF:EXPORT:HISTORY:RANGE:PRESET:7d"),
+                InlineKeyboardButton("30d", callback_data="PF:EXPORT:HISTORY:RANGE:PRESET:30d"),
+                InlineKeyboardButton("90d", callback_data="PF:EXPORT:HISTORY:RANGE:PRESET:90d"),
+            ],
+            [
+                InlineKeyboardButton("YTD", callback_data="PF:EXPORT:HISTORY:RANGE:PRESET:ytd"),
+                InlineKeyboardButton("Todo", callback_data="PF:EXPORT:HISTORY:RANGE:PRESET:all"),
+            ],
+            [InlineKeyboardButton("Volver", callback_data="PF:EXPORT")],
+            _pf_menu_nav_row(),
+        ])
+        await q.edit_message_text(
+            "Elegí un rango para exportar histórico.\nManual (opcional): dd/mm/aaaa.",
+            reply_markup=kb_history_range,
+        )
+        return
+
+    if data.startswith("PF:EXPORT:HISTORY:RANGE:PRESET:"):
+        preset = data.split(":", 5)[5] if data.count(":") >= 5 else "all"
+        from_ts, to_ts, label = _pf_export_compute_range(preset)
+        context.user_data[PF_EXPORT_RANGE_FROM_KEY] = from_ts
+        context.user_data[PF_EXPORT_RANGE_TO_KEY] = to_ts
+        context.user_data[PF_EXPORT_RANGE_LABEL_KEY] = label
         await pf_export_history(context, chat_id)
         await pf_refresh_menu(context, chat_id, force_new=True)
         return
