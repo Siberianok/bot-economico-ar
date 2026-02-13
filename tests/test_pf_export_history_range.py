@@ -12,11 +12,13 @@ class _DummyCallbackQuery:
     def __init__(self, data: str):
         self.data = data
         self.message = _DummyMessage()
+        self.edits = []
 
     async def answer(self):
         return None
 
     async def edit_message_text(self, *args, **kwargs):
+        self.edits.append((args, kwargs))
         return None
 
 
@@ -97,3 +99,59 @@ def test_pf_export_range_preset_callback_sets_user_data_and_exports(monkeypatch)
     assert context.user_data[bot.PF_EXPORT_RANGE_FROM_KEY] is not None
     assert context.user_data[bot.PF_EXPORT_RANGE_TO_KEY] is not None
     assert "a" in context.user_data[bot.PF_EXPORT_RANGE_LABEL_KEY]
+
+
+def test_pf_export_menu_uses_local_back_and_main_menu_button(monkeypatch):
+    chat_id = 123
+    bot.pf_get(chat_id)["items"] = [{"simbolo": "GGAL.BA", "tipo": "acc"}]
+
+    update = _DummyUpdate("PF:EXPORT")
+    context = _DummyContext()
+
+    asyncio.run(bot.pf_menu_cb(update, context))
+
+    _, kwargs = update.callback_query.edits[-1]
+    kb = kwargs["reply_markup"].inline_keyboard
+    assert kb[-2][0].text == "Volver"
+    assert kb[-2][0].callback_data == "PF:EXPORT:BACK"
+    assert "menú" in kb[-1][0].text.lower()
+    assert kb[-1][0].callback_data == "PF:MENU"
+
+
+def test_pf_export_history_range_back_returns_to_export_menu(monkeypatch):
+    chat_id = 123
+    bot.pf_get(chat_id)["items"] = [{"simbolo": "GGAL.BA", "tipo": "acc"}]
+
+    update = _DummyUpdate("PF:EXPORT:HISTORY:RANGE")
+    context = _DummyContext()
+
+    asyncio.run(bot.pf_menu_cb(update, context))
+
+    _, kwargs = update.callback_query.edits[-1]
+    kb = kwargs["reply_markup"].inline_keyboard
+    assert kb[-2][0].text == "Volver"
+    assert kb[-2][0].callback_data == "PF:EXPORT"
+    assert "menú" in kb[-1][0].text.lower()
+
+
+def test_pf_export_back_routes_to_main_without_refresh(monkeypatch):
+    calls = {"refresh": 0}
+
+    async def _fake_refresh_menu(*_args, **_kwargs):
+        calls["refresh"] += 1
+
+    async def _fake_main_menu_text(_chat_id):
+        return "menú principal"
+
+    monkeypatch.setattr(bot, "pf_refresh_menu", _fake_refresh_menu)
+    monkeypatch.setattr(bot, "pf_main_menu_text", _fake_main_menu_text)
+
+    update = _DummyUpdate("PF:EXPORT:BACK")
+    context = _DummyContext()
+
+    asyncio.run(bot.pf_menu_cb(update, context))
+
+    args, kwargs = update.callback_query.edits[-1]
+    assert args[0] == "menú principal"
+    assert kwargs.get("parse_mode") == bot.ParseMode.HTML
+    assert calls["refresh"] == 0
