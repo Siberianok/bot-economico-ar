@@ -551,18 +551,79 @@ def _matches_keyword(record: Dict[str, Any], keyword: str) -> bool:
     return keyword.lower() in haystack
 
 
-def _pick_fci_record(symbol: str, records: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    keywords = FCI_KEYWORDS.get(symbol, [])
-    for kw in keywords:
+def _fci_record_identifier(record: Dict[str, Any]) -> Optional[str]:
+    for key in ("fundId", "ticker"):
+        raw = record.get(key)
+        if raw is None:
+            continue
+        val = str(raw).strip()
+        if val:
+            return val
+    return None
+
+
+def _pick_fci_record(
+    symbol: str,
+    records: List[Dict[str, Any]],
+    *,
+    preferred_identifier: Optional[str] = None,
+) -> Tuple[Optional[Dict[str, Any]], bool, Optional[str]]:
+    def _norm(value: Any) -> str:
+        return str(value or "").strip().lower()
+
+    candidates = [_norm(preferred_identifier), _norm(symbol)]
+    candidates = [cand for cand in candidates if cand]
+    if candidates:
         for rec in records:
-            if _matches_keyword(rec, kw):
-                return rec
+            rec_id = _norm(rec.get("fundId"))
+            rec_ticker = _norm(rec.get("ticker"))
+            if any(cand == rec_id or cand == rec_ticker for cand in candidates):
+                return rec, True, _fci_record_identifier(rec)
+
+    keywords = FCI_KEYWORDS.get(symbol, [])
+    if not keywords:
+        return None, False, None
 
     currency_pref = "USD" if "USD" in symbol.upper() else "ARS"
+    threshold = 0.40
+    margin = 0.08
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+
     for rec in records:
-        if str(rec.get("fundCurrency", "")).upper() == currency_pref:
-            return rec
-    return records[0] if records else None
+        name = str(rec.get("fundName") or "").lower()
+        strategy = " ".join(
+            str(rec.get(field) or "")
+            for field in ("fundStrategy", "fundFocus", "fundType")
+        ).lower()
+        manager = " ".join(
+            str(rec.get(field) or "")
+            for field in ("managerName", "managementCompany", "fundManager", "adminName")
+        ).lower()
+        currency = str(rec.get("fundCurrency") or "").upper()
+
+        keyword_count = max(1, len(keywords))
+        name_hits = sum(1 for kw in keywords if kw.lower() in name) / keyword_count
+        strategy_hits = sum(1 for kw in keywords if kw.lower() in strategy) / keyword_count
+        manager_hits = sum(1 for kw in keywords if kw.lower() in manager) / keyword_count
+        currency_hit = 1.0 if currency_pref and currency == currency_pref else 0.0
+
+        score = (
+            (name_hits * 0.45)
+            + (strategy_hits * 0.25)
+            + (currency_hit * 0.20)
+            + (manager_hits * 0.10)
+        )
+        scored.append((score, rec))
+
+    scored.sort(key=lambda row: row[0], reverse=True)
+    if not scored:
+        return None, False, None
+    best_score, best_record = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else 0.0
+    confident = best_score >= threshold and (best_score - second_score) >= margin
+    if not confident:
+        return None, False, None
+    return best_record, True, _fci_record_identifier(best_record)
 
 
 def _fci_metrics_from_record(record: Dict[str, Any]) -> Dict[str, Optional[float]]:
@@ -620,19 +681,37 @@ async def _fondosonline_records(session: ClientSession) -> List[Dict[str, Any]]:
     return []
 
 
-async def _fci_metrics(session: ClientSession, symbol: str) -> Dict[str, Optional[float]]:
+async def _fci_metrics(
+    session: ClientSession,
+    symbol: str,
+    *,
+    preferred_identifier: Optional[str] = None,
+) -> Dict[str, Optional[float]]:
     records = await _fondosonline_records(session)
     if records:
-        picked = _pick_fci_record(symbol, records)
-        if picked:
+        picked, confident, selected_id = _pick_fci_record(
+            symbol,
+            records,
+            preferred_identifier=preferred_identifier,
+        )
+        if picked and confident:
             base = _fci_metrics_from_record(picked)
+            base["fci_source_valid"] = True
+            base["fci_selected_id"] = selected_id
             if base.get("last_px") is None:
                 fallback = _fci_metrics_from_series(symbol)
                 for key in ("last_px", "prev_px", "last_chg", "last_ts"):
                     if fallback.get(key) is not None:
                         base[key] = fallback.get(key)
             return base
-    return _fci_metrics_from_series(symbol)
+        fallback = _fci_metrics_from_series(symbol)
+        fallback["fci_source_valid"] = False
+        fallback["fci_source_warning"] = "sin fuente válida"
+        return fallback
+    fallback = _fci_metrics_from_series(symbol)
+    fallback["fci_source_valid"] = False
+    fallback["fci_source_warning"] = "sin fuente válida"
+    return fallback
 
 
 def _build_custom_crypto_map(entries: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, str]]:
@@ -9804,18 +9883,62 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             symbols.append(benchmark_symbol)
             symbols = sorted(set(symbols))
         mets, last_ts = await metrics_for_symbols(session, symbols) if symbols else ({}, None)
+        fci_item_metrics: Dict[int, Dict[str, Optional[float]]] = {}
+        fci_tasks: List[Tuple[int, Awaitable[Dict[str, Optional[float]]]]] = []
+        for idx, it in enumerate(items):
+            if str(it.get("tipo") or "").lower() != "fci":
+                continue
+            sym = it.get("simbolo")
+            if not sym:
+                continue
+            preferred_id = it.get("fci_selected_id")
+            fci_tasks.append(
+                (
+                    idx,
+                    _fci_metrics(
+                        session,
+                        sym,
+                        preferred_identifier=str(preferred_id) if preferred_id else None,
+                    ),
+                )
+            )
+        if fci_tasks:
+            resolved = await asyncio.gather(*(task for _, task in fci_tasks))
+            for (idx, _), met in zip(fci_tasks, resolved):
+                fci_item_metrics[idx] = met
     enriched: List[Dict[str, Any]] = []
     total_invertido = 0.0
     total_actual = 0.0
     fx_item_fresh_secs = max(1, PORTFOLIO_ITEM_FX_FRESH_HOURS) * 60 * 60
     now_ts = int(time())
-    for it in items:
+    for idx, it in enumerate(items):
         sym = it.get("simbolo", "")
         tipo = it.get("tipo", "")
         qty = float(it["cantidad"]) if it.get("cantidad") is not None else None
         invertido = float(it.get("importe") or 0.0)
-        met_raw = mets.get(sym, {}) if sym in mets else {}
+        if str(tipo).lower() == "fci" and idx in fci_item_metrics:
+            met_raw = fci_item_metrics[idx]
+        else:
+            met_raw = mets.get(sym, {}) if sym in mets else {}
         met = dict(met_raw) if met_raw else {}
+        if str(tipo).lower() == "fci":
+            selected_id = met.get("fci_selected_id")
+            if selected_id and it.get("fci_selected_id") != selected_id:
+                it["fci_selected_id"] = selected_id
+                state_updated = True
+            source_valid = met.get("fci_source_valid")
+            if isinstance(source_valid, bool):
+                if it.get("fci_source_valid") != source_valid:
+                    it["fci_source_valid"] = source_valid
+                    state_updated = True
+            source_warning = met.get("fci_source_warning")
+            if source_warning:
+                if it.get("fci_source_warning") != source_warning:
+                    it["fci_source_warning"] = source_warning
+                    state_updated = True
+            elif it.get("fci_source_warning"):
+                it.pop("fci_source_warning", None)
+                state_updated = True
         price_ts_raw = met_raw.get("last_ts") if met_raw else None
         try:
             price_ts = int(price_ts_raw) if price_ts_raw is not None else None
@@ -10010,6 +10133,8 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             "valuation_stale": valuation_stale,
             "last_valued_base": last_valued_base,
             "last_valued_ts": last_valued_ts,
+            "source_valid": met.get("fci_source_valid") if str(tipo).lower() == "fci" else True,
+            "source_warning": met.get("fci_source_warning") if str(tipo).lower() == "fci" else None,
         })
 
     if items_updated:
@@ -10898,6 +11023,11 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         if last_data and entry in stale_entries:
             linea += f" · 🕒 último dato: {last_data}"
         lines.append(linea)
+    invalid_sources = [entry['label'] for entry in snapshot if entry.get('source_valid') is False]
+    if invalid_sources:
+        lines.append("")
+        lines.append("⚠️ Sin fuente válida para: " + ", ".join(invalid_sources) + ".")
+
     if not HAS_MPL:
         lines.append("")
         lines.append("ℹ️ Instalá matplotlib para ver la composición en gráficos.")
@@ -11063,6 +11193,11 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
     if sin_datos:
         lines.append("")
         lines.append("Sin datos recientes para: " + ", ".join(sin_datos) + ". Se mantiene el valor cargado.")
+
+    invalid_sources = [entry['label'] for entry in snapshot if entry.get('source_valid') is False]
+    if invalid_sources:
+        lines.append("")
+        lines.append("⚠️ Sin fuente válida para: " + ", ".join(invalid_sources) + ".")
 
     if not HAS_MPL:
         lines.append("")
