@@ -8400,10 +8400,13 @@ PF_EXPORT_HEADERS = [
 kb_export = InlineKeyboardMarkup(
     [
         [
-            InlineKeyboardButton("Exportar actual", callback_data="PF:EXPORT:NOW"),
+            InlineKeyboardButton("Actual", callback_data="PF:EXPORT:NOW"),
             InlineKeyboardButton("Histórico", callback_data="PF:EXPORT:HISTORY"),
         ],
-        [InlineKeyboardButton("Histórico por fechas", callback_data="PF:EXPORT:HISTORY:RANGE")],
+        [
+            InlineKeyboardButton("Histórico por fechas", callback_data="PF:EXPORT:HISTORY:RANGE"),
+            InlineKeyboardButton("Personalizado", callback_data="PF:EXPORT:HISTORY:CUSTOM"),
+        ],
         [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
     ]
 )
@@ -8412,6 +8415,19 @@ kb_export = InlineKeyboardMarkup(
 PF_EXPORT_RANGE_FROM_KEY = "pf_export_history_from_ts"
 PF_EXPORT_RANGE_TO_KEY = "pf_export_history_to_ts"
 PF_EXPORT_RANGE_LABEL_KEY = "pf_export_history_range_label"
+PF_EXPORT_CUSTOM_STEP_KEY = "pf_export_custom_step"
+PF_EXPORT_CUSTOM_FROM_DATE_KEY = "pf_export_custom_from_date"
+
+
+def _parse_pf_export_date(raw: str) -> Optional[datetime]:
+    txt = (raw or "").strip()
+    if not re.fullmatch(r"\d{2}/\d{2}/\d{4}", txt):
+        return None
+    try:
+        parsed = datetime.strptime(txt, "%d/%m/%Y")
+    except ValueError:
+        return None
+    return datetime(parsed.year, parsed.month, parsed.day, tzinfo=TZ)
 
 
 def _pf_export_range_label(from_ts: Optional[float], to_ts: Optional[float]) -> str:
@@ -9313,6 +9329,16 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pf_refresh_menu(context, chat_id, force_new=True)
         return
 
+    if data == "PF:EXPORT:HISTORY:CUSTOM":
+        context.user_data[PF_EXPORT_CUSTOM_STEP_KEY] = "from"
+        context.user_data.pop(PF_EXPORT_CUSTOM_FROM_DATE_KEY, None)
+        await q.edit_message_text(
+            "Ingresá la fecha <b>desde</b> (dd/mm/aaaa).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_pf_with_menu_nav([]),
+        )
+        return
+
     if data == "PF:CLEAR":
         pf = pf_get(chat_id)
         items = pf.get("items", [])
@@ -9421,9 +9447,46 @@ def _parse_num_text(s: str) -> Optional[float]:
 async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     mode = context.user_data.get("pf_mode")
-    if not mode: return
     text = (update.message.text or "").strip()
     pf = pf_get(chat_id)
+
+    export_custom_step = context.user_data.get(PF_EXPORT_CUSTOM_STEP_KEY)
+    if export_custom_step == "from":
+        from_dt = _parse_pf_export_date(text)
+        if from_dt is None:
+            await update.message.reply_text("Formato inválido. Usá dd/mm/aaaa (ejemplo: 05/01/2026).")
+            return
+        context.user_data[PF_EXPORT_CUSTOM_FROM_DATE_KEY] = from_dt
+        context.user_data[PF_EXPORT_CUSTOM_STEP_KEY] = "to"
+        await update.message.reply_text("Ahora ingresá la fecha <b>hasta</b> (dd/mm/aaaa).", parse_mode=ParseMode.HTML)
+        return
+
+    if export_custom_step == "to":
+        to_dt = _parse_pf_export_date(text)
+        if to_dt is None:
+            await update.message.reply_text("Formato inválido. Usá dd/mm/aaaa (ejemplo: 31/12/2026).")
+            return
+        from_dt = context.user_data.get(PF_EXPORT_CUSTOM_FROM_DATE_KEY)
+        if not isinstance(from_dt, datetime):
+            context.user_data.pop(PF_EXPORT_CUSTOM_STEP_KEY, None)
+            context.user_data.pop(PF_EXPORT_CUSTOM_FROM_DATE_KEY, None)
+            await update.message.reply_text("No encontré la fecha desde. Volvé a iniciar en Personalizado.")
+            return
+        if from_dt > to_dt:
+            await update.message.reply_text("Rango inválido: la fecha desde no puede ser mayor que la fecha hasta.")
+            return
+        from_ts = from_dt.timestamp()
+        to_ts = (to_dt + timedelta(days=1) - timedelta(seconds=1)).timestamp()
+        context.user_data[PF_EXPORT_RANGE_FROM_KEY] = from_ts
+        context.user_data[PF_EXPORT_RANGE_TO_KEY] = to_ts
+        context.user_data[PF_EXPORT_RANGE_LABEL_KEY] = f"{from_dt.strftime('%d/%m/%Y')} a {to_dt.strftime('%d/%m/%Y')}"
+        context.user_data.pop(PF_EXPORT_CUSTOM_STEP_KEY, None)
+        context.user_data.pop(PF_EXPORT_CUSTOM_FROM_DATE_KEY, None)
+        await pf_export_history(context, chat_id)
+        await pf_refresh_menu(context, chat_id, force_new=True)
+        return
+
+    if not mode: return
 
     if mode == "pf_search_symbol":
         guess = pf_guess_symbol(text)
