@@ -99,3 +99,48 @@ def test_pf_market_snapshot_uses_base_fx_when_item_stale(monkeypatch):
     assert entry["valor_actual"] == 10000.0
     assert pf["items"][0]["fx_rate_used"] == base_tc
     assert pf["items"][0]["fx_ts_used"] == base_ts
+
+
+
+def test_pf_market_snapshot_bond_derives_qty_from_native_purchase_with_base_tc(monkeypatch):
+    now = int(time())
+    pf = {
+        "base": {
+            "moneda": "ARS",
+            "tc": "mep",
+            "tc_valor": 1000.0,
+            "tc_timestamp": now - 120,
+        },
+        "items": [
+            {
+                "simbolo": "GD30",
+                "tipo": "bono",
+                "cantidad": None,
+                "importe": 2000.0,
+                "precio_compra_nativo": 2.0,
+                "moneda_nativa": "USD",
+            }
+        ],
+    }
+
+    async def fake_metrics_for_symbols(_session, _symbols):
+        return {"GD30": {"currency": "USD", "last_ts": now, "last_chg": 2.0}}, now
+
+    async def fake_get_tc_value(_session, _tc_name):
+        return None
+
+    async def fake_save_state():
+        return None
+
+    monkeypatch.setattr(app, "metrics_for_symbols", fake_metrics_for_symbols)
+    monkeypatch.setattr(app, "get_tc_value", fake_get_tc_value)
+    monkeypatch.setattr(app, "save_state", fake_save_state)
+
+    snapshot, *_ = asyncio.run(app.pf_market_snapshot(pf))
+    entry = snapshot[0]
+
+    assert entry["cantidad_derivada"] is True
+    assert entry["cantidad"] == 1.0
+    assert entry["precio_base"] is None
+    assert entry["valuation_mode"] == "cost_basis_fallback"
+    assert entry["valuation_stale"] is True

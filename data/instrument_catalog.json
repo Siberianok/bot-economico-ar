@@ -1,0 +1,428 @@
+{
+  "version": "2026-02-10",
+  "updated_at": "2026-02-10T09:30:00-03:00",
+  "bonos": [
+    {
+      "symbol": "AL29",
+      "label": "Bonar 2029",
+      "moneda": "ARS",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "AL29D",
+      "label": "Bonar 2029",
+      "moneda": "USD",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "AL30",
+      "label": "Bonar 2030",
+      "moneda": "ARS",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "AL30D",
+      "label": "Bonar 2030",
+      "moneda": "USD",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "AL35",
+      "label": "Bonar 2035",
+      "moneda": "ARS",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "AL38",
+      "label": "Bonar 2038",
+      "moneda": "ARS",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "AL39",
+      "label": "Bonar 2039",
+      "moneda": "ARS",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "AL41",
+      "label": "Bonar 2041",
+      "moneda": "ARS",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "AE38",
+      "label": "Bono Global 2038",
+      "moneda": "USD",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "GD29",
+      "label": "Global 2029",
+      "moneda": "ARS",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "GD30",
+      "label": "Global 2030",
+      "moneda": "ARS",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "GD30D",
+      "label": "Global 2030",
+      "moneda": "USD",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "GD35",
+      "label": "Global 2035",
+      "moneda": "ARS",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "GD35D",
+      "label": "Global 2035",
+      "moneda": "USD",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "GD38",
+      "label": "Global 2038",
+      "moneda": "ARS",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "GD41",
+      "label": "Global 2041",
+      "moneda": "ARS",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "GD41D",
+      "label": "Global 2041",
+      "moneda": "USD",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "GD46",
+      "label": "Global 2046",
+      "moneda": "ARS",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "AL32",
+      "label": "Bonar 2032",
+      "moneda": "ARS",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    },
+    {
+      "symbol": "AL36",
+      "label": "Bonar 2036",
+      "moneda": "ARS",
+      "tipo": "soberano",
+      "fuente": "BYMA/Rava",
+      "activo": true
+    }
+  ],
+  "fci": [
+    {
+      "id": "214",
+      "symbol": "FCI-AccionesArg",
+      "nombre": "Acciones Argentina",
+      "administradora": "Adcap",
+      "moneda": "ARS",
+      "tipo": "acciones",
+      "liquidez": "T+2",
+      "riesgo": "alto",
+      "fuente": "FondosOnline",
+      "label": "Adcap Acciones",
+      "activo": true
+    },
+    {
+      "id": "621",
+      "symbol": "FCI-Balanceado",
+      "nombre": "Balanceado Moderado",
+      "administradora": "Galileo",
+      "moneda": "ARS",
+      "tipo": "mixto",
+      "liquidez": "T+2",
+      "riesgo": "medio",
+      "fuente": "FondosOnline",
+      "label": "Galileo Balanceado",
+      "activo": true
+    },
+    {
+      "id": "1016",
+      "symbol": "FCI-BlueChips",
+      "nombre": "BlueChips",
+      "administradora": "Catálogo Local",
+      "moneda": "ARS",
+      "tipo": "otros",
+      "liquidez": "T+1",
+      "riesgo": "medio",
+      "fuente": "Catalogo local",
+      "label": "FCI BlueChips",
+      "activo": true
+    },
+    {
+      "id": "305",
+      "symbol": "FCI-BonosCER",
+      "nombre": "Bonos CER",
+      "administradora": "IOL Invertir",
+      "moneda": "ARS",
+      "tipo": "cer",
+      "liquidez": "T+1",
+      "riesgo": "medio",
+      "fuente": "FondosOnline",
+      "label": "IOL Bonos CER",
+      "activo": true
+    },
+    {
+      "id": "534",
+      "symbol": "FCI-BonosUSD",
+      "nombre": "Renta Dólar",
+      "administradora": "SBS Asset Management",
+      "moneda": "USD",
+      "tipo": "renta fija soberana",
+      "liquidez": "T+1",
+      "riesgo": "medio",
+      "fuente": "FondosOnline",
+      "label": "SBS Renta Dólar",
+      "activo": true
+    },
+    {
+      "id": "1009",
+      "symbol": "FCI-Commodity",
+      "nombre": "Commodity",
+      "administradora": "Catálogo Local",
+      "moneda": "ARS",
+      "tipo": "otros",
+      "liquidez": "T+1",
+      "riesgo": "medio",
+      "fuente": "Catalogo local",
+      "label": "FCI Commodity",
+      "activo": true
+    },
+    {
+      "id": "190",
+      "symbol": "FCI-Corporativos",
+      "nombre": "Obligaciones Negociables",
+      "administradora": "Balanz",
+      "moneda": "ARS",
+      "tipo": "corporativos",
+      "liquidez": "T+1",
+      "riesgo": "medio",
+      "fuente": "FondosOnline",
+      "label": "Balanz ON",
+      "activo": true
+    },
+    {
+      "id": "899",
+      "symbol": "FCI-DurationCorta",
+      "nombre": "Renta Fija Corta",
+      "administradora": "Consultatio",
+      "moneda": "ARS",
+      "tipo": "renta fija corta",
+      "liquidez": "T+1",
+      "riesgo": "bajo",
+      "fuente": "FondosOnline",
+      "label": "Consultatio Corta",
+      "activo": true
+    },
+    {
+      "id": "925",
+      "symbol": "FCI-DurationLarga",
+      "nombre": "Renta Fija Larga",
+      "administradora": "MegaQM",
+      "moneda": "USD",
+      "tipo": "renta fija larga",
+      "liquidez": "T+2",
+      "riesgo": "alto",
+      "fuente": "FondosOnline",
+      "label": "MegaQM Duration Larga",
+      "activo": true
+    },
+    {
+      "id": "913",
+      "symbol": "FCI-DurationMedia",
+      "nombre": "Renta Fija Media",
+      "administradora": "Delta",
+      "moneda": "ARS",
+      "tipo": "renta fija media",
+      "liquidez": "T+1",
+      "riesgo": "medio",
+      "fuente": "FondosOnline",
+      "label": "Delta Duration Media",
+      "activo": true
+    },
+    {
+      "id": "1020",
+      "symbol": "FCI-Global",
+      "nombre": "Global",
+      "administradora": "Catálogo Local",
+      "moneda": "ARS",
+      "tipo": "otros",
+      "liquidez": "T+1",
+      "riesgo": "medio",
+      "fuente": "Catalogo local",
+      "label": "FCI Global",
+      "activo": true
+    },
+    {
+      "id": "1017",
+      "symbol": "FCI-Growth",
+      "nombre": "Growth",
+      "administradora": "Catálogo Local",
+      "moneda": "ARS",
+      "tipo": "otros",
+      "liquidez": "T+1",
+      "riesgo": "medio",
+      "fuente": "Catalogo local",
+      "label": "FCI Growth",
+      "activo": true
+    },
+    {
+      "id": "1015",
+      "symbol": "FCI-HighYield",
+      "nombre": "HighYield",
+      "administradora": "Catálogo Local",
+      "moneda": "ARS",
+      "tipo": "otros",
+      "liquidez": "T+1",
+      "riesgo": "medio",
+      "fuente": "Catalogo local",
+      "label": "FCI HighYield",
+      "activo": true
+    },
+    {
+      "id": "1019",
+      "symbol": "FCI-Latam",
+      "nombre": "Latam",
+      "administradora": "Catálogo Local",
+      "moneda": "ARS",
+      "tipo": "otros",
+      "liquidez": "T+1",
+      "riesgo": "medio",
+      "fuente": "Catalogo local",
+      "label": "FCI Latam",
+      "activo": true
+    },
+    {
+      "id": "140",
+      "symbol": "FCI-Liquidez",
+      "nombre": "Liquidez Premium",
+      "administradora": "Pellegrini",
+      "moneda": "ARS",
+      "tipo": "money market",
+      "liquidez": "T+0",
+      "riesgo": "bajo",
+      "fuente": "FondosOnline",
+      "label": "Pellegrini Liquidez",
+      "activo": true
+    },
+    {
+      "id": "779",
+      "symbol": "FCI-MoneyMarket",
+      "nombre": "Money Market Pesos",
+      "administradora": "Allaria Fondos",
+      "moneda": "ARS",
+      "tipo": "money market",
+      "liquidez": "T+0",
+      "riesgo": "bajo",
+      "fuente": "FondosOnline",
+      "label": "Allaria Money Market",
+      "activo": true
+    },
+    {
+      "id": "1008",
+      "symbol": "FCI-RealEstate",
+      "nombre": "RealEstate",
+      "administradora": "Catálogo Local",
+      "moneda": "ARS",
+      "tipo": "otros",
+      "liquidez": "T+1",
+      "riesgo": "medio",
+      "fuente": "Catalogo local",
+      "label": "FCI RealEstate",
+      "activo": true
+    },
+    {
+      "id": "410",
+      "symbol": "FCI-RentaMixta",
+      "nombre": "Renta Mixta",
+      "administradora": "Cohen",
+      "moneda": "ARS",
+      "tipo": "mixto",
+      "liquidez": "T+1",
+      "riesgo": "medio",
+      "fuente": "FondosOnline",
+      "label": "Cohen Renta Mixta",
+      "activo": true
+    },
+    {
+      "id": "1010",
+      "symbol": "FCI-Tech",
+      "nombre": "Tech",
+      "administradora": "Catálogo Local",
+      "moneda": "ARS",
+      "tipo": "otros",
+      "liquidez": "T+1",
+      "riesgo": "medio",
+      "fuente": "Catalogo local",
+      "label": "FCI Tech",
+      "activo": true
+    },
+    {
+      "id": "1018",
+      "symbol": "FCI-Value",
+      "nombre": "Value",
+      "administradora": "Catálogo Local",
+      "moneda": "ARS",
+      "tipo": "otros",
+      "liquidez": "T+1",
+      "riesgo": "medio",
+      "fuente": "Catalogo local",
+      "label": "FCI Value",
+      "activo": true
+    }
+  ]
+}

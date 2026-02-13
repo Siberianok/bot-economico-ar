@@ -5,6 +5,7 @@ import os, asyncio, logging, re, html as _html, json, math, io, signal, csv, uni
 import copy
 import urllib.request
 import urllib.error
+from dataclasses import dataclass
 from time import time
 from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime, date
@@ -125,16 +126,182 @@ CEDEAR_UNDERLYING_OVERRIDES = {
     "BRKB.BA": "BRK-B",
     "DISN.BA": "DIS",
 }
-BONOS_AR = [
-    "AL30","AL30D","AL35","AL29","GD30","GD30D","GD35","GD38","GD41","AE38",
-    "AL41","AL38","GD46","AL32","GD29","AL36","AL39","GD35D","GD41D","AL29D"
-]
-FCI_LIST = [
-    "FCI-MoneyMarket","FCI-BonosUSD","FCI-AccionesArg","FCI-Corporativos","FCI-Liquidez","FCI-Balanceado",
-    "FCI-RentaMixta","FCI-RealEstate","FCI-Commodity","FCI-Tech","FCI-BonosCER","FCI-DurationCorta",
-    "FCI-DurationMedia","FCI-DurationLarga","FCI-HighYield","FCI-BlueChips","FCI-Growth","FCI-Value",
-    "FCI-Latam","FCI-Global"
-]
+CATALOG_DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "instrument_catalog.json")
+CATALOG_UPDATE_INTERVAL_SECONDS = int(getattr(config, "instrument_catalog_update_seconds", 6 * 3600))
+CATALOG_VALIDATE_INTERVAL_SECONDS = int(getattr(config, "instrument_catalog_validate_seconds", 12 * 3600))
+
+
+@dataclass
+class CatalogInstrument:
+    symbol: str
+    label: str
+    moneda: str
+    tipo: str
+    fuente: str
+    activo: bool = True
+
+
+@dataclass
+class FCICatalogInstrument(CatalogInstrument):
+    id: str = ""
+    nombre: str = ""
+    administradora: str = ""
+    liquidez: str = ""
+    riesgo: str = ""
+
+
+class InstrumentCatalogProvider:
+    def __init__(self, local_path: str):
+        self.local_path = local_path
+        self.version = ""
+        self.updated_at = ""
+        self._bonos: Dict[str, CatalogInstrument] = {}
+        self._fci: Dict[str, FCICatalogInstrument] = {}
+        self._last_validation_ts: Optional[int] = None
+
+    def load_local(self) -> None:
+        try:
+            with open(self.local_path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except Exception as exc:
+            LOGGER.warning("No se pudo cargar catálogo local (%s): %s", self.local_path, exc)
+            return
+        self._hydrate(raw)
+
+    def _hydrate(self, raw: Dict[str, Any]) -> None:
+        bonos: Dict[str, CatalogInstrument] = {}
+        fci: Dict[str, FCICatalogInstrument] = {}
+        for row in raw.get("bonos", []) or []:
+            symbol = str(row.get("symbol") or "").upper().strip()
+            if not symbol:
+                continue
+            bonos[symbol] = CatalogInstrument(
+                symbol=symbol,
+                label=str(row.get("label") or symbol),
+                moneda=str(row.get("moneda") or ("USD" if symbol.endswith("D") else "ARS")).upper(),
+                tipo=str(row.get("tipo") or "soberano").lower(),
+                fuente=str(row.get("fuente") or "catalogo-local"),
+                activo=bool(row.get("activo", True)),
+            )
+        for row in raw.get("fci", []) or []:
+            symbol = str(row.get("symbol") or "").strip()
+            if not symbol:
+                continue
+            fci[symbol] = FCICatalogInstrument(
+                id=str(row.get("id") or symbol),
+                symbol=symbol,
+                label=str(row.get("label") or row.get("nombre") or symbol),
+                nombre=str(row.get("nombre") or symbol),
+                administradora=str(row.get("administradora") or ""),
+                moneda=str(row.get("moneda") or "ARS").upper(),
+                tipo=str(row.get("tipo") or "otros").lower(),
+                liquidez=str(row.get("liquidez") or ""),
+                riesgo=str(row.get("riesgo") or ""),
+                fuente=str(row.get("fuente") or "catalogo-local"),
+                activo=bool(row.get("activo", True)),
+            )
+        if bonos:
+            self._bonos = bonos
+        if fci:
+            self._fci = fci
+        self.version = str(raw.get("version") or self.version)
+        self.updated_at = str(raw.get("updated_at") or self.updated_at)
+
+    def as_payload(self) -> Dict[str, Any]:
+        return {
+            "version": self.version,
+            "updated_at": self.updated_at,
+            "bonos": [vars(x) for x in self._bonos.values()],
+            "fci": [vars(x) for x in self._fci.values()],
+        }
+
+    async def refresh_from_sources(self) -> bool:
+        urls = [u.strip() for u in os.getenv("INSTRUMENT_CATALOG_URLS", "").split(",") if u.strip()]
+        if not urls:
+            return False
+        for url in urls:
+            try:
+                payload = await http_service.get_json(url, timeout=15)
+                if isinstance(payload, dict) and payload.get("bonos") and payload.get("fci"):
+                    self._hydrate(payload)
+                    self._persist_local()
+                    LOGGER.info("Catálogo actualizado desde %s", url)
+                    return True
+            except SourceSuspendedError:
+                LOGGER.warning("Fuente de catálogo suspendida: %s", url)
+            except Exception as exc:
+                LOGGER.warning("No se pudo actualizar catálogo desde %s: %s", url, exc)
+        return False
+
+    async def validate_activity(self, session: Optional[ClientSession] = None) -> None:
+        now_ts = int(time())
+        self._last_validation_ts = now_ts
+        own_session = session is None
+        if own_session:
+            session = ClientSession()
+        try:
+            for sym, inst in self._bonos.items():
+                try:
+                    profile = await _fetch_rava_profile(session, sym) if session else None
+                    inst.activo = bool(profile)
+                except Exception:
+                    pass
+            fci_products = await _fetch_fondosonline_products(session) if session else []
+            names = {str(r.get("name") or "").strip().lower() for r in fci_products if isinstance(r, dict)}
+            if names:
+                for inst in self._fci.values():
+                    inst.activo = inst.nombre.strip().lower() in names
+        finally:
+            if own_session and session:
+                await session.close()
+
+    def _persist_local(self) -> None:
+        try:
+            with open(self.local_path, "w", encoding="utf-8") as fh:
+                json.dump(self.as_payload(), fh, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            LOGGER.warning("No se pudo persistir catálogo local: %s", exc)
+
+    def bonos(self, *, only_active: bool = True) -> List[CatalogInstrument]:
+        values = list(self._bonos.values())
+        if only_active:
+            values = [x for x in values if x.activo]
+        return sorted(values, key=lambda x: x.symbol)
+
+    def fci(self, *, only_active: bool = True) -> List[FCICatalogInstrument]:
+        values = list(self._fci.values())
+        if only_active:
+            values = [x for x in values if x.activo]
+        return sorted(values, key=lambda x: (x.administradora, x.nombre, x.symbol))
+
+    def bono_by_symbol(self, symbol: str) -> Optional[CatalogInstrument]:
+        return self._bonos.get((symbol or "").upper())
+
+    def fci_by_symbol(self, symbol: str) -> Optional[FCICatalogInstrument]:
+        return self._fci.get(symbol or "")
+
+
+async def _fetch_fondosonline_products(session: ClientSession) -> List[Dict[str, Any]]:
+    try:
+        async with session.get(FONDOSONLINE_FUNDS_URL, headers=REQ_HEADERS, timeout=ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return []
+            payload = await resp.json(content_type=None)
+    except Exception:
+        return []
+    if isinstance(payload, dict):
+        rows = payload.get("data") or payload.get("items") or payload.get("funds")
+        if isinstance(rows, list):
+            return [r for r in rows if isinstance(r, dict)]
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    return []
+
+
+CATALOG_PROVIDER = InstrumentCatalogProvider(CATALOG_DATA_PATH)
+CATALOG_PROVIDER.load_local()
+BONOS_AR = [x.symbol for x in CATALOG_PROVIDER.bonos(only_active=False)]
+FCI_LIST = [x.symbol for x in CATALOG_PROVIDER.fci(only_active=False)]
 LETES_LIST = [
     "LETRA-30D","LETRA-60D","LETRA-90D","LETRA-120D","LETRA-180D","LETRA-270D","LETRA-360D",
     "LETRA-12M","LETRA-18M","LETRA-24M","LETRA-USD-90D","LETRA-USD-180D","LETRA-USD-12M",
@@ -617,6 +784,14 @@ PF_SYMBOL_LOOKUP: Dict[str, Tuple[str, str]] = {}
 PF_SYMBOL_SANITIZED_LOOKUP: Dict[str, Tuple[str, str]] = {}
 PF_NAME_LOOKUP: Dict[str, Tuple[str, str]] = {}
 
+
+def is_bono_symbol(symbol: str) -> bool:
+    return CATALOG_PROVIDER.bono_by_symbol(symbol) is not None
+
+
+def is_fci_symbol(symbol: str) -> bool:
+    return CATALOG_PROVIDER.fci_by_symbol(symbol) is not None
+
 def _register_pf_symbol(symbol: str, tipo: str):
     key = symbol.upper()
     PF_SYMBOL_LOOKUP[key] = (symbol, tipo)
@@ -647,6 +822,20 @@ for sym, name in TICKER_NAME.items():
     if entry:
         PF_NAME_LOOKUP[_sanitize_match(name)] = entry
 
+for inst in CATALOG_PROVIDER.bonos(only_active=False):
+    entry = PF_SYMBOL_LOOKUP.get(inst.symbol.upper())
+    if entry:
+        PF_NAME_LOOKUP[_sanitize_match(inst.label)] = entry
+
+for inst in CATALOG_PROVIDER.fci(only_active=False):
+    entry = PF_SYMBOL_LOOKUP.get(inst.symbol.upper())
+    if entry:
+        PF_NAME_LOOKUP[_sanitize_match(inst.label)] = entry
+        PF_NAME_LOOKUP[_sanitize_match(inst.nombre)] = entry
+        PF_NAME_LOOKUP[_sanitize_match(inst.administradora)] = entry
+        PF_SYMBOL_LOOKUP[inst.id.upper()] = entry
+        PF_SYMBOL_SANITIZED_LOOKUP[_sanitize_match(inst.id)] = entry
+
 CEDEARS_SET = {sym.upper() for sym in CEDEARS_BA}
 
 def cedear_underlying_symbol(symbol: str) -> Optional[str]:
@@ -664,10 +853,12 @@ def label_with_currency(sym: str) -> str:
         base_sym = sym[:-3]
         base = f"{TICKER_NAME.get(sym, sym)} ({base_sym})"
         return f"{base} (ARS)"
-    if sym in BONOS_AR: return f"{sym} ({bono_moneda(sym)})"
-    if sym.startswith("FCI-"):
-        cur = "USD" if "USD" in sym.upper() else "ARS"
-        return f"{sym.replace('-',' ')} ({cur})"
+    bono = CATALOG_PROVIDER.bono_by_symbol(sym)
+    if bono:
+        return f"{bono.label} ({bono.symbol}) ({bono.moneda})"
+    fci = CATALOG_PROVIDER.fci_by_symbol(sym)
+    if fci:
+        return f"{fci.label} ({fci.administradora}) ({fci.moneda})"
     if sym.startswith("LETRA"):
         cur = "USD" if "USD" in sym.upper() else "ARS"
         return f"{sym.replace('-',' ')} ({cur})"
@@ -705,8 +896,13 @@ def instrument_currency(sym: str, tipo: str) -> str:
     t = (tipo or "").lower()
     if s.endswith("-USD"): return "USD"
     if t == "cripto": return "USD"
-    if t == "bono": return bono_moneda(sym)
-    if t in ("fci", "lete"):
+    if t == "bono":
+        bono = CATALOG_PROVIDER.bono_by_symbol(sym)
+        return bono.moneda if bono else bono_moneda(sym)
+    if t == "fci":
+        fci = CATALOG_PROVIDER.fci_by_symbol(sym)
+        return fci.moneda if fci else ("USD" if "USD" in s else "ARS")
+    if t == "lete":
         return "USD" if "USD" in s else "ARS"
     if s.endswith(".BA"): return "ARS"
     if t in ("cedear", "accion"): return "ARS"
@@ -2238,6 +2434,9 @@ async def _fx_metrics_series(
     fx_type: str,
 ) -> Dict[str, Optional[float]]:
     out = {
+        "1d": None,
+        "3d": None,
+        "7d": None,
         "6m": None,
         "3m": None,
         "1m": None,
@@ -2266,6 +2465,11 @@ async def _fx_metrics_series(
     horizons = [(30, "1m"), (90, "3m"), (180, "6m")]
     for days, key in horizons:
         prev_val = await _fx_value_at(session, fx_type, today - timedelta(days=days))
+        if prev_val and prev_val > 0:
+            out[key] = (cur_val / prev_val - 1.0) * 100.0
+    short_horizons = [(1, "1d"), (3, "3d"), (7, "7d")]
+    for days, key in short_horizons:
+        prev_val = await _fx_value_at(session, fx_type, today - timedelta(days=days), max_back=3)
         if prev_val and prev_val > 0:
             out[key] = (cur_val / prev_val - 1.0) * 100.0
     if _fx_returns_look_empty(out):
@@ -2846,7 +3050,7 @@ async def _screenermatic_bonds(session: ClientSession) -> Dict[str, Dict[str, Op
             continue
         clean = [re.sub("<[^<]+?>", "", c).strip() for c in cells]
         symbol = clean[0]
-        if symbol not in BONOS_AR:
+        if not is_bono_symbol(symbol):
             continue
         last_px = None
         last_chg = None
@@ -3158,7 +3362,10 @@ def _metrics_from_chart(res: Dict[str, Any], symbol: Optional[str] = None) -> Op
         slope50 = ((s50_last/s50_prev - 1.0)*100.0) if (s50_last and s50_prev) else 0.0
         s200_last = sma200[idx_last] if idx_last < len(sma200) else None
         trend_flag = 1 if (s200_last and last > s200_last) else (-1 if s200_last else 0)
-        return {"1m": ret1, "3m": ret3, "6m": ret6, "last_ts": int(t_last), "vol_ann": vol_ann,
+        ret_1d = ((last / closes[-2]) - 1.0) * 100.0 if len(closes) >= 2 and closes[-2] else None
+        ret_3d = ((last / closes[-4]) - 1.0) * 100.0 if len(closes) >= 4 and closes[-4] else None
+        ret_7d = ((last / closes[-8]) - 1.0) * 100.0 if len(closes) >= 8 and closes[-8] else None
+        return {"1d": ret_1d, "3d": ret_3d, "7d": ret_7d, "1m": ret1, "3m": ret3, "6m": ret6, "last_ts": int(t_last), "vol_ann": vol_ann,
                 "dd6m": dd6, "hi52": hi52, "slope50": slope50, "trend_flag": float(trend_flag),
                 "last_px": float(last), "prev_px": float(prev) if prev else None, "last_chg": last_chg}
     except Exception:
@@ -3195,7 +3402,7 @@ def _validate_interval_independence() -> None:
             log.warning("Validación intervalos: %s diff=%.3f", horizon, abs(d_val - w_val))
 
 async def _yf_metrics_1y(session: ClientSession, symbol: str) -> Dict[str, Optional[float]]:
-    out = {"6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None, "dd6m": None, "hi52": None, "slope50": None,
+    out = {"1d": None, "3d": None, "7d": None, "6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None, "dd6m": None, "hi52": None, "slope50": None,
            "trend_flag": None, "last_px": None, "prev_px": None, "last_chg": None}
     _validate_interval_independence()
     for interval in ("1d", "1wk"):
@@ -3259,7 +3466,7 @@ async def _cedear_metrics(
     return local
 
 async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tuple[Dict[str, Dict[str, Optional[float]]], Optional[int]]:
-    out = {s: {"6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None, "dd6m": None, "hi52": None,
+    out = {s: {"1d": None, "3d": None, "7d": None, "6m": None, "3m": None, "1m": None, "last_ts": None, "vol_ann": None, "dd6m": None, "hi52": None,
                "slope50": None, "trend_flag": None, "last_px": None, "prev_px": None, "last_chg": None} for s in symbols}
     sem = asyncio.Semaphore(4)
     fx_type = "ccl"
@@ -3270,9 +3477,9 @@ async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
 
     async def work(sym: str):
         async with sem:
-            if sym.startswith("FCI-"):
+            if is_fci_symbol(sym):
                 out[sym] = await _fci_metrics(session, sym)
-            elif sym in BONOS_AR:
+            elif is_bono_symbol(sym):
                 out[sym] = await _rava_metrics(session, sym)
             elif sym.upper() in CEDEARS_SET:
                 out[sym] = await _cedear_metrics(session, sym, fx_metrics)
@@ -4570,11 +4777,13 @@ PROJ_RANGE_SHRINK = 0.6
 PROJ_RANGE_LIMITS = {WINDOW_DAYS[3]: (-50.0, 80.0), WINDOW_DAYS[6]: (-70.0, 120.0)}
 PROJ_RANGE_PCTL = 0.674
 
-def _format_projection_range(proj: ProjectionRange, nd: int = 1) -> str:
+def _format_projection_range(proj: ProjectionRange, nd: int = 1, simple: bool = False) -> str:
     center, low, high = proj
     if center is None:
         return "—"
     center_txt = pct(center, nd)
+    if simple:
+        return center_txt
     if low is None or high is None:
         return center_txt
     return f"{center_txt} ({pct(low, nd)} a {pct(high, nd)})"
@@ -4687,14 +4896,14 @@ def _projection_range(
 
 def format_proj_dual(title: str, fecha: Optional[str], rows: List[Tuple[str, ProjectionRange, ProjectionRange]]) -> str:
     head = f"<b>{title}</b>" + (f" <i>Últ. Dato: {fecha}</i>" if fecha else "")
-    sub = "<i>Proy. 3M (corto) y Proy. 6M (medio) — rango estimado P25–P75</i>"
-    lines = [head, sub, "<pre>Rank Empresa (Ticker)     Proy. 3M (rango est.)    Proy. 6M (rango est.)</pre>"]
+    sub = "<i>Proy. 3M (corto) y Proy. 6M (medio)</i>"
+    lines = [head, sub, "<pre>Rank Empresa (Ticker)          Proy. 3M             Proy. 6M</pre>"]
     out = []
     if not rows: out.append("<pre>—</pre>")
     else:
         for idx, (sym, p3v, p6v) in enumerate(rows[:5], start=1):
-            p3 = _format_projection_range(p3v, 1)
-            p6 = _format_projection_range(p6v, 1)
+            p3 = _format_projection_range(p3v, 1, simple=True)
+            p6 = _format_projection_range(p6v, 1, simple=True)
             label = pad(_label_short(sym), 28)
             c3 = center_text(p3, 26); c6 = center_text(p6, 26)
             l = f"{idx:<4} {label}{c3}{c6}"
@@ -5815,12 +6024,13 @@ async def econ_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ============================ ALERTAS ============================
 
-AL_KIND, AL_FX_TYPE, AL_FX_SIDE, AL_OP, AL_MODE, AL_VALUE, AL_METRIC_TYPE, AL_TICKER, AL_CRYPTO = range(9)
+AL_KIND, AL_FX_TYPE, AL_FX_SIDE, AL_OP, AL_MODE, AL_VALUE, AL_METRIC_TYPE, AL_TICKER, AL_CRYPTO, AL_COMPOSITE_LOGIC = range(10)
 ALERTS_SILENT_UNTIL: Dict[int, float] = {}
 ALERTS_PAUSED: Set[int] = set()
 ALERT_PRICE_TOLERANCE_PCT = 0.002  # 0.2% de margen alrededor del umbral
 ALERT_PRICE_TOLERANCE_ABS = 0.0005  # margen mínimo absoluto para precios muy bajos
 ALERT_REARM_COOLDOWN_SECS = 15 * 60
+ALERT_COMPOSITE_COOLDOWN_DEFAULT_SECS = 30 * 60
 
 
 def _float_equals(a: Any, b: Any, abs_tol: float = 1e-6) -> bool:
@@ -5899,6 +6109,103 @@ def _alert_can_trigger(rule: Dict[str, Any], cur: Any, now_ts: float) -> Tuple[b
     return _matches_with_tolerance(cur, target, op), state_changed
 
 
+def _composite_indicator_key(indicator: Dict[str, Any]) -> Optional[str]:
+    kind = (indicator.get("kind") or "").lower()
+    if kind == "fx":
+        fx_type = (indicator.get("type") or "").lower()
+        side = (indicator.get("side") or "").lower() or "venta"
+        if fx_type:
+            return f"fx:{fx_type}:{side}"
+    elif kind == "metric":
+        metric_type = (indicator.get("type") or "").lower()
+        if metric_type:
+            return f"metric:{metric_type}"
+    elif kind == "ticker":
+        symbol = (indicator.get("symbol") or "").upper()
+        if symbol:
+            return f"ticker:{symbol}"
+    elif kind == "crypto":
+        symbol = (indicator.get("symbol") or "").upper()
+        if symbol:
+            return f"crypto:{symbol}"
+    return None
+
+
+def _evaluate_composite_condition(
+    cond: Dict[str, Any],
+    snapshot: Dict[str, Dict[str, Any]],
+    prev_snapshot: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Tuple[bool, str]:
+    ctype = (cond.get("type") or "").lower()
+    if ctype == "variation":
+        key = _composite_indicator_key(cond.get("indicator") or {})
+        if not key:
+            return False, "Condición inválida (indicador)."
+        window = (cond.get("window") or "").lower()
+        op = cond.get("op")
+        target = cond.get("value")
+        if window not in {"1d", "3d", "7d"} or op not in {">", "<"}:
+            return False, "Condición inválida (ventana/op)."
+        cur = ((snapshot.get(key) or {}).get("ret") or {}).get(window)
+        if cur is None or target is None:
+            return False, f"Sin dato para {key} ({window})."
+        ok = cur >= float(target) if op == ">" else cur <= float(target)
+        return ok, f"{key} var {window}: {cur:.2f}% {html_op(op)} {float(target):.2f}%"
+    if ctype == "cross":
+        left_key = _composite_indicator_key(cond.get("left") or {})
+        right_key = _composite_indicator_key(cond.get("right") or {})
+        direction = (cond.get("direction") or "").lower()
+        if not left_key or not right_key or direction not in {"up", "down"}:
+            return False, "Cruce inválido."
+        left_cur = (snapshot.get(left_key) or {}).get("current")
+        right_cur = (snapshot.get(right_key) or {}).get("current")
+        left_prev = ((prev_snapshot or {}).get(left_key) or {}).get("current")
+        right_prev = ((prev_snapshot or {}).get(right_key) or {}).get("current")
+        if None in (left_cur, right_cur, left_prev, right_prev):
+            return False, f"Sin histórico para cruce {left_key} vs {right_key}."
+        if direction == "up":
+            ok = float(left_prev) <= float(right_prev) and float(left_cur) > float(right_cur)
+            why = f"Cruce alcista: {left_key} {left_prev:.2f}→{left_cur:.2f} y {right_key} {right_prev:.2f}→{right_cur:.2f}"
+        else:
+            ok = float(left_prev) >= float(right_prev) and float(left_cur) < float(right_cur)
+            why = f"Cruce bajista: {left_key} {left_prev:.2f}→{left_cur:.2f} y {right_key} {right_prev:.2f}→{right_cur:.2f}"
+        return ok, why
+    return False, "Tipo de condición no soportado."
+
+
+def _evaluate_composite_rule(
+    rule: Dict[str, Any],
+    snapshot: Dict[str, Dict[str, Any]],
+    now_ts: float,
+) -> Tuple[bool, bool, List[str]]:
+    state_changed = False
+    cooldown = int(rule.get("cooldown_secs") or ALERT_COMPOSITE_COOLDOWN_DEFAULT_SECS)
+    last_ts = rule.get("last_trigger_ts")
+    try:
+        last_ts_f = float(last_ts) if last_ts is not None else None
+    except Exception:
+        last_ts_f = None
+    if last_ts_f is not None and now_ts - last_ts_f < cooldown:
+        return False, state_changed, []
+
+    prev_snapshot = rule.get("last_snapshot") if isinstance(rule.get("last_snapshot"), dict) else None
+    conds = rule.get("conditions") or []
+    logic = (rule.get("logic") or "AND").upper()
+    reasons: List[str] = []
+    results: List[bool] = []
+    for cond in conds:
+        ok, why = _evaluate_composite_condition(cond, snapshot, prev_snapshot)
+        results.append(ok)
+        if ok:
+            reasons.append(why)
+    triggered = any(results) if logic == "OR" else (all(results) if results else False)
+
+    if rule.get("last_snapshot") != snapshot:
+        rule["last_snapshot"] = copy.deepcopy(snapshot)
+        state_changed = True
+    return triggered, state_changed, reasons
+
+
 def _alerts_match(existing: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
     if existing.get("kind") != candidate.get("kind"):
         return False
@@ -5929,6 +6236,11 @@ def _alerts_match(existing: Dict[str, Any], candidate: Dict[str, Any]) -> bool:
             existing.get("symbol") == candidate.get("symbol")
             and existing.get("op") == candidate.get("op")
             and _float_equals(existing.get("value"), candidate.get("value"))
+        )
+    if kind == "composite":
+        return (
+            (existing.get("logic") or "AND").upper() == (candidate.get("logic") or "AND").upper()
+            and (existing.get("conditions") or []) == (candidate.get("conditions") or [])
         )
     return False
 
@@ -6410,6 +6722,21 @@ async def alertas_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await q.edit_message_text(msg, reply_markup=kb_op)
         return AL_OP
 
+    if kind == "composite":
+        al.update({
+            "logic": (rule.get("logic") or "AND").upper(),
+        })
+        kb_logic = kb([
+            [("AND", "LOGIC:AND"), ("OR", "LOGIC:OR")],
+            [("Volver", "BACK:KIND"), ("Cancelar", "CANCEL")],
+        ])
+        await q.edit_message_text(
+            f"Regla compuesta actual: {(rule.get('logic') or 'AND').upper()} con {len(rule.get('conditions') or [])} condiciones.\n"
+            "Elegí el operador lógico para editar.",
+            reply_markup=kb_logic,
+        )
+        return AL_COMPOSITE_LOGIC
+
     await q.edit_message_text("Esta alerta no se puede modificar desde el bot.")
     await cmd_alertas_menu(update, context, edit=True)
     return ConversationHandler.END
@@ -6790,6 +7117,10 @@ def _alert_rule_label(rule: Dict[str, Any]) -> str:
         op = rule.get("op", "")
         v = rule.get("value")
         return f"{label} (Precio) {html_op(op)} {fmt_crypto_price(v, rule.get('quote'))}"
+    if kind == "composite":
+        logic = (rule.get("logic") or "AND").upper()
+        conds = rule.get("conditions") or []
+        return f"Compuesta {logic} ({len(conds)} condiciones)"
     sym = rule.get("symbol")
     op = rule.get("op", "")
     v = rule.get("value")
@@ -6943,11 +7274,86 @@ def _get_alert_usage_suggestions(chat_id: int) -> List[Dict[str, Any]]:
     return suggestions[:5]
 
 
+def _parse_composite_indicator(raw: str) -> Optional[Dict[str, Any]]:
+    token = (raw or "").strip()
+    if not token or ":" not in token:
+        return None
+    parts = [p.strip() for p in token.split(":") if p.strip()]
+    root = parts[0].lower()
+    if root == "fx" and len(parts) >= 2:
+        side = parts[2].lower() if len(parts) >= 3 else "venta"
+        return {"kind": "fx", "type": parts[1].lower(), "side": side}
+    if root == "metric" and len(parts) >= 2:
+        return {"kind": "metric", "type": parts[1].lower()}
+    if root == "ticker" and len(parts) >= 2:
+        return {"kind": "ticker", "symbol": parts[1].upper()}
+    if root == "crypto" and len(parts) >= 2:
+        return {"kind": "crypto", "symbol": parts[1].upper()}
+    return None
+
+
+def _parse_composite_conditions(raw: str) -> Optional[List[Dict[str, Any]]]:
+    out: List[Dict[str, Any]] = []
+    for line in (raw or "").splitlines():
+        row = line.strip()
+        if not row:
+            continue
+        parts = row.split()
+        head = parts[0].upper()
+        if head == "VAR" and len(parts) == 5:
+            ind = _parse_composite_indicator(parts[1])
+            window = parts[2].lower()
+            op = parts[3]
+            try:
+                value = float(parts[4].replace(",", "."))
+            except Exception:
+                return None
+            if not ind or window not in {"1d", "3d", "7d"} or op not in {">", "<"}:
+                return None
+            out.append({"type": "variation", "indicator": ind, "window": window, "op": op, "value": value})
+        elif head == "CROSS" and len(parts) == 4:
+            left = _parse_composite_indicator(parts[1])
+            direction = parts[2].lower()
+            right = _parse_composite_indicator(parts[3])
+            if not left or not right or direction not in {"up", "down"}:
+                return None
+            out.append({"type": "cross", "left": left, "right": right, "direction": direction})
+        else:
+            return None
+    return out if out else None
+
+
+async def alertas_add_composite_logic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "CANCEL":
+        await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
+        return ConversationHandler.END
+    if q.data and q.data.startswith("BACK:"):
+        return await alertas_back(update, context)
+    logic = q.data.split(":", 1)[1].upper() if q.data and q.data.startswith("LOGIC:") else "AND"
+    context.user_data.setdefault("al", {})["logic"] = logic
+    example = (
+        "Definí condiciones compuestas, una por línea:\n"
+        "• VAR <indicador> <1d|3d|7d> >|< <umbral>\n"
+        "• CROSS <indicador_1> <up|down> <indicador_2>\n\n"
+        "Indicadores:\n"
+        "- fx:blue:venta\n- metric:riesgo\n- ticker:GGAL.BA\n- crypto:BTCUSDT\n\n"
+        "Ejemplo:\n"
+        "VAR ticker:GGAL.BA 3d > 4\n"
+        "VAR fx:ccl:venta 1d > 1\n"
+        "CROSS ticker:GGAL.BA up fx:ccl:venta"
+    )
+    await q.edit_message_text(f"Operador lógico: <b>{logic}</b>\n\n{example}", parse_mode=ParseMode.HTML)
+    return AL_VALUE
+
+
 def _alertas_kind_prompt(chat_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     base_rows: List[List[Tuple[str, str]]] = [
         [("Dólares", "KIND:fx"), ("Economía", "KIND:metric")],
         [("Acciones", "KIND:acciones"), ("Cedears", "KIND:cedears")],
         [("Criptomonedas", "KIND:crypto")],
+        [("Compuesta", "KIND:composite")],
         [("Volver", "AL:MENU"), ("Cancelar", "CANCEL")],
     ]
     suggestions = _get_alert_usage_suggestions(chat_id)
@@ -7067,6 +7473,14 @@ async def alertas_add_kind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "crypto":
         al["kind"] = "crypto"
         return await alertas_show_crypto_list(update, context, query=q)
+    if kind == "composite":
+        al["kind"] = "composite"
+        kb_logic = kb([
+            [("AND", "LOGIC:AND"), ("OR", "LOGIC:OR")],
+            [("Volver", "BACK:KIND"), ("Cancelar", "CANCEL")],
+        ])
+        await q.edit_message_text("Elegí el operador lógico de la regla compuesta:", reply_markup=kb_logic)
+        return AL_COMPOSITE_LOGIC
     await cmd_alertas_menu(update, context, prefix="Operación cancelada.", edit=True)
     return ConversationHandler.END
 
@@ -7420,6 +7834,44 @@ async def alertas_add_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def alertas_add_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     al = context.user_data.get("al", {})
+    if al.get("kind") == "composite":
+        conditions = _parse_composite_conditions(update.message.text)
+        if not conditions:
+            await update.message.reply_text("Formato inválido. Revisá el ejemplo y reintentá.")
+            return AL_VALUE
+        chat_id = update.effective_chat.id
+        rules = ALERTS.setdefault(chat_id, [])
+        edit_idx = context.user_data.get("al_edit_idx")
+        if not isinstance(edit_idx, int):
+            edit_idx = None
+        is_edit = isinstance(edit_idx, int) and 0 <= edit_idx < len(rules)
+        prev_rule = rules[edit_idx] if is_edit else None
+        candidate = {
+            "kind": "composite",
+            "logic": (al.get("logic") or "AND").upper(),
+            "conditions": conditions,
+            "cooldown_secs": ALERT_COMPOSITE_COOLDOWN_DEFAULT_SECS,
+            "last_trigger_ts": None,
+            "last_snapshot": None,
+        }
+        if _has_duplicate_alert(rules, candidate, skip_idx=edit_idx if is_edit else None):
+            await update.message.reply_text("Ya tenés una alerta compuesta igual configurada.")
+            return AL_VALUE
+        if is_edit:
+            if prev_rule:
+                for key in ("pause_until", "pause_indef"):
+                    if key in prev_rule:
+                        candidate[key] = prev_rule[key]
+            rules[edit_idx] = candidate
+        else:
+            rules.append(candidate)
+        invalidate_alerts_cache()
+        await save_state()
+        msg = "Listo. Alerta compuesta actualizada ✅" if is_edit else "Listo. Alerta compuesta agregada ✅"
+        await update.message.reply_text(msg)
+        await cmd_alertas_menu(update, context)
+        return ConversationHandler.END
+
     val = _parse_float_user_strict(update.message.text)
     if val is None:
         await update.message.reply_text("Ingresá solo número (sin $ ni % ni separadores)."); return AL_VALUE
@@ -7629,6 +8081,28 @@ async def alerts_loop(app: Application):
                                 "reservas": rv[0] if rv else None}
                         sym_list = {r["symbol"] for cid in active_chats for r in ALERTS.get(cid, []) if r.get("kind")=="ticker" and r.get("symbol")}
                         crypto_list = {(r.get("symbol") or "").upper() for cid in active_chats for r in ALERTS.get(cid, []) if r.get("kind")=="crypto" and r.get("symbol")}
+                        composite_rules = [
+                            r
+                            for cid in active_chats
+                            for r in (ALERTS.get(cid, []) or [])
+                            if r.get("kind") == "composite"
+                        ]
+                        comp_fx_types: Set[str] = set()
+                        comp_tickers: Set[str] = set()
+                        comp_cryptos: Set[str] = set()
+                        for cr in composite_rules:
+                            for cond in cr.get("conditions") or []:
+                                for key in ("indicator", "left", "right"):
+                                    ind = cond.get(key) or {}
+                                    ik = (ind.get("kind") or "").lower()
+                                    if ik == "fx" and ind.get("type"):
+                                        comp_fx_types.add((ind.get("type") or "").lower())
+                                    elif ik == "ticker" and ind.get("symbol"):
+                                        comp_tickers.add((ind.get("symbol") or "").upper())
+                                    elif ik == "crypto" and ind.get("symbol"):
+                                        comp_cryptos.add((ind.get("symbol") or "").upper())
+                        sym_list.update(comp_tickers)
+                        crypto_list.update(comp_cryptos)
                         crypto_info_map: Dict[str, Dict[str, Optional[str]]] = {}
                         for cid in active_chats:
                             for rule in ALERTS.get(cid, []) or []:
@@ -7643,6 +8117,13 @@ async def alerts_loop(app: Application):
                                     "quote": rule.get("quote"),
                                 }
                         metmap, _ = (await metrics_for_symbols(session, sorted(sym_list))) if sym_list else ({}, None)
+                        comp_crypto_metrics: Dict[str, Dict[str, Optional[float]]] = {}
+                        if comp_cryptos:
+                            yahoo_symbols = sorted({_crypto_to_symbol(sym.replace("USDT", "")) for sym in comp_cryptos})
+                            comp_crypto_metrics, _ = await metrics_for_symbols(session, yahoo_symbols)
+                        comp_fx_metrics: Dict[str, Dict[str, Optional[float]]] = {}
+                        for fxt in sorted(comp_fx_types):
+                            comp_fx_metrics[fxt] = await _fx_metrics_series(session, fxt)
                         crypto_prices = await get_crypto_prices(session, sorted(crypto_list), crypto_info_map) if crypto_list else {}
                         for chat_id in active_chats:
                             rules = ALERTS.get(chat_id, [])
@@ -7716,6 +8197,42 @@ async def alerts_loop(app: Application):
                                         r["armed"] = False
                                         state_dirty = True
                                         trig.append(("crypto_px", sym, r.get("op"), r.get("value"), cur, r.get("base"), r.get("quote")))
+                                elif r.get("kind") == "composite":
+                                    snapshot: Dict[str, Dict[str, Any]] = {}
+                                    for cond in r.get("conditions") or []:
+                                        for k in ("indicator", "left", "right"):
+                                            ind = cond.get(k) or {}
+                                            key = _composite_indicator_key(ind)
+                                            if not key or key in snapshot:
+                                                continue
+                                            kind = (ind.get("kind") or "").lower()
+                                            if kind == "fx":
+                                                fxt = (ind.get("type") or "").lower()
+                                                side = (ind.get("side") or "venta").lower()
+                                                row = fx.get(fxt, {}) or {}
+                                                cur = _fx_display_value(row, side)
+                                                rets = comp_fx_metrics.get(fxt, {})
+                                                snapshot[key] = {"current": cur, "ret": {"1d": rets.get("1d"), "3d": rets.get("3d"), "7d": rets.get("7d")}}
+                                            elif kind == "metric":
+                                                t = (ind.get("type") or "").lower()
+                                                snapshot[key] = {"current": vals.get(t), "ret": {"1d": None, "3d": None, "7d": None}}
+                                            elif kind == "ticker":
+                                                sym = (ind.get("symbol") or "").upper()
+                                                mm = metmap.get(sym, {})
+                                                snapshot[key] = {"current": mm.get("last_px"), "ret": {"1d": mm.get("1d"), "3d": mm.get("3d"), "7d": mm.get("7d")}}
+                                            elif kind == "crypto":
+                                                sym = (ind.get("symbol") or "").upper()
+                                                cur = crypto_prices.get(sym)
+                                                ysym = _crypto_to_symbol(sym.replace("USDT", ""))
+                                                cm = comp_crypto_metrics.get(ysym, {})
+                                                snapshot[key] = {"current": cur, "ret": {"1d": cm.get("1d"), "3d": cm.get("3d"), "7d": cm.get("7d")}}
+                                    ok, changed, reasons = _evaluate_composite_rule(r, snapshot, now_ts)
+                                    if changed:
+                                        state_dirty = True
+                                    if ok:
+                                        r["last_trigger_ts"] = now_ts
+                                        state_dirty = True
+                                        trig.append(("composite", (r.get("logic") or "AND").upper(), reasons))
                             if trig:
                                 lines = [f"<b>🔔 Alertas</b>"]
                                 for t, *rest in trig:
@@ -7734,6 +8251,11 @@ async def alerts_loop(app: Application):
                                         sym, op, v, cur, base, quote = rest
                                         label = crypto_display_name(sym, base, quote)
                                         lines.append(f"{label}: {fmt_crypto_price(cur, quote)} ({html_op(op)} {fmt_crypto_price(v, quote)})")
+                                    elif t == "composite":
+                                        logic, reasons = rest
+                                        lines.append(f"Compuesta {logic}: disparó por {len(reasons)} condición(es).")
+                                        for reason in reasons:
+                                            lines.append(f"• {reason}")
                                     else:
                                         sym, op, v, cur = rest
                                         lines.append(f"{_label_long(sym)} (Precio): {fmt_money_ars(cur)} ({html_op(op)} {fmt_money_ars(v)})")
@@ -8106,7 +8628,7 @@ def kb_pf_main(chat_id: Optional[int] = None) -> InlineKeyboardMarkup:
 
     rows = [
         [InlineKeyboardButton("Ayuda", callback_data="PF:HELP")],
-        [InlineKeyboardButton("Fijar base", callback_data="PF:SETBASE"), InlineKeyboardButton("Fijar monto", callback_data="PF:SETMONTO")],
+        [InlineKeyboardButton("Fijar base", callback_data="PF:SETBASE"), InlineKeyboardButton("Presupuesto", callback_data="PF:SETMONTO")],
         [InlineKeyboardButton("Benchmark", callback_data="PF:SETBENCH")],
         [InlineKeyboardButton("Agregar instrumento", callback_data="PF:ADD")],
     ]
@@ -8145,6 +8667,37 @@ def _pf_menu_nav_row() -> List[InlineKeyboardButton]:
 
 def _pf_with_menu_nav(rows: List[List[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([*rows, _pf_menu_nav_row()])
+
+
+PF_BUDGET_PRESETS: Dict[str, List[str]] = {
+    "ARS": ["100.000", "500.000", "1.000.000", "10.000.000", "50.000.000", "100.000.000"],
+    "USD": ["1.000", "10.000", "100.000", "1.000.000"],
+}
+
+
+def parse_budget_value(raw: str) -> Optional[float]:
+    return _parse_num_text(raw)
+
+
+def kb_pf_budget(currency: str) -> InlineKeyboardMarkup:
+    curr = (currency or "ARS").upper()
+    if curr not in PF_BUDGET_PRESETS:
+        curr = "ARS"
+    curr_row = [
+        InlineKeyboardButton(("✅ " if curr == c else "") + c, callback_data=f"PF:BUDGET:CUR:{c}")
+        for c in ("ARS", "USD")
+    ]
+    preset_rows = [
+        [InlineKeyboardButton(label, callback_data=f"PF:BUDGET:PRESET:{curr}:{label}")]
+        for label in PF_BUDGET_PRESETS[curr]
+    ]
+    return InlineKeyboardMarkup([
+        curr_row,
+        *preset_rows,
+        [InlineKeyboardButton("Ingresar manual", callback_data=f"PF:BUDGET:MANUAL:{curr}")],
+        [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
+        _pf_menu_nav_row(),
+    ])
 
 def kb_pf_projection_horizons(selected: int) -> InlineKeyboardMarkup:
     horizons = [1, 3, 6, 12]
@@ -8233,6 +8786,81 @@ def kb_pick_generic(symbols: List[str], back: str, prefix: str) -> InlineKeyboar
     if row: rows.append(row)
     rows.append([("Volver","PF:ADD")])
     kb_rows = [[InlineKeyboardButton(t, callback_data=d) for t,d in r] for r in rows]
+    return _pf_with_menu_nav(kb_rows)
+
+
+def _catalog_filter_values(tipo: str) -> Tuple[List[str], List[str]]:
+    if tipo == "bono":
+        entries = CATALOG_PROVIDER.bonos()
+        monedas = sorted({e.moneda for e in entries})
+        tipos = sorted({e.tipo for e in entries})
+        return monedas, tipos
+    if tipo == "fci":
+        entries = CATALOG_PROVIDER.fci()
+        monedas = sorted({e.moneda for e in entries})
+        tipos = sorted({e.tipo for e in entries})
+        return monedas, tipos
+    return [], []
+
+
+def _filter_catalog_entries(tipo: str, moneda: Optional[str], clase: Optional[str], query: Optional[str] = None):
+    q = (query or "").strip().lower()
+    if tipo == "bono":
+        entries = CATALOG_PROVIDER.bonos()
+        out = [
+            e for e in entries
+            if (not moneda or e.moneda == moneda)
+            and (not clase or e.tipo == clase)
+            and (not q or q in e.symbol.lower() or q in e.label.lower())
+        ]
+        return out
+    if tipo == "fci":
+        entries = CATALOG_PROVIDER.fci()
+        out = [
+            e for e in entries
+            if (not moneda or e.moneda == moneda)
+            and (not clase or e.tipo == clase)
+            and (not q or q in e.nombre.lower() or q in e.label.lower() or q in e.administradora.lower())
+        ]
+        return out
+    return []
+
+
+def kb_pick_catalog_entries(entries: List[Any], tipo: str) -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for e in entries[:20]:
+        label = label_with_currency(e.symbol)
+        row.append((label[:52], f"PF:PICK:{e.symbol}"))
+        if len(row) == 1:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([("Refinar filtros", f"PF:ADD:{tipo}")])
+    kb_rows = [[InlineKeyboardButton(t, callback_data=d) for t, d in r] for r in rows]
+    return _pf_with_menu_nav(kb_rows)
+
+
+def kb_catalog_filters(tipo: str, moneda: Optional[str], clase: Optional[str]) -> InlineKeyboardMarkup:
+    monedas, tipos = _catalog_filter_values(tipo)
+    rows: List[List[Tuple[str, str]]] = []
+    if monedas:
+        rows.append([(f"Moneda: {moneda or 'Todas'}", "PF:CAT:NOOP")])
+        rows.append([(f"{m}{' ✅' if m == moneda else ''}", f"PF:CAT:MON:{tipo}:{m}") for m in monedas])
+    if tipos:
+        rows.append([(f"Tipo: {clase or 'Todos'}", "PF:CAT:NOOP")])
+        chunk: List[Tuple[str, str]] = []
+        for t in tipos[:6]:
+            chunk.append((f"{t}{' ✅' if t == clase else ''}", f"PF:CAT:TIPO:{tipo}:{t}"))
+            if len(chunk) == 2:
+                rows.append(chunk)
+                chunk = []
+        if chunk:
+            rows.append(chunk)
+    rows.append([("Ver resultados", f"PF:CAT:LIST:{tipo}"), ("Buscar", f"PF:CAT:SEARCH:{tipo}")])
+    rows.append([("Limpiar filtros", f"PF:CAT:CLEAR:{tipo}")])
+    kb_rows = [[InlineKeyboardButton(t, callback_data=d) for t, d in r] for r in rows]
     return _pf_with_menu_nav(kb_rows)
 
 async def cmd_portafolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8363,8 +8991,59 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "PF:SETMONTO":
-        context.user_data["pf_mode"] = "set_monto"
-        await q.edit_message_text("Ingresá el <b>monto total</b> (solo número).", parse_mode=ParseMode.HTML, reply_markup=_pf_with_menu_nav([])); return
+        budget_currency = (context.user_data.get("pf_budget_currency") or "ARS").upper()
+        if budget_currency not in PF_BUDGET_PRESETS:
+            budget_currency = "ARS"
+        context.user_data["pf_budget_currency"] = budget_currency
+        await q.edit_message_text(
+            "<b>PF:BUDGET</b>\nElegí moneda y presupuesto objetivo.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_pf_budget(budget_currency),
+        )
+        return
+
+    if data.startswith("PF:BUDGET:CUR:"):
+        currency = data.split(":", 3)[3].upper()
+        if currency not in PF_BUDGET_PRESETS:
+            currency = "ARS"
+        context.user_data["pf_budget_currency"] = currency
+        await q.edit_message_text(
+            "<b>PF:BUDGET</b>\nElegí moneda y presupuesto objetivo.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_pf_budget(currency),
+        )
+        return
+
+    if data.startswith("PF:BUDGET:PRESET:"):
+        _, _, _, currency, preset = data.split(":", 4)
+        v = parse_budget_value(preset)
+        if v is None:
+            await q.edit_message_text("Preset inválido.", reply_markup=kb_pf_budget(currency))
+            return
+        pf = pf_get(chat_id)
+        pf["monto"] = float(v)
+        await save_state()
+        context.user_data["pf_budget_currency"] = currency.upper()
+        await q.edit_message_text(
+            await pf_main_menu_text(chat_id),
+            reply_markup=kb_pf_main(chat_id),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data.startswith("PF:BUDGET:MANUAL:"):
+        currency = data.split(":", 3)[3].upper()
+        context.user_data["pf_budget_currency"] = currency if currency in PF_BUDGET_PRESETS else "ARS"
+        context.user_data["pf_mode"] = "set_monto_manual"
+        await q.edit_message_text(
+            "Ingresá el <b>monto total</b> (solo número).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Volver", callback_data="PF:SETMONTO")],
+                _pf_menu_nav_row(),
+            ]),
+        )
+        return
 
     if data == "PF:ADD":
         kb_add = InlineKeyboardMarkup([
@@ -8442,14 +9121,66 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif tipo == "cedear":
             await q.edit_message_text("Elegí el cedear:", reply_markup=kb_pick_generic(CEDEARS_BA, "ADD", "PF:PICK"))
         elif tipo == "bono":
-            await q.edit_message_text("Elegí el bono:", reply_markup=kb_pick_generic(BONOS_AR, "ADD", "PF:PICK"))
+            context.user_data["pf_catalog_moneda"] = None
+            context.user_data["pf_catalog_tipo"] = None
+            await q.edit_message_text("Filtrá bonos por moneda y tipo:", reply_markup=kb_catalog_filters("bono", None, None))
         elif tipo == "fci":
-            await q.edit_message_text("Elegí el FCI:", reply_markup=kb_pick_generic(FCI_LIST, "ADD", "PF:PICK"))
+            context.user_data["pf_catalog_moneda"] = None
+            context.user_data["pf_catalog_tipo"] = None
+            await q.edit_message_text("Filtrá FCI por moneda y tipo:", reply_markup=kb_catalog_filters("fci", None, None))
         elif tipo == "lete":
             await q.edit_message_text("Elegí la Letra:", reply_markup=kb_pick_generic(LETES_LIST, "ADD", "PF:PICK"))
         else:
             await q.edit_message_text("Elegí la cripto:", reply_markup=kb_pick_generic(CRIPTO_TOP_NAMES, "ADD", "PF:PICK"))
         context.user_data["pf_add_message_id"] = q.message.message_id
+        return
+
+    if data == "PF:CAT:NOOP":
+        return
+
+    if data.startswith("PF:CAT:MON:"):
+        _, _, _, tipo, moneda = data.split(":", 4)
+        current = context.user_data.get("pf_catalog_moneda")
+        context.user_data["pf_catalog_moneda"] = None if current == moneda else moneda
+        await q.edit_message_text(
+            f"Filtrá {tipo} por moneda y tipo:",
+            reply_markup=kb_catalog_filters(tipo, context.user_data.get("pf_catalog_moneda"), context.user_data.get("pf_catalog_tipo")),
+        )
+        return
+
+    if data.startswith("PF:CAT:TIPO:"):
+        _, _, _, tipo, clase = data.split(":", 4)
+        current = context.user_data.get("pf_catalog_tipo")
+        context.user_data["pf_catalog_tipo"] = None if current == clase else clase
+        await q.edit_message_text(
+            f"Filtrá {tipo} por moneda y tipo:",
+            reply_markup=kb_catalog_filters(tipo, context.user_data.get("pf_catalog_moneda"), context.user_data.get("pf_catalog_tipo")),
+        )
+        return
+
+    if data.startswith("PF:CAT:CLEAR:"):
+        tipo = data.split(":")[3]
+        context.user_data["pf_catalog_moneda"] = None
+        context.user_data["pf_catalog_tipo"] = None
+        await q.edit_message_text(f"Filtrá {tipo} por moneda y tipo:", reply_markup=kb_catalog_filters(tipo, None, None))
+        return
+
+    if data.startswith("PF:CAT:LIST:"):
+        tipo = data.split(":")[3]
+        moneda = context.user_data.get("pf_catalog_moneda")
+        clase = context.user_data.get("pf_catalog_tipo")
+        results = _filter_catalog_entries(tipo, moneda, clase)
+        if not results:
+            await q.edit_message_text("Sin resultados para ese filtro.", reply_markup=kb_catalog_filters(tipo, moneda, clase))
+            return
+        await q.edit_message_text(f"Resultados ({len(results)}):", reply_markup=kb_pick_catalog_entries(results, tipo))
+        return
+
+    if data.startswith("PF:CAT:SEARCH:"):
+        tipo = data.split(":")[3]
+        context.user_data["pf_mode"] = "pf_catalog_search"
+        context.user_data["pf_catalog_search_tipo"] = tipo
+        await q.edit_message_text("Ingresá texto para buscar por nombre/símbolo.", reply_markup=_pf_with_menu_nav([]))
         return
 
     if data.startswith("PF:PICK:"):
@@ -8560,12 +9291,20 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await pf_show_projection_below(context, chat_id, horizon)
         return
     if data.startswith("PF:PROJ:H:"):
+        horizon_raw = data.split(":", 3)[3] if data.count(":") >= 3 else ""
         try:
-            horizon = int(data.split(":")[3])
+            horizon = int(horizon_raw)
         except (IndexError, ValueError):
             horizon = 3
         if horizon not in (1, 3, 6, 12):
             horizon = 3
+        LOGGER.info(
+            "PF projection horizon callback | chat_id=%s data=%s horizon_raw=%s parsed_horizon=%s",
+            chat_id,
+            data,
+            horizon_raw,
+            horizon,
+        )
         await pf_show_projection_below(context, chat_id, horizon)
         return
 
@@ -8724,13 +9463,25 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["pf_mode"] = None
         return
 
+    if mode == "pf_catalog_search":
+        tipo = context.user_data.get("pf_catalog_search_tipo")
+        moneda = context.user_data.get("pf_catalog_moneda")
+        clase = context.user_data.get("pf_catalog_tipo")
+        results = _filter_catalog_entries(tipo, moneda, clase, text)
+        if not results:
+            await update.message.reply_text("No encontré instrumentos con ese texto. Probá otra búsqueda.")
+            return
+        await _send_below_menu(context, chat_id, text=f"Resultados ({len(results)}):", reply_markup=kb_pick_catalog_entries(results, tipo))
+        context.user_data["pf_mode"] = None
+        return
+
     def _restante_str(usado: float) -> str:
         pf_base = pf["base"]["moneda"].upper()
         return (fmt_money_ars if pf_base=="ARS" else fmt_money_usd)(max(0.0, pf["monto"] - usado))
 
     # Monto total
-    if mode == "set_monto":
-        v = _parse_num_text(text)
+    if mode in ("set_monto", "set_monto_manual"):
+        v = parse_budget_value(text)
         if v is None:
             await update.message.reply_text("Ingresá solo número (sin símbolos)."); return
         pf["monto"] = float(v); await save_state()
@@ -9251,13 +10002,34 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
         if precio_compra_base is None and precio_compra_nativo is not None:
             if base_currency == inst_cur:
                 precio_compra_base = float(precio_compra_nativo)
-            elif fx_rate_compra and fx_rate_compra > 0:
-                precio_compra_base = price_to_base(precio_compra_nativo, inst_cur, base_currency, fx_rate_compra)
+            elif (fx_rate_compra and fx_rate_compra > 0) or (tc_val and tc_val > 0):
+                precio_compra_base = price_to_base(
+                    precio_compra_nativo,
+                    inst_cur,
+                    base_currency,
+                    fx_rate_compra if (fx_rate_compra and fx_rate_compra > 0) else tc_val,
+                )
         derived_qty = False
-        price_base_for_qty = price_base if price_base is not None else precio_compra_base
-        if qty is None and price_base_for_qty and price_base_for_qty > 0 and invertido > 0:
-            qty = invertido / price_base_for_qty
-            derived_qty = True
+        is_bond_or_fci = str(tipo).lower() in {"bono", "fci"}
+        qty_candidate_prices: List[float] = []
+        if is_bond_or_fci:
+            qty_candidate_prices.extend([
+                precio_compra_base,
+                price_base,
+            ])
+            if precio_compra_nativo is not None:
+                fx_for_native = fx_rate_compra if (fx_rate_compra and fx_rate_compra > 0) else tc_val
+                converted_purchase = price_to_base(precio_compra_nativo, inst_cur, base_currency, fx_for_native)
+                qty_candidate_prices.append(converted_purchase)
+        else:
+            qty_candidate_prices.extend([price_base, precio_compra_base])
+
+        if qty is None and invertido > 0:
+            for candidate_price in qty_candidate_prices:
+                if candidate_price is not None and candidate_price > 0:
+                    qty = invertido / candidate_price
+                    derived_qty = True
+                    break
         last_valued_base_raw = it.get("last_valued_base")
         try:
             last_valued_base = float(last_valued_base_raw) if last_valued_base_raw is not None else None
@@ -9276,6 +10048,7 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
 
         valor_actual = invertido
         valuation_mode = "last_known"
+        valuation_stale = False
         if qty is not None and price_base is not None:
             valor_actual = float(qty) * float(price_base)
             valuation_mode = "price"
@@ -9290,13 +10063,31 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
                 last_valued_ts = now_ts
                 items_updated = True
         else:
-            base_value = last_valued_base if last_valued_base is not None else invertido
-            if daily_change is not None:
-                valor_actual = float(base_value) * (1.0 + float(daily_change) / 100.0)
-                valuation_mode = "estimated_from_daily_change"
+            if last_valued_base is not None:
+                valuation_stale = True
+                if daily_change is not None:
+                    valor_actual = float(last_valued_base) * (1.0 + float(daily_change) / 100.0)
+                    valuation_mode = "estimated_from_daily_change"
+                else:
+                    valor_actual = float(last_valued_base)
+                    valuation_mode = "last_known"
             else:
-                valor_actual = float(base_value)
-                valuation_mode = "last_known"
+                valor_actual = float(invertido)
+                valuation_mode = "cost_basis_fallback"
+                valuation_stale = is_bond_or_fci or price_base is None
+
+        if price_base is None and valuation_mode != "price":
+            valuation_stale = True
+
+        quality_updates = {
+            "valuation_mode": valuation_mode,
+            "valuation_stale": valuation_stale,
+            "valuation_price_ts": price_ts,
+        }
+        for quality_key, quality_val in quality_updates.items():
+            if it.get(quality_key) != quality_val:
+                it[quality_key] = quality_val
+                items_updated = True
         valor_actual_nativo = None
         if qty is not None and price_native is not None:
             valor_actual_nativo = float(qty) * float(price_native)
@@ -9339,6 +10130,7 @@ async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], 
             "fx_ts_used": fx_ts_used,
             "added_ts": added_ts,
             "valuation_mode": valuation_mode,
+            "valuation_stale": valuation_stale,
             "last_valued_base": last_valued_base,
             "last_valued_ts": last_valued_ts,
             "source_valid": met.get("fci_source_valid") if str(tipo).lower() == "fci" else True,
@@ -9826,8 +10618,8 @@ def _projection_by_instrument_image(
         missing_6m.append(center_6m is None)
         values_3m.append(center_3m if center_3m is not None else 0.0)
         values_6m.append(center_6m if center_6m is not None else 0.0)
-        labels_3m.append(_format_projection_range(val_3m, 1))
-        labels_6m.append(_format_projection_range(val_6m, 1))
+        labels_3m.append(_format_projection_range(val_3m, 1, simple=True))
+        labels_6m.append(_format_projection_range(val_6m, 1, simple=True))
 
     all_values = [abs(v) for v, miss in zip(values_3m, missing_3m) if not miss]
     all_values += [abs(v) for v, miss in zip(values_6m, missing_6m) if not miss]
@@ -9973,7 +10765,7 @@ def _projection_by_instrument_single_image(
             continue
         labels.append(label)
         values.append(center)
-        value_labels.append(_format_projection_range(val, 1))
+        value_labels.append(_format_projection_range(val, 1, simple=True))
 
     if not values:
         return None
@@ -10214,8 +11006,8 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             linea += f" ({pct(r_ind,2)} vs {f_money(entry['invertido'])})"
         if entry.get("valuation_mode") == "estimated_from_daily_change":
             linea += " · ~estimado"
-        if entry.get("source_valid") is False:
-            linea += " · ⚠️ sin fuente válida"
+        if entry.get("valuation_stale"):
+            linea += " · ⚠️ stale"
         qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
         if qty_txt:
             linea += f" · 📦 Cant: {qty_txt}"
@@ -10334,8 +11126,8 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             detail += f" (Δ {f_money(delta)})"
         if entry.get("valuation_mode") == "estimated_from_daily_change":
             detail += " · ~estimado"
-        if entry.get("source_valid") is False:
-            detail += " · ⚠️ sin fuente válida"
+        if entry.get("valuation_stale"):
+            detail += " · ⚠️ stale"
         qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
         if qty_txt:
             detail += f" · 📦 Cant: {qty_txt}"
@@ -10510,7 +11302,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         delta = valor_actual - invertido
         actual_pct = (delta / invertido) * 100.0 if invertido > 0 else None
         actual_txt = pct(actual_pct, 2)
-        proj_txt = f"🔭 {horizon_label} {_format_projection_range(proj, 2)}"
+        proj_txt = f"🔭 {horizon_label} {_format_projection_range(proj, 2, simple=True)}"
         delta_txt = f"📈 Δ {f_money(delta)}"
 
         detail.append(
@@ -10529,9 +11321,9 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         header += f" <i>Datos al {fecha}</i>"
     lines = [header, f"🧮 Valor actual estimado: {f_money(total_actual)}"]
     lines.append(
-        f"✨ Proyección {horizon_label} (rango estimado): "
-        + f"{pct(w,2)} ({pct(w_low,2)} a {pct(w_high,2)}) → "
-        + f"{f_money(forecast)} ({f_money(forecast_low)} a {f_money(forecast_high)})"
+        f"✨ Proyección {horizon_label}: "
+        + f"{pct(w,2)} → "
+        + f"{f_money(forecast)}"
     )
     if tc_val is not None:
         tc_line = f"💱 Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
@@ -10577,7 +11369,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
             (
                 horizon_label,
                 forecast,
-                f"{f_money(forecast)} ({f_money(forecast_low)} a {f_money(forecast_high)})",
+                f"{f_money(forecast)}",
             ),
         ],
         lambda value, label: label or f_money(value),
@@ -10850,6 +11642,19 @@ async def _shutdown_httpx_client(app: Application) -> None:
     await http_service.aclose()
 
 
+async def instrument_catalog_loop() -> None:
+    while True:
+        try:
+            await CATALOG_PROVIDER.refresh_from_sources()
+        except Exception as exc:
+            log.warning("Fallo actualización de catálogo remoto; se mantiene catálogo local: %s", exc)
+        try:
+            await CATALOG_PROVIDER.validate_activity()
+        except Exception as exc:
+            log.warning("Fallo validación de vigencia de catálogo: %s", exc)
+        await asyncio.sleep(min(CATALOG_UPDATE_INTERVAL_SECONDS, CATALOG_VALIDATE_INTERVAL_SECONDS))
+
+
 def build_application() -> Application:
     httpx_client = build_httpx_client()
     app = (
@@ -10903,6 +11708,7 @@ def build_application() -> Application:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, alertas_crypto_query),
                 CallbackQueryHandler(alertas_crypto_pick_cb, pattern="^(CRYPTOSEL:|CRYPTO:SEARCH|BACK:|CANCEL$)"),
             ],
+            AL_COMPOSITE_LOGIC: [CallbackQueryHandler(alertas_add_composite_logic, pattern="^(LOGIC:|BACK:|CANCEL$)")],
             AL_OP: [CallbackQueryHandler(alertas_add_op, pattern="^(OP:|BACK:|CANCEL$)")],
             AL_MODE: [CallbackQueryHandler(alertas_add_mode, pattern="^(MODE:|BACK:|CANCEL$)")],
             AL_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, alertas_add_value)],
@@ -10954,12 +11760,14 @@ async def main():
 
     alerts_task = None
     keepalive_task = None
+    catalog_task = None
     updater_started = False
     app_started = False
 
     async with application:
         alerts_task = asyncio.create_task(alerts_loop(application))
         keepalive_task = asyncio.create_task(keepalive_loop())
+        catalog_task = asyncio.create_task(instrument_catalog_loop())
         try:
             await application.bot.set_my_commands(BOT_COMMANDS)
             await application.updater.start_webhook(
@@ -11000,9 +11808,11 @@ async def main():
                 alerts_task.cancel()
             if keepalive_task:
                 keepalive_task.cancel()
-            if alerts_task or keepalive_task:
+            if catalog_task:
+                catalog_task.cancel()
+            if alerts_task or keepalive_task or catalog_task:
                 await asyncio.gather(
-                    *(t for t in (alerts_task, keepalive_task) if t),
+                    *(t for t in (alerts_task, keepalive_task, catalog_task) if t),
                     return_exceptions=True,
                 )
             if updater_started:
