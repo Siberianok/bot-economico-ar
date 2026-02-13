@@ -114,6 +114,41 @@ def test_pf_budget_currency_selection_usd_shows_usd_presets():
     assert "Ingresar manual" in all_labels
 
 
+def test_pf_budget_back_returns_to_budget_base_and_not_portfolio_main(monkeypatch):
+    async def _fail_refresh_menu(*_args, **_kwargs):
+        raise AssertionError("No debe volver al menú principal")
+
+    monkeypatch.setattr(bot, "pf_refresh_menu", _fail_refresh_menu)
+    update, q = _make_update_with_query("PF:BUDGET:BACK")
+    context = SimpleNamespace(user_data={"pf_budget_currency": "USD"})
+
+    asyncio.run(bot.pf_menu_cb(update, context))
+
+    text, kwargs = q.edits[-1]
+    assert "PF:BUDGET" in text
+    kb = kwargs["reply_markup"].inline_keyboard
+    assert [btn.text for btn in kb[0]] == ["ARS", "USD"]
+    assert context.user_data.get("pf_budget_currency") is None
+
+
+def test_pf_budget_keeps_portfolio_menu_button_and_pf_menu_returns_main(monkeypatch):
+    async def _fake_main_menu_text(_chat_id):
+        return "menu portafolio"
+
+    monkeypatch.setattr(bot, "pf_main_menu_text", _fake_main_menu_text)
+
+    kb = bot.kb_pf_budget("USD").inline_keyboard
+    assert kb[-1][0].text == "⬅️ Volver al menú portafolio"
+    assert kb[-1][0].callback_data == "PF:MENU"
+
+    update, q = _make_update_with_query("PF:MENU")
+    context = SimpleNamespace(user_data={"pf_budget_currency": "USD"})
+
+    asyncio.run(bot.pf_menu_cb(update, context))
+
+    assert q.edits[-1][0] == "menu portafolio"
+
+
 def test_kb_pf_budget_usd_contains_expected_presets_and_manual_option():
     kb = bot.kb_pf_budget("USD").inline_keyboard
 
