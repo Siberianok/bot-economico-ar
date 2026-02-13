@@ -8404,7 +8404,7 @@ kb_export = InlineKeyboardMarkup(
             InlineKeyboardButton("Histórico", callback_data="PF:EXPORT:HISTORY"),
         ],
         [InlineKeyboardButton("Histórico por fechas", callback_data="PF:EXPORT:HISTORY:RANGE")],
-        [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
+        [InlineKeyboardButton("Volver", callback_data="PF:EXPORT:BACK")],
     ]
 )
 
@@ -9277,6 +9277,10 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Tu portafolio está vacío. No hay datos para exportar.", reply_markup=_pf_with_menu_nav([]))
             return
         await q.edit_message_text("¿Qué querés exportar?", reply_markup=_pf_with_menu_nav(kb_export.inline_keyboard))
+        return
+
+    if data == "PF:EXPORT:BACK":
+        await q.edit_message_text(await pf_main_menu_text(chat_id), reply_markup=kb_pf_main(chat_id), parse_mode=ParseMode.HTML)
         return
 
     if data == "PF:EXPORT:NOW":
