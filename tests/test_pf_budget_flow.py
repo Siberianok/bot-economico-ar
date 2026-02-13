@@ -72,7 +72,7 @@ def test_parse_budget_value_accepts_presets_and_manual_text():
 
 def test_pf_setmonto_opens_budget_screen():
     update, q = _make_update_with_query("PF:SETMONTO")
-    context = SimpleNamespace(user_data={})
+    context = SimpleNamespace(user_data={"pf_budget_currency": "ARS"})
 
     asyncio.run(bot.pf_menu_cb(update, context))
 
@@ -80,8 +80,38 @@ def test_pf_setmonto_opens_budget_screen():
     text, kwargs = q.edits[-1]
     assert "PF:BUDGET" in text
     kb = kwargs["reply_markup"].inline_keyboard
-    assert kb[0][0].text.endswith("ARS")
+    assert [btn.text for btn in kb[0]] == ["ARS", "USD"]
+    all_labels = [btn.text for row in kb for btn in row]
+    assert "Ingresar manual" not in all_labels
+    assert "500.000" not in all_labels
     assert kb[-2][0].text == "Volver"
+    assert context.user_data.get("pf_budget_currency") is None
+
+
+def test_pf_budget_currency_selection_ars_shows_ars_presets():
+    update, q = _make_update_with_query("PF:BUDGET:CUR:ARS")
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(bot.pf_menu_cb(update, context))
+
+    kb = q.edits[-1][1]["reply_markup"].inline_keyboard
+    all_labels = [btn.text for row in kb for btn in row]
+    assert "100.000" in all_labels
+    assert "1.000" not in all_labels
+    assert "Ingresar manual" in all_labels
+
+
+def test_pf_budget_currency_selection_usd_shows_usd_presets():
+    update, q = _make_update_with_query("PF:BUDGET:CUR:USD")
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(bot.pf_menu_cb(update, context))
+
+    kb = q.edits[-1][1]["reply_markup"].inline_keyboard
+    all_labels = [btn.text for row in kb for btn in row]
+    assert "1.000" in all_labels
+    assert "500.000" not in all_labels
+    assert "Ingresar manual" in all_labels
 
 
 def test_pf_budget_preset_updates_amount_and_returns_main(monkeypatch):

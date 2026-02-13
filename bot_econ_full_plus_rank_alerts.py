@@ -8679,25 +8679,25 @@ def parse_budget_value(raw: str) -> Optional[float]:
     return _parse_num_text(raw)
 
 
-def kb_pf_budget(currency: str) -> InlineKeyboardMarkup:
-    curr = (currency or "ARS").upper()
-    if curr not in PF_BUDGET_PRESETS:
-        curr = "ARS"
+def kb_pf_budget(currency: Optional[str] = None) -> InlineKeyboardMarkup:
+    curr = (currency or "").upper()
+    selected_curr = curr if curr in PF_BUDGET_PRESETS else None
     curr_row = [
-        InlineKeyboardButton(("✅ " if curr == c else "") + c, callback_data=f"PF:BUDGET:CUR:{c}")
+        InlineKeyboardButton(("✅ " if selected_curr == c else "") + c, callback_data=f"PF:BUDGET:CUR:{c}")
         for c in ("ARS", "USD")
     ]
-    preset_rows = [
-        [InlineKeyboardButton(label, callback_data=f"PF:BUDGET:PRESET:{curr}:{label}")]
-        for label in PF_BUDGET_PRESETS[curr]
-    ]
-    return InlineKeyboardMarkup([
-        curr_row,
-        *preset_rows,
-        [InlineKeyboardButton("Ingresar manual", callback_data=f"PF:BUDGET:MANUAL:{curr}")],
+    rows: List[List[InlineKeyboardButton]] = [curr_row]
+    if selected_curr:
+        rows.extend([
+            [InlineKeyboardButton(label, callback_data=f"PF:BUDGET:PRESET:{selected_curr}:{label}")]
+            for label in PF_BUDGET_PRESETS[selected_curr]
+        ])
+        rows.append([InlineKeyboardButton("Ingresar manual", callback_data=f"PF:BUDGET:MANUAL:{selected_curr}")])
+    rows.extend([
         [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
         _pf_menu_nav_row(),
     ])
+    return InlineKeyboardMarkup(rows)
 
 def kb_pf_projection_horizons(selected: int) -> InlineKeyboardMarkup:
     horizons = [1, 3, 6, 12]
@@ -8991,14 +8991,11 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "PF:SETMONTO":
-        budget_currency = (context.user_data.get("pf_budget_currency") or "ARS").upper()
-        if budget_currency not in PF_BUDGET_PRESETS:
-            budget_currency = "ARS"
-        context.user_data["pf_budget_currency"] = budget_currency
+        context.user_data.pop("pf_budget_currency", None)
         await q.edit_message_text(
             "<b>PF:BUDGET</b>\nElegí moneda y presupuesto objetivo.",
             parse_mode=ParseMode.HTML,
-            reply_markup=kb_pf_budget(budget_currency),
+            reply_markup=kb_pf_budget(None),
         )
         return
 
