@@ -5,6 +5,7 @@ import os, asyncio, logging, re, html as _html, json, math, io, signal, csv, uni
 import copy
 import urllib.request
 import urllib.error
+from dataclasses import dataclass
 from time import time
 from math import sqrt, floor
 from datetime import datetime, timedelta, time as dtime, date
@@ -125,16 +126,182 @@ CEDEAR_UNDERLYING_OVERRIDES = {
     "BRKB.BA": "BRK-B",
     "DISN.BA": "DIS",
 }
-BONOS_AR = [
-    "AL30","AL30D","AL35","AL29","GD30","GD30D","GD35","GD38","GD41","AE38",
-    "AL41","AL38","GD46","AL32","GD29","AL36","AL39","GD35D","GD41D","AL29D"
-]
-FCI_LIST = [
-    "FCI-MoneyMarket","FCI-BonosUSD","FCI-AccionesArg","FCI-Corporativos","FCI-Liquidez","FCI-Balanceado",
-    "FCI-RentaMixta","FCI-RealEstate","FCI-Commodity","FCI-Tech","FCI-BonosCER","FCI-DurationCorta",
-    "FCI-DurationMedia","FCI-DurationLarga","FCI-HighYield","FCI-BlueChips","FCI-Growth","FCI-Value",
-    "FCI-Latam","FCI-Global"
-]
+CATALOG_DATA_PATH = os.path.join(os.path.dirname(__file__), "data", "instrument_catalog.json")
+CATALOG_UPDATE_INTERVAL_SECONDS = int(getattr(config, "instrument_catalog_update_seconds", 6 * 3600))
+CATALOG_VALIDATE_INTERVAL_SECONDS = int(getattr(config, "instrument_catalog_validate_seconds", 12 * 3600))
+
+
+@dataclass
+class CatalogInstrument:
+    symbol: str
+    label: str
+    moneda: str
+    tipo: str
+    fuente: str
+    activo: bool = True
+
+
+@dataclass
+class FCICatalogInstrument(CatalogInstrument):
+    id: str = ""
+    nombre: str = ""
+    administradora: str = ""
+    liquidez: str = ""
+    riesgo: str = ""
+
+
+class InstrumentCatalogProvider:
+    def __init__(self, local_path: str):
+        self.local_path = local_path
+        self.version = ""
+        self.updated_at = ""
+        self._bonos: Dict[str, CatalogInstrument] = {}
+        self._fci: Dict[str, FCICatalogInstrument] = {}
+        self._last_validation_ts: Optional[int] = None
+
+    def load_local(self) -> None:
+        try:
+            with open(self.local_path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+        except Exception as exc:
+            LOGGER.warning("No se pudo cargar catálogo local (%s): %s", self.local_path, exc)
+            return
+        self._hydrate(raw)
+
+    def _hydrate(self, raw: Dict[str, Any]) -> None:
+        bonos: Dict[str, CatalogInstrument] = {}
+        fci: Dict[str, FCICatalogInstrument] = {}
+        for row in raw.get("bonos", []) or []:
+            symbol = str(row.get("symbol") or "").upper().strip()
+            if not symbol:
+                continue
+            bonos[symbol] = CatalogInstrument(
+                symbol=symbol,
+                label=str(row.get("label") or symbol),
+                moneda=str(row.get("moneda") or ("USD" if symbol.endswith("D") else "ARS")).upper(),
+                tipo=str(row.get("tipo") or "soberano").lower(),
+                fuente=str(row.get("fuente") or "catalogo-local"),
+                activo=bool(row.get("activo", True)),
+            )
+        for row in raw.get("fci", []) or []:
+            symbol = str(row.get("symbol") or "").strip()
+            if not symbol:
+                continue
+            fci[symbol] = FCICatalogInstrument(
+                id=str(row.get("id") or symbol),
+                symbol=symbol,
+                label=str(row.get("label") or row.get("nombre") or symbol),
+                nombre=str(row.get("nombre") or symbol),
+                administradora=str(row.get("administradora") or ""),
+                moneda=str(row.get("moneda") or "ARS").upper(),
+                tipo=str(row.get("tipo") or "otros").lower(),
+                liquidez=str(row.get("liquidez") or ""),
+                riesgo=str(row.get("riesgo") or ""),
+                fuente=str(row.get("fuente") or "catalogo-local"),
+                activo=bool(row.get("activo", True)),
+            )
+        if bonos:
+            self._bonos = bonos
+        if fci:
+            self._fci = fci
+        self.version = str(raw.get("version") or self.version)
+        self.updated_at = str(raw.get("updated_at") or self.updated_at)
+
+    def as_payload(self) -> Dict[str, Any]:
+        return {
+            "version": self.version,
+            "updated_at": self.updated_at,
+            "bonos": [vars(x) for x in self._bonos.values()],
+            "fci": [vars(x) for x in self._fci.values()],
+        }
+
+    async def refresh_from_sources(self) -> bool:
+        urls = [u.strip() for u in os.getenv("INSTRUMENT_CATALOG_URLS", "").split(",") if u.strip()]
+        if not urls:
+            return False
+        for url in urls:
+            try:
+                payload = await http_service.get_json(url, timeout=15)
+                if isinstance(payload, dict) and payload.get("bonos") and payload.get("fci"):
+                    self._hydrate(payload)
+                    self._persist_local()
+                    LOGGER.info("Catálogo actualizado desde %s", url)
+                    return True
+            except SourceSuspendedError:
+                LOGGER.warning("Fuente de catálogo suspendida: %s", url)
+            except Exception as exc:
+                LOGGER.warning("No se pudo actualizar catálogo desde %s: %s", url, exc)
+        return False
+
+    async def validate_activity(self, session: Optional[ClientSession] = None) -> None:
+        now_ts = int(time())
+        self._last_validation_ts = now_ts
+        own_session = session is None
+        if own_session:
+            session = ClientSession()
+        try:
+            for sym, inst in self._bonos.items():
+                try:
+                    profile = await _fetch_rava_profile(session, sym) if session else None
+                    inst.activo = bool(profile)
+                except Exception:
+                    pass
+            fci_products = await _fetch_fondosonline_products(session) if session else []
+            names = {str(r.get("name") or "").strip().lower() for r in fci_products if isinstance(r, dict)}
+            if names:
+                for inst in self._fci.values():
+                    inst.activo = inst.nombre.strip().lower() in names
+        finally:
+            if own_session and session:
+                await session.close()
+
+    def _persist_local(self) -> None:
+        try:
+            with open(self.local_path, "w", encoding="utf-8") as fh:
+                json.dump(self.as_payload(), fh, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            LOGGER.warning("No se pudo persistir catálogo local: %s", exc)
+
+    def bonos(self, *, only_active: bool = True) -> List[CatalogInstrument]:
+        values = list(self._bonos.values())
+        if only_active:
+            values = [x for x in values if x.activo]
+        return sorted(values, key=lambda x: x.symbol)
+
+    def fci(self, *, only_active: bool = True) -> List[FCICatalogInstrument]:
+        values = list(self._fci.values())
+        if only_active:
+            values = [x for x in values if x.activo]
+        return sorted(values, key=lambda x: (x.administradora, x.nombre, x.symbol))
+
+    def bono_by_symbol(self, symbol: str) -> Optional[CatalogInstrument]:
+        return self._bonos.get((symbol or "").upper())
+
+    def fci_by_symbol(self, symbol: str) -> Optional[FCICatalogInstrument]:
+        return self._fci.get(symbol or "")
+
+
+async def _fetch_fondosonline_products(session: ClientSession) -> List[Dict[str, Any]]:
+    try:
+        async with session.get(FONDOSONLINE_FUNDS_URL, headers=REQ_HEADERS, timeout=ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return []
+            payload = await resp.json(content_type=None)
+    except Exception:
+        return []
+    if isinstance(payload, dict):
+        rows = payload.get("data") or payload.get("items") or payload.get("funds")
+        if isinstance(rows, list):
+            return [r for r in rows if isinstance(r, dict)]
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    return []
+
+
+CATALOG_PROVIDER = InstrumentCatalogProvider(CATALOG_DATA_PATH)
+CATALOG_PROVIDER.load_local()
+BONOS_AR = [x.symbol for x in CATALOG_PROVIDER.bonos(only_active=False)]
+FCI_LIST = [x.symbol for x in CATALOG_PROVIDER.fci(only_active=False)]
 LETES_LIST = [
     "LETRA-30D","LETRA-60D","LETRA-90D","LETRA-120D","LETRA-180D","LETRA-270D","LETRA-360D",
     "LETRA-12M","LETRA-18M","LETRA-24M","LETRA-USD-90D","LETRA-USD-180D","LETRA-USD-12M",
@@ -538,6 +705,14 @@ PF_SYMBOL_LOOKUP: Dict[str, Tuple[str, str]] = {}
 PF_SYMBOL_SANITIZED_LOOKUP: Dict[str, Tuple[str, str]] = {}
 PF_NAME_LOOKUP: Dict[str, Tuple[str, str]] = {}
 
+
+def is_bono_symbol(symbol: str) -> bool:
+    return CATALOG_PROVIDER.bono_by_symbol(symbol) is not None
+
+
+def is_fci_symbol(symbol: str) -> bool:
+    return CATALOG_PROVIDER.fci_by_symbol(symbol) is not None
+
 def _register_pf_symbol(symbol: str, tipo: str):
     key = symbol.upper()
     PF_SYMBOL_LOOKUP[key] = (symbol, tipo)
@@ -568,6 +743,20 @@ for sym, name in TICKER_NAME.items():
     if entry:
         PF_NAME_LOOKUP[_sanitize_match(name)] = entry
 
+for inst in CATALOG_PROVIDER.bonos(only_active=False):
+    entry = PF_SYMBOL_LOOKUP.get(inst.symbol.upper())
+    if entry:
+        PF_NAME_LOOKUP[_sanitize_match(inst.label)] = entry
+
+for inst in CATALOG_PROVIDER.fci(only_active=False):
+    entry = PF_SYMBOL_LOOKUP.get(inst.symbol.upper())
+    if entry:
+        PF_NAME_LOOKUP[_sanitize_match(inst.label)] = entry
+        PF_NAME_LOOKUP[_sanitize_match(inst.nombre)] = entry
+        PF_NAME_LOOKUP[_sanitize_match(inst.administradora)] = entry
+        PF_SYMBOL_LOOKUP[inst.id.upper()] = entry
+        PF_SYMBOL_SANITIZED_LOOKUP[_sanitize_match(inst.id)] = entry
+
 CEDEARS_SET = {sym.upper() for sym in CEDEARS_BA}
 
 def cedear_underlying_symbol(symbol: str) -> Optional[str]:
@@ -585,10 +774,12 @@ def label_with_currency(sym: str) -> str:
         base_sym = sym[:-3]
         base = f"{TICKER_NAME.get(sym, sym)} ({base_sym})"
         return f"{base} (ARS)"
-    if sym in BONOS_AR: return f"{sym} ({bono_moneda(sym)})"
-    if sym.startswith("FCI-"):
-        cur = "USD" if "USD" in sym.upper() else "ARS"
-        return f"{sym.replace('-',' ')} ({cur})"
+    bono = CATALOG_PROVIDER.bono_by_symbol(sym)
+    if bono:
+        return f"{bono.label} ({bono.symbol}) ({bono.moneda})"
+    fci = CATALOG_PROVIDER.fci_by_symbol(sym)
+    if fci:
+        return f"{fci.label} ({fci.administradora}) ({fci.moneda})"
     if sym.startswith("LETRA"):
         cur = "USD" if "USD" in sym.upper() else "ARS"
         return f"{sym.replace('-',' ')} ({cur})"
@@ -626,8 +817,13 @@ def instrument_currency(sym: str, tipo: str) -> str:
     t = (tipo or "").lower()
     if s.endswith("-USD"): return "USD"
     if t == "cripto": return "USD"
-    if t == "bono": return bono_moneda(sym)
-    if t in ("fci", "lete"):
+    if t == "bono":
+        bono = CATALOG_PROVIDER.bono_by_symbol(sym)
+        return bono.moneda if bono else bono_moneda(sym)
+    if t == "fci":
+        fci = CATALOG_PROVIDER.fci_by_symbol(sym)
+        return fci.moneda if fci else ("USD" if "USD" in s else "ARS")
+    if t == "lete":
         return "USD" if "USD" in s else "ARS"
     if s.endswith(".BA"): return "ARS"
     if t in ("cedear", "accion"): return "ARS"
@@ -2767,7 +2963,7 @@ async def _screenermatic_bonds(session: ClientSession) -> Dict[str, Dict[str, Op
             continue
         clean = [re.sub("<[^<]+?>", "", c).strip() for c in cells]
         symbol = clean[0]
-        if symbol not in BONOS_AR:
+        if not is_bono_symbol(symbol):
             continue
         last_px = None
         last_chg = None
@@ -3191,9 +3387,9 @@ async def metrics_for_symbols(session: ClientSession, symbols: List[str]) -> Tup
 
     async def work(sym: str):
         async with sem:
-            if sym.startswith("FCI-"):
+            if is_fci_symbol(sym):
                 out[sym] = await _fci_metrics(session, sym)
-            elif sym in BONOS_AR:
+            elif is_bono_symbol(sym):
                 out[sym] = await _rava_metrics(session, sym)
             elif sym.upper() in CEDEARS_SET:
                 out[sym] = await _cedear_metrics(session, sym, fx_metrics)
@@ -8156,6 +8352,81 @@ def kb_pick_generic(symbols: List[str], back: str, prefix: str) -> InlineKeyboar
     kb_rows = [[InlineKeyboardButton(t, callback_data=d) for t,d in r] for r in rows]
     return _pf_with_menu_nav(kb_rows)
 
+
+def _catalog_filter_values(tipo: str) -> Tuple[List[str], List[str]]:
+    if tipo == "bono":
+        entries = CATALOG_PROVIDER.bonos()
+        monedas = sorted({e.moneda for e in entries})
+        tipos = sorted({e.tipo for e in entries})
+        return monedas, tipos
+    if tipo == "fci":
+        entries = CATALOG_PROVIDER.fci()
+        monedas = sorted({e.moneda for e in entries})
+        tipos = sorted({e.tipo for e in entries})
+        return monedas, tipos
+    return [], []
+
+
+def _filter_catalog_entries(tipo: str, moneda: Optional[str], clase: Optional[str], query: Optional[str] = None):
+    q = (query or "").strip().lower()
+    if tipo == "bono":
+        entries = CATALOG_PROVIDER.bonos()
+        out = [
+            e for e in entries
+            if (not moneda or e.moneda == moneda)
+            and (not clase or e.tipo == clase)
+            and (not q or q in e.symbol.lower() or q in e.label.lower())
+        ]
+        return out
+    if tipo == "fci":
+        entries = CATALOG_PROVIDER.fci()
+        out = [
+            e for e in entries
+            if (not moneda or e.moneda == moneda)
+            and (not clase or e.tipo == clase)
+            and (not q or q in e.nombre.lower() or q in e.label.lower() or q in e.administradora.lower())
+        ]
+        return out
+    return []
+
+
+def kb_pick_catalog_entries(entries: List[Any], tipo: str) -> InlineKeyboardMarkup:
+    rows = []
+    row = []
+    for e in entries[:20]:
+        label = label_with_currency(e.symbol)
+        row.append((label[:52], f"PF:PICK:{e.symbol}"))
+        if len(row) == 1:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([("Refinar filtros", f"PF:ADD:{tipo}")])
+    kb_rows = [[InlineKeyboardButton(t, callback_data=d) for t, d in r] for r in rows]
+    return _pf_with_menu_nav(kb_rows)
+
+
+def kb_catalog_filters(tipo: str, moneda: Optional[str], clase: Optional[str]) -> InlineKeyboardMarkup:
+    monedas, tipos = _catalog_filter_values(tipo)
+    rows: List[List[Tuple[str, str]]] = []
+    if monedas:
+        rows.append([(f"Moneda: {moneda or 'Todas'}", "PF:CAT:NOOP")])
+        rows.append([(f"{m}{' ✅' if m == moneda else ''}", f"PF:CAT:MON:{tipo}:{m}") for m in monedas])
+    if tipos:
+        rows.append([(f"Tipo: {clase or 'Todos'}", "PF:CAT:NOOP")])
+        chunk: List[Tuple[str, str]] = []
+        for t in tipos[:6]:
+            chunk.append((f"{t}{' ✅' if t == clase else ''}", f"PF:CAT:TIPO:{tipo}:{t}"))
+            if len(chunk) == 2:
+                rows.append(chunk)
+                chunk = []
+        if chunk:
+            rows.append(chunk)
+    rows.append([("Ver resultados", f"PF:CAT:LIST:{tipo}"), ("Buscar", f"PF:CAT:SEARCH:{tipo}")])
+    rows.append([("Limpiar filtros", f"PF:CAT:CLEAR:{tipo}")])
+    kb_rows = [[InlineKeyboardButton(t, callback_data=d) for t, d in r] for r in rows]
+    return _pf_with_menu_nav(kb_rows)
+
 async def cmd_portafolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = await pf_main_menu_text(chat_id)
@@ -8363,14 +8634,66 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif tipo == "cedear":
             await q.edit_message_text("Elegí el cedear:", reply_markup=kb_pick_generic(CEDEARS_BA, "ADD", "PF:PICK"))
         elif tipo == "bono":
-            await q.edit_message_text("Elegí el bono:", reply_markup=kb_pick_generic(BONOS_AR, "ADD", "PF:PICK"))
+            context.user_data["pf_catalog_moneda"] = None
+            context.user_data["pf_catalog_tipo"] = None
+            await q.edit_message_text("Filtrá bonos por moneda y tipo:", reply_markup=kb_catalog_filters("bono", None, None))
         elif tipo == "fci":
-            await q.edit_message_text("Elegí el FCI:", reply_markup=kb_pick_generic(FCI_LIST, "ADD", "PF:PICK"))
+            context.user_data["pf_catalog_moneda"] = None
+            context.user_data["pf_catalog_tipo"] = None
+            await q.edit_message_text("Filtrá FCI por moneda y tipo:", reply_markup=kb_catalog_filters("fci", None, None))
         elif tipo == "lete":
             await q.edit_message_text("Elegí la Letra:", reply_markup=kb_pick_generic(LETES_LIST, "ADD", "PF:PICK"))
         else:
             await q.edit_message_text("Elegí la cripto:", reply_markup=kb_pick_generic(CRIPTO_TOP_NAMES, "ADD", "PF:PICK"))
         context.user_data["pf_add_message_id"] = q.message.message_id
+        return
+
+    if data == "PF:CAT:NOOP":
+        return
+
+    if data.startswith("PF:CAT:MON:"):
+        _, _, _, tipo, moneda = data.split(":", 4)
+        current = context.user_data.get("pf_catalog_moneda")
+        context.user_data["pf_catalog_moneda"] = None if current == moneda else moneda
+        await q.edit_message_text(
+            f"Filtrá {tipo} por moneda y tipo:",
+            reply_markup=kb_catalog_filters(tipo, context.user_data.get("pf_catalog_moneda"), context.user_data.get("pf_catalog_tipo")),
+        )
+        return
+
+    if data.startswith("PF:CAT:TIPO:"):
+        _, _, _, tipo, clase = data.split(":", 4)
+        current = context.user_data.get("pf_catalog_tipo")
+        context.user_data["pf_catalog_tipo"] = None if current == clase else clase
+        await q.edit_message_text(
+            f"Filtrá {tipo} por moneda y tipo:",
+            reply_markup=kb_catalog_filters(tipo, context.user_data.get("pf_catalog_moneda"), context.user_data.get("pf_catalog_tipo")),
+        )
+        return
+
+    if data.startswith("PF:CAT:CLEAR:"):
+        tipo = data.split(":")[3]
+        context.user_data["pf_catalog_moneda"] = None
+        context.user_data["pf_catalog_tipo"] = None
+        await q.edit_message_text(f"Filtrá {tipo} por moneda y tipo:", reply_markup=kb_catalog_filters(tipo, None, None))
+        return
+
+    if data.startswith("PF:CAT:LIST:"):
+        tipo = data.split(":")[3]
+        moneda = context.user_data.get("pf_catalog_moneda")
+        clase = context.user_data.get("pf_catalog_tipo")
+        results = _filter_catalog_entries(tipo, moneda, clase)
+        if not results:
+            await q.edit_message_text("Sin resultados para ese filtro.", reply_markup=kb_catalog_filters(tipo, moneda, clase))
+            return
+        await q.edit_message_text(f"Resultados ({len(results)}):", reply_markup=kb_pick_catalog_entries(results, tipo))
+        return
+
+    if data.startswith("PF:CAT:SEARCH:"):
+        tipo = data.split(":")[3]
+        context.user_data["pf_mode"] = "pf_catalog_search"
+        context.user_data["pf_catalog_search_tipo"] = tipo
+        await q.edit_message_text("Ingresá texto para buscar por nombre/símbolo.", reply_markup=_pf_with_menu_nav([]))
         return
 
     if data.startswith("PF:PICK:"):
@@ -8642,6 +8965,18 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await context.bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id, reply_markup=kb_ask)
             except Exception:
                 pass
+        context.user_data["pf_mode"] = None
+        return
+
+    if mode == "pf_catalog_search":
+        tipo = context.user_data.get("pf_catalog_search_tipo")
+        moneda = context.user_data.get("pf_catalog_moneda")
+        clase = context.user_data.get("pf_catalog_tipo")
+        results = _filter_catalog_entries(tipo, moneda, clase, text)
+        if not results:
+            await update.message.reply_text("No encontré instrumentos con ese texto. Probá otra búsqueda.")
+            return
+        await _send_below_menu(context, chat_id, text=f"Resultados ({len(results)}):", reply_markup=kb_pick_catalog_entries(results, tipo))
         context.user_data["pf_mode"] = None
         return
 
@@ -10711,6 +11046,19 @@ async def _shutdown_httpx_client(app: Application) -> None:
     await http_service.aclose()
 
 
+async def instrument_catalog_loop() -> None:
+    while True:
+        try:
+            await CATALOG_PROVIDER.refresh_from_sources()
+        except Exception as exc:
+            log.warning("Fallo actualización de catálogo remoto; se mantiene catálogo local: %s", exc)
+        try:
+            await CATALOG_PROVIDER.validate_activity()
+        except Exception as exc:
+            log.warning("Fallo validación de vigencia de catálogo: %s", exc)
+        await asyncio.sleep(min(CATALOG_UPDATE_INTERVAL_SECONDS, CATALOG_VALIDATE_INTERVAL_SECONDS))
+
+
 def build_application() -> Application:
     httpx_client = build_httpx_client()
     app = (
@@ -10815,12 +11163,14 @@ async def main():
 
     alerts_task = None
     keepalive_task = None
+    catalog_task = None
     updater_started = False
     app_started = False
 
     async with application:
         alerts_task = asyncio.create_task(alerts_loop(application))
         keepalive_task = asyncio.create_task(keepalive_loop())
+        catalog_task = asyncio.create_task(instrument_catalog_loop())
         try:
             await application.bot.set_my_commands(BOT_COMMANDS)
             await application.updater.start_webhook(
@@ -10861,9 +11211,11 @@ async def main():
                 alerts_task.cancel()
             if keepalive_task:
                 keepalive_task.cancel()
-            if alerts_task or keepalive_task:
+            if catalog_task:
+                catalog_task.cancel()
+            if alerts_task or keepalive_task or catalog_task:
                 await asyncio.gather(
-                    *(t for t in (alerts_task, keepalive_task) if t),
+                    *(t for t in (alerts_task, keepalive_task, catalog_task) if t),
                     return_exceptions=True,
                 )
             if updater_started:
