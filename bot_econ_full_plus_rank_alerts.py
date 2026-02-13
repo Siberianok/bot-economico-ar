@@ -8403,11 +8403,8 @@ kb_export = InlineKeyboardMarkup(
             InlineKeyboardButton("Actual", callback_data="PF:EXPORT:NOW"),
             InlineKeyboardButton("Histórico", callback_data="PF:EXPORT:HISTORY"),
         ],
-        [
-            InlineKeyboardButton("Histórico por fechas", callback_data="PF:EXPORT:HISTORY:RANGE"),
-            InlineKeyboardButton("Personalizado", callback_data="PF:EXPORT:HISTORY:CUSTOM"),
-        ],
-        [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
+        [InlineKeyboardButton("Histórico por fechas", callback_data="PF:EXPORT:HISTORY:RANGE")],
+        [InlineKeyboardButton("Volver", callback_data="PF:EXPORT:BACK")],
     ]
 )
 
@@ -8667,7 +8664,7 @@ def kb_pf_budget(currency: Optional[str] = None) -> InlineKeyboardMarkup:
         ])
         rows.append([InlineKeyboardButton("Ingresar manual", callback_data=f"PF:BUDGET:MANUAL:{selected_curr}")])
     rows.extend([
-        [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
+        [InlineKeyboardButton("Volver", callback_data="PF:BUDGET:BACK")],
         _pf_menu_nav_row(),
     ])
     return InlineKeyboardMarkup(rows)
@@ -8964,6 +8961,15 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "PF:SETMONTO":
+        context.user_data.pop("pf_budget_currency", None)
+        await q.edit_message_text(
+            "<b>PF:BUDGET</b>\nElegí moneda y presupuesto objetivo.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_pf_budget(None),
+        )
+        return
+
+    if data == "PF:BUDGET:BACK":
         context.user_data.pop("pf_budget_currency", None)
         await q.edit_message_text(
             "<b>PF:BUDGET</b>\nElegí moneda y presupuesto objetivo.",
@@ -9284,6 +9290,10 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("Tu portafolio está vacío. No hay datos para exportar.", reply_markup=_pf_with_menu_nav([]))
             return
         await q.edit_message_text("¿Qué querés exportar?", reply_markup=_pf_with_menu_nav(kb_export.inline_keyboard))
+        return
+
+    if data == "PF:EXPORT:BACK":
+        await q.edit_message_text(await pf_main_menu_text(chat_id), reply_markup=kb_pf_main(chat_id), parse_mode=ParseMode.HTML)
         return
 
     if data == "PF:EXPORT:NOW":
