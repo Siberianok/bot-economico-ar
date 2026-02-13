@@ -8651,7 +8651,7 @@ def kb_pf_budget(currency: Optional[str] = None) -> InlineKeyboardMarkup:
         ])
         rows.append([InlineKeyboardButton("Ingresar manual", callback_data=f"PF:BUDGET:MANUAL:{selected_curr}")])
     rows.extend([
-        [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
+        [InlineKeyboardButton("Volver", callback_data="PF:BUDGET:BACK")],
         _pf_menu_nav_row(),
     ])
     return InlineKeyboardMarkup(rows)
@@ -8948,6 +8948,15 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "PF:SETMONTO":
+        context.user_data.pop("pf_budget_currency", None)
+        await q.edit_message_text(
+            "<b>PF:BUDGET</b>\nElegí moneda y presupuesto objetivo.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_pf_budget(None),
+        )
+        return
+
+    if data == "PF:BUDGET:BACK":
         context.user_data.pop("pf_budget_currency", None)
         await q.edit_message_text(
             "<b>PF:BUDGET</b>\nElegí moneda y presupuesto objetivo.",
