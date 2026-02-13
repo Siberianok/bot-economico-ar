@@ -4774,7 +4774,11 @@ def format_top3_table(
 
 ProjectionRange = Tuple[Optional[float], Optional[float], Optional[float]]
 PROJ_RANGE_SHRINK = 0.6
-PROJ_RANGE_LIMITS = {WINDOW_DAYS[3]: (-50.0, 80.0), WINDOW_DAYS[6]: (-70.0, 120.0)}
+PROJ_RANGE_LIMITS = {
+    WINDOW_DAYS[3]: (-50.0, 80.0),
+    WINDOW_DAYS[6]: (-70.0, 120.0),
+    WINDOW_DAYS[12]: (-80.0, 150.0),
+}
 PROJ_RANGE_PCTL = 0.674
 
 def _format_projection_range(proj: ProjectionRange, nd: int = 1, simple: bool = False) -> str:
@@ -5017,7 +5021,10 @@ def projection_by_horizon(m: Dict[str, Optional[float]], horizon_months: int) ->
         return projection_3m(m)
     if horizon_months == 6:
         return projection_6m(m)
-    return _projection_range(m, WINDOW_DAYS[horizon_months])
+    horizon_days = WINDOW_DAYS.get(horizon_months)
+    if horizon_days is None:
+        horizon_days = WINDOW_DAYS[3]
+    return _projection_range(m, horizon_days)
 
 
 def _format_projection_date(ts: float) -> str:
