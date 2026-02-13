@@ -1,2 +1,2 @@
-WINDOW_DAYS = {1: 21, 3: 63, 6: 126}
+WINDOW_DAYS = {1: 21, 3: 63, 6: 126, 12: 252}
 WINDOW_MONTHS = tuple(sorted(WINDOW_DAYS))
