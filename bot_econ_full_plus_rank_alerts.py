@@ -1099,7 +1099,6 @@ NEWS_CACHE: Dict[str, Any] = {"date": "", "items": []}
 RIESGO_CACHE: Dict[str, Any] = {}
 RESERVAS_CACHE: Dict[str, Any] = {}
 DOLAR_CACHE: Dict[str, Any] = {}
-QUALITY_CACHE: Dict[str, Dict[str, Any]] = {}
 SHORT_CACHE = ShortCache(default_ttl=45, redis_url=UPSTASH_REDIS_URL, namespace="bot-econ:short")
 CMD_THROTTLER = RateLimiter(redis_url=UPSTASH_REDIS_URL, namespace="bot-econ:throttle")
 PROJ_HISTORY: List[Dict[str, Any]] = []
@@ -1273,16 +1272,6 @@ async def load_state():
                 DOLAR_CACHE = {}
         else:
             DOLAR_CACHE = {}
-
-        raw_quality = data.get("quality_cache")
-        if isinstance(raw_quality, dict):
-            QUALITY_CACHE = {
-                str(metric): meta
-                for metric, meta in raw_quality.items()
-                if isinstance(metric, str) and isinstance(meta, dict)
-            }
-        else:
-            QUALITY_CACHE = {}
 
         raw_proj_history = data.get("proj_history")
         PROJ_HISTORY = _clean_proj_history(raw_proj_history)
@@ -1709,83 +1698,6 @@ def parse_iso_ddmmyyyy(s: Optional[str]) -> Optional[str]:
     return s
 
 
-QUALITY_THRESHOLDS = {"high": 80, "medium": 55}
-
-
-def _compute_quality_score(meta: Dict[str, Any]) -> int:
-    score = 100.0
-    try:
-        updated_at = float(meta.get("updated_at")) if meta.get("updated_at") is not None else None
-    except Exception:
-        updated_at = None
-    if updated_at:
-        age_hours = max(0.0, (time() - updated_at) / 3600.0)
-        score -= min(40.0, age_hours * 1.2)
-    fallbacks = 0
-    try:
-        fallbacks = max(0, int(meta.get("fallback_count") or 0))
-    except Exception:
-        fallbacks = 0
-    score -= min(30.0, fallbacks * 8.0)
-    divergence = meta.get("divergence_pct")
-    if isinstance(divergence, (int, float)) and math.isfinite(float(divergence)):
-        score -= min(30.0, abs(float(divergence)) * 1.5)
-    sources = meta.get("source")
-    if isinstance(sources, list):
-        source_count = len([s for s in sources if s])
-    elif isinstance(sources, str) and sources:
-        source_count = 1
-    else:
-        source_count = 0
-    if source_count == 0:
-        score -= 25.0
-    elif source_count >= 2 and divergence in (None, 0):
-        score += 3.0
-    return max(0, min(100, int(round(score))))
-
-
-def _quality_level(score: int) -> str:
-    if score >= QUALITY_THRESHOLDS["high"]:
-        return "alto"
-    if score >= QUALITY_THRESHOLDS["medium"]:
-        return "medio"
-    return "bajo"
-
-
-def _quality_icon(level: str) -> str:
-    return {"alto": "🟢", "medio": "🟡", "bajo": "🔴"}.get(level, "⚪")
-
-
-def _record_quality(metric: str, *, source: Any, fallback_count: int = 0, divergence_pct: Optional[float] = None) -> Dict[str, Any]:
-    global QUALITY_CACHE
-    normalized_sources: List[str]
-    if isinstance(source, list):
-        normalized_sources = sorted({str(s) for s in source if s})
-    elif source:
-        normalized_sources = [str(source)]
-    else:
-        normalized_sources = []
-    payload: Dict[str, Any] = {
-        "source": normalized_sources,
-        "updated_at": time(),
-        "fallback_count": max(0, int(fallback_count)),
-    }
-    if isinstance(divergence_pct, (int, float)) and math.isfinite(float(divergence_pct)):
-        payload["divergence_pct"] = float(divergence_pct)
-    payload["score"] = _compute_quality_score(payload)
-    payload["level"] = _quality_level(payload["score"])
-    QUALITY_CACHE[metric] = payload
-    return payload
-
-
-def _quality_line(metric: str, title: str) -> str:
-    meta = QUALITY_CACHE.get(metric, {})
-    score = int(meta.get("score") or 0)
-    level = str(meta.get("level") or _quality_level(score))
-    icon = _quality_icon(level)
-    warning = " ⚠️ Confianza baja" if level == "bajo" else ""
-    return f"{icon} <b>Confianza {title}</b>: {score}/100 ({level}){warning}"
-
 # ============================ HTTP HELPERS ============================
 
 async def fetch_json(session: ClientSession, url: str, **kwargs) -> Optional[Dict[str, Any]]:
@@ -2108,7 +2020,7 @@ def _has_fx_data(rows: Dict[str, Dict[str, Any]]) -> bool:
 
 def _save_dolar_cache(payload: Dict[str, Dict[str, Any]]) -> None:
     global DOLAR_CACHE
-    new_cache = {"data": payload, "updated_at": time(), "meta": QUALITY_CACHE.get("dolar", {})}
+    new_cache = {"data": payload, "updated_at": time()}
     if DOLAR_CACHE != new_cache:
         DOLAR_CACHE = new_cache
         try:
@@ -2344,26 +2256,11 @@ async def get_dolares(session: ClientSession) -> Dict[str, Dict[str, Any]]:
     divergence_pct = max(divergence_vals) if divergence_vals else None
 
     if _has_fx_data(merged):
-        quality_meta = _record_quality(
-            "dolar",
-            source=sorted({row.get("fuente") for row in merged.values() if isinstance(row, dict) and row.get("fuente")}),
-            fallback_count=fallback_count,
-            divergence_pct=divergence_pct,
-        )
-        for row in merged.values():
-            if isinstance(row, dict):
-                row["meta"] = {
-                    "source": row.get("fuente"),
-                    "updated_at": quality_meta.get("updated_at"),
-                    "fallback_count": quality_meta.get("fallback_count"),
-                    "divergence_pct": quality_meta.get("divergence_pct"),
-                }
         _save_dolar_cache(merged)
         SHORT_CACHE.set(cache_key, merged)
         return merged
 
     if isinstance(cached_data, dict) and _has_fx_data(cached_data):
-        _record_quality("dolar", source=["cache"], fallback_count=fallback_count + 1, divergence_pct=divergence_pct)
         SHORT_CACHE.set(cache_key, cached_data)
         return cached_data
 
@@ -2549,7 +2446,6 @@ async def get_riesgo_pais(
             "fecha": f,
             "variation": var,
             "updated_at": time(),
-            "meta": QUALITY_CACHE.get("riesgo", {}),
         }
         if RIESGO_CACHE != new_cache:
             RIESGO_CACHE = new_cache
@@ -2706,7 +2602,6 @@ async def get_riesgo_pais(
             RIESGO_CACHE.get("variation") if isinstance(RIESGO_CACHE, dict) else None,
             True,
         )
-        _record_quality("riesgo", source=["cache"], fallback_count=fallback_count + 1)
         SHORT_CACHE.set(cache_key, res)
         return res
 
@@ -2721,7 +2616,6 @@ async def get_riesgo_pais(
         mn, mx = min(vals), max(vals)
         divergence_pct = ((mx - mn) / mn) * 100.0
     sources = sorted(source_values.keys()) if source_values else (["cache"] if from_cache else [])
-    _record_quality("riesgo", source=sources, fallback_count=fallback_count + (1 if from_cache else 0), divergence_pct=divergence_pct)
     _save_riesgo_cache(rounded, fecha, variation)
     res = (rounded, fecha, variation, from_cache)
     SHORT_CACHE.set(cache_key, res)
@@ -2855,7 +2749,6 @@ def _save_reservas_cache(val: float, fecha: Optional[str], prev_val: Optional[fl
         "prev_val": prev_val,
         "fecha": fecha,
         "updated_at": time(),
-        "meta": QUALITY_CACHE.get("reservas", {}),
     }
     if RESERVAS_CACHE != new_cache:
         RESERVAS_CACHE = new_cache
@@ -2925,11 +2818,9 @@ async def get_reservas_con_variacion(
     cache_key = "macro:reservas"
     cached_short = SHORT_CACHE.get(cache_key)
     if isinstance(cached_short, (list, tuple)) and len(cached_short) >= 3:
-        _record_quality("reservas", source=["cache"], fallback_count=1)
         return tuple(cached_short)  # type: ignore[return-value]
     res = await get_reservas_lamacro(session)
     if not res:
-        _record_quality("reservas", source=["cache"], fallback_count=1)
         cache_val = RESERVAS_CACHE.get("val") if isinstance(RESERVAS_CACHE, dict) else None
         cache_fecha = RESERVAS_CACHE.get("fecha") if isinstance(RESERVAS_CACHE, dict) else None
         cache_prev = RESERVAS_CACHE.get("prev_val") if isinstance(RESERVAS_CACHE, dict) else None
@@ -2970,15 +2861,6 @@ async def get_reservas_con_variacion(
             prev_val = cached_val_f
         elif cached_prev_f is not None:
             prev_val = cached_prev_f
-        divergence_pct = None
-        if isinstance(prev_val, (int, float)) and prev_val != 0:
-            divergence_pct = abs((cur_val - prev_val) / prev_val) * 100.0
-        _record_quality(
-            "reservas",
-            source=["LaMacro"],
-            fallback_count=0,
-            divergence_pct=divergence_pct,
-        )
         _save_reservas_cache(cur_val, fecha, prev_val)
     res_tuple = (cur_val, fecha, prev_val, from_cache)
     SHORT_CACHE.set(cache_key, res_tuple)
@@ -4214,7 +4096,6 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[News
             if cached_items != NEWS_CACHE.get("items"):
                 NEWS_CACHE["items"] = cached_items
                 await save_state()
-            _record_quality("noticias", source=["cache"], fallback_count=1)
             return cached_items[:limit]
         NEWS_CACHE.clear()
     history_stems: Set[str] = {stem for stem, _ in NEWS_HISTORY}
@@ -4322,12 +4203,10 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[News
             NEWS_CACHE = {"date": today, "items": deduped_raw[:target_limit]}
             await save_state()
             source_name = "feeds_ext" if extended_used else "feeds"
-            _record_quality("noticias", source=[source_name], fallback_count=1)
             return NEWS_CACHE["items"][:limit]
         enriched_generic = await _enrich_with_fallback_images(fallback_generic[:target_limit])
         NEWS_CACHE = {"date": today, "items": enriched_generic}
         await save_state()
-        _record_quality("noticias", source=["generic_fallback"], fallback_count=2)
         return NEWS_CACHE["items"][:limit]
 
     def _build_scored_entries() -> List[Dict[str, Any]]:
@@ -4598,7 +4477,6 @@ async def fetch_rss_entries(session: ClientSession, limit: int = 5) -> List[News
     NEWS_CACHE = {"date": today, "items": deduped_final[:target_limit]}
     await save_state()
     feed_sources = ["feeds_ext"] if extended_used else ["feeds"]
-    _record_quality("noticias", source=feed_sources, fallback_count=1 if extended_used else 0)
     return NEWS_CACHE["items"][:limit]
 
 def _short_title(text: str, limit: int = 32) -> str:
@@ -4634,9 +4512,6 @@ def _format_news_item(title: str, link: str) -> str:
 
 def _build_news_layout(news: List[NewsItem]) -> Tuple[str, Optional[InlineKeyboardMarkup], List[Tuple[str, Optional[str]]]]:
     header = "<b>📰 Noticias</b>"
-    quality_meta = QUALITY_CACHE.get("noticias")
-    if quality_meta:
-        header = f"{header}\n{_quality_line('noticias', 'Noticias')}"
     if not news:
         return header, None, []
 
@@ -4669,9 +4544,6 @@ def format_dolar_panels(d: Dict[str, Dict[str, Any]]) -> Tuple[str, str]:
             fecha = parse_iso_ddmmyyyy(f)
 
     header = "<b>💵 Dólares</b>" + (f" <i>Actualizado: {fecha}</i>" if fecha else "")
-    q_meta = QUALITY_CACHE.get("dolar")
-    if q_meta:
-        header = f"{header}\n{_quality_line('dolar', 'Dólar')}"
     order = [
         ("oficial", "Oficial"),
         ("mayorista", "Mayorista"),
@@ -5923,7 +5795,7 @@ async def cmd_reservas(update: Update, context: ContextTypes.DEFAULT_TYPE):
         var_txt = _format_reservas_variation(prev_val, val)
         cache_hint = " <i>(dato en caché)</i>" if from_cache else ""
         txt = (f"<b>🏦 Reservas BCRA</b>{f' <i>Últ. Act.: {fecha}</i>' if fecha else ''}{cache_hint}\n"
-               f"<b>{fmt_number(val,0)} MUS$</b>{var_txt}\n{_quality_line('reservas', 'Reservas')}")
+               f"<b>{fmt_number(val,0)} MUS$</b>{var_txt}")
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
 async def cmd_inflacion(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5970,7 +5842,7 @@ async def cmd_riesgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 freshness = f" <i>(dato de respaldo, {cache_str})</i>"
             txt = (
                 f"<b>📈 Riesgo País</b>{f' <i>{f_str}</i>' if f_str else ''}{freshness}\n"
-                f"<b>{int(rp_num)} pb</b>{change_txt}\n{_quality_line('riesgo', 'Riesgo país')}"
+                f"<b>{int(rp_num)} pb</b>{change_txt}"
             )
     await update.effective_message.reply_text(txt, parse_mode=ParseMode.HTML)
 
@@ -11431,14 +11303,6 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if news:
         partes.append(format_news_block(news)[0])
 
-    _refresh_projection_quality()
-    quality_rows = []
-    for metric, label in (("dolar", "Dólar"), ("riesgo", "Riesgo país"), ("reservas", "Reservas"), ("noticias", "Noticias"), ("proyecciones", "Proyecciones")):
-        if QUALITY_CACHE.get(metric):
-            quality_rows.append(_quality_line(metric, label))
-    if quality_rows:
-        partes.append("<b>🔎 Quality scoring</b>\n" + "\n".join(quality_rows))
-
     txt = "\n\n".join(partes) if partes else "Sin datos para el resumen ahora."
     await update.effective_message.reply_text(
         txt,
@@ -11447,21 +11311,7 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
-def _refresh_projection_quality() -> Dict[str, Any]:
-    evaluated = [b for b in PROJECTION_BATCHES if b.get("evaluated")]
-    if not evaluated:
-        return _record_quality("proyecciones", source=["batches"], fallback_count=2)
-    mae_vals = [float(b.get("mae")) for b in evaluated if isinstance(b.get("mae"), (int, float))]
-    hit_vals = [float(b.get("hit_rate")) for b in evaluated if isinstance(b.get("hit_rate"), (int, float))]
-    mae = sum(mae_vals) / len(mae_vals) if mae_vals else 20.0
-    hit = sum(hit_vals) / len(hit_vals) if hit_vals else 0.5
-    divergence = max(0.0, mae - (hit * 10.0))
-    fallback_count = 0 if len(evaluated) >= 5 else 1
-    return _record_quality("proyecciones", source=["batches"], fallback_count=fallback_count, divergence_pct=divergence)
-
-
 async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    _refresh_projection_quality()
     evaluated = [b for b in PROJECTION_BATCHES if b.get("evaluated")]
     if not evaluated:
         pending = [b for b in PROJECTION_BATCHES if not b.get("evaluated")]
@@ -11493,7 +11343,7 @@ async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     batches_6m = [b for b in evaluated if b.get("horizon") == WINDOW_DAYS[6]]
     summary_3m = _summarize_projection_performance(batches_3m)
     summary_6m = _summarize_projection_performance(batches_6m)
-    lines = ["<b>📊 Performance de Proyecciones</b>", _quality_line("proyecciones", "Proyecciones")]
+    lines = ["<b>📊 Performance de Proyecciones</b>"]
     for label, summary in (
         (f"3M ({WINDOW_DAYS[3]} ruedas)", summary_3m),
         (f"6M ({WINDOW_DAYS[6]} ruedas)", summary_6m),
@@ -11579,11 +11429,9 @@ def setup_health_routes(application: Application) -> None:
 
     async def _metrics(_: web.Request) -> web.Response:
         payload = metrics.snapshot()
-        payload["quality"] = QUALITY_CACHE
         return web.json_response(payload)
 
     async def _performance(_: web.Request) -> web.Response:
-        _refresh_projection_quality()
         evaluated = [b for b in PROJECTION_BATCHES if b.get("evaluated")]
         batches_3m = [b for b in evaluated if b.get("horizon") == WINDOW_DAYS[3]]
         batches_6m = [b for b in evaluated if b.get("horizon") == WINDOW_DAYS[6]]
@@ -11594,7 +11442,6 @@ def setup_health_routes(application: Application) -> None:
                     "6m": _summarize_projection_performance(batches_6m),
                 },
                 "batches": evaluated[-50:],
-                "quality": QUALITY_CACHE,
                 "generated_at": time(),
             }
         )
