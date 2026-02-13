@@ -4502,11 +4502,13 @@ PROJ_RANGE_SHRINK = 0.6
 PROJ_RANGE_LIMITS = {WINDOW_DAYS[3]: (-50.0, 80.0), WINDOW_DAYS[6]: (-70.0, 120.0)}
 PROJ_RANGE_PCTL = 0.674
 
-def _format_projection_range(proj: ProjectionRange, nd: int = 1) -> str:
+def _format_projection_range(proj: ProjectionRange, nd: int = 1, simple: bool = False) -> str:
     center, low, high = proj
     if center is None:
         return "—"
     center_txt = pct(center, nd)
+    if simple:
+        return center_txt
     if low is None or high is None:
         return center_txt
     return f"{center_txt} ({pct(low, nd)} a {pct(high, nd)})"
@@ -4619,14 +4621,14 @@ def _projection_range(
 
 def format_proj_dual(title: str, fecha: Optional[str], rows: List[Tuple[str, ProjectionRange, ProjectionRange]]) -> str:
     head = f"<b>{title}</b>" + (f" <i>Últ. Dato: {fecha}</i>" if fecha else "")
-    sub = "<i>Proy. 3M (corto) y Proy. 6M (medio) — rango estimado P25–P75</i>"
-    lines = [head, sub, "<pre>Rank Empresa (Ticker)     Proy. 3M (rango est.)    Proy. 6M (rango est.)</pre>"]
+    sub = "<i>Proy. 3M (corto) y Proy. 6M (medio)</i>"
+    lines = [head, sub, "<pre>Rank Empresa (Ticker)          Proy. 3M             Proy. 6M</pre>"]
     out = []
     if not rows: out.append("<pre>—</pre>")
     else:
         for idx, (sym, p3v, p6v) in enumerate(rows[:5], start=1):
-            p3 = _format_projection_range(p3v, 1)
-            p6 = _format_projection_range(p6v, 1)
+            p3 = _format_projection_range(p3v, 1, simple=True)
+            p6 = _format_projection_range(p6v, 1, simple=True)
             label = pad(_label_short(sym), 28)
             c3 = center_text(p3, 26); c6 = center_text(p6, 26)
             l = f"{idx:<4} {label}{c3}{c6}"
@@ -10025,8 +10027,8 @@ def _projection_by_instrument_image(
         missing_6m.append(center_6m is None)
         values_3m.append(center_3m if center_3m is not None else 0.0)
         values_6m.append(center_6m if center_6m is not None else 0.0)
-        labels_3m.append(_format_projection_range(val_3m, 1))
-        labels_6m.append(_format_projection_range(val_6m, 1))
+        labels_3m.append(_format_projection_range(val_3m, 1, simple=True))
+        labels_6m.append(_format_projection_range(val_6m, 1, simple=True))
 
     all_values = [abs(v) for v, miss in zip(values_3m, missing_3m) if not miss]
     all_values += [abs(v) for v, miss in zip(values_6m, missing_6m) if not miss]
@@ -10172,7 +10174,7 @@ def _projection_by_instrument_single_image(
             continue
         labels.append(label)
         values.append(center)
-        value_labels.append(_format_projection_range(val, 1))
+        value_labels.append(_format_projection_range(val, 1, simple=True))
 
     if not values:
         return None
@@ -10695,7 +10697,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         delta = valor_actual - invertido
         actual_pct = (delta / invertido) * 100.0 if invertido > 0 else None
         actual_txt = pct(actual_pct, 2)
-        proj_txt = f"🔭 {horizon_label} {_format_projection_range(proj, 2)}"
+        proj_txt = f"🔭 {horizon_label} {_format_projection_range(proj, 2, simple=True)}"
         delta_txt = f"📈 Δ {f_money(delta)}"
 
         detail.append(
@@ -10714,9 +10716,9 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         header += f" <i>Datos al {fecha}</i>"
     lines = [header, f"🧮 Valor actual estimado: {f_money(total_actual)}"]
     lines.append(
-        f"✨ Proyección {horizon_label} (rango estimado): "
-        + f"{pct(w,2)} ({pct(w_low,2)} a {pct(w_high,2)}) → "
-        + f"{f_money(forecast)} ({f_money(forecast_low)} a {f_money(forecast_high)})"
+        f"✨ Proyección {horizon_label}: "
+        + f"{pct(w,2)} → "
+        + f"{f_money(forecast)}"
     )
     if tc_val is not None:
         tc_line = f"💱 Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
@@ -10762,7 +10764,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
             (
                 horizon_label,
                 forecast,
-                f"{f_money(forecast)} ({f_money(forecast_low)} a {f_money(forecast_high)})",
+                f"{f_money(forecast)}",
             ),
         ],
         lambda value, label: label or f_money(value),
