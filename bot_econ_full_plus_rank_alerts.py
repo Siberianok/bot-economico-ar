@@ -8549,7 +8549,7 @@ def kb_pf_main(chat_id: Optional[int] = None) -> InlineKeyboardMarkup:
 
     rows = [
         [InlineKeyboardButton("Ayuda", callback_data="PF:HELP")],
-        [InlineKeyboardButton("Fijar base", callback_data="PF:SETBASE"), InlineKeyboardButton("Fijar monto", callback_data="PF:SETMONTO")],
+        [InlineKeyboardButton("Fijar base", callback_data="PF:SETBASE"), InlineKeyboardButton("Presupuesto", callback_data="PF:SETMONTO")],
         [InlineKeyboardButton("Benchmark", callback_data="PF:SETBENCH")],
         [InlineKeyboardButton("Agregar instrumento", callback_data="PF:ADD")],
     ]
@@ -8588,6 +8588,37 @@ def _pf_menu_nav_row() -> List[InlineKeyboardButton]:
 
 def _pf_with_menu_nav(rows: List[List[InlineKeyboardButton]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([*rows, _pf_menu_nav_row()])
+
+
+PF_BUDGET_PRESETS: Dict[str, List[str]] = {
+    "ARS": ["100.000", "500.000", "1.000.000", "10.000.000", "50.000.000", "100.000.000"],
+    "USD": ["1.000", "10.000", "100.000", "1.000.000"],
+}
+
+
+def parse_budget_value(raw: str) -> Optional[float]:
+    return _parse_num_text(raw)
+
+
+def kb_pf_budget(currency: str) -> InlineKeyboardMarkup:
+    curr = (currency or "ARS").upper()
+    if curr not in PF_BUDGET_PRESETS:
+        curr = "ARS"
+    curr_row = [
+        InlineKeyboardButton(("✅ " if curr == c else "") + c, callback_data=f"PF:BUDGET:CUR:{c}")
+        for c in ("ARS", "USD")
+    ]
+    preset_rows = [
+        [InlineKeyboardButton(label, callback_data=f"PF:BUDGET:PRESET:{curr}:{label}")]
+        for label in PF_BUDGET_PRESETS[curr]
+    ]
+    return InlineKeyboardMarkup([
+        curr_row,
+        *preset_rows,
+        [InlineKeyboardButton("Ingresar manual", callback_data=f"PF:BUDGET:MANUAL:{curr}")],
+        [InlineKeyboardButton("Volver", callback_data="PF:BACK")],
+        _pf_menu_nav_row(),
+    ])
 
 def kb_pf_projection_horizons(selected: int) -> InlineKeyboardMarkup:
     horizons = [1, 3, 6, 12]
@@ -8881,8 +8912,59 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "PF:SETMONTO":
-        context.user_data["pf_mode"] = "set_monto"
-        await q.edit_message_text("Ingresá el <b>monto total</b> (solo número).", parse_mode=ParseMode.HTML, reply_markup=_pf_with_menu_nav([])); return
+        budget_currency = (context.user_data.get("pf_budget_currency") or "ARS").upper()
+        if budget_currency not in PF_BUDGET_PRESETS:
+            budget_currency = "ARS"
+        context.user_data["pf_budget_currency"] = budget_currency
+        await q.edit_message_text(
+            "<b>PF:BUDGET</b>\nElegí moneda y presupuesto objetivo.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_pf_budget(budget_currency),
+        )
+        return
+
+    if data.startswith("PF:BUDGET:CUR:"):
+        currency = data.split(":", 3)[3].upper()
+        if currency not in PF_BUDGET_PRESETS:
+            currency = "ARS"
+        context.user_data["pf_budget_currency"] = currency
+        await q.edit_message_text(
+            "<b>PF:BUDGET</b>\nElegí moneda y presupuesto objetivo.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb_pf_budget(currency),
+        )
+        return
+
+    if data.startswith("PF:BUDGET:PRESET:"):
+        _, _, _, currency, preset = data.split(":", 4)
+        v = parse_budget_value(preset)
+        if v is None:
+            await q.edit_message_text("Preset inválido.", reply_markup=kb_pf_budget(currency))
+            return
+        pf = pf_get(chat_id)
+        pf["monto"] = float(v)
+        await save_state()
+        context.user_data["pf_budget_currency"] = currency.upper()
+        await q.edit_message_text(
+            await pf_main_menu_text(chat_id),
+            reply_markup=kb_pf_main(chat_id),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data.startswith("PF:BUDGET:MANUAL:"):
+        currency = data.split(":", 3)[3].upper()
+        context.user_data["pf_budget_currency"] = currency if currency in PF_BUDGET_PRESETS else "ARS"
+        context.user_data["pf_mode"] = "set_monto_manual"
+        await q.edit_message_text(
+            "Ingresá el <b>monto total</b> (solo número).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Volver", callback_data="PF:SETMONTO")],
+                _pf_menu_nav_row(),
+            ]),
+        )
+        return
 
     if data == "PF:ADD":
         kb_add = InlineKeyboardMarkup([
@@ -9319,8 +9401,8 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return (fmt_money_ars if pf_base=="ARS" else fmt_money_usd)(max(0.0, pf["monto"] - usado))
 
     # Monto total
-    if mode == "set_monto":
-        v = _parse_num_text(text)
+    if mode in ("set_monto", "set_monto_manual"):
+        v = parse_budget_value(text)
         if v is None:
             await update.message.reply_text("Ingresá solo número (sin símbolos)."); return
         pf["monto"] = float(v); await save_state()
