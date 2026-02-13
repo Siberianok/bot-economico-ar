@@ -5438,8 +5438,8 @@ async def _rank_proj5(
                 c6, _, _ = _projection_bounds(p6)
                 chart_rows.append((_label_short(sym), [c3, c6]))
                 label_rows.append([
-                    _format_projection_range(p3, 1),
-                    _format_projection_range(p6, 1),
+                    _format_projection_range(p3, 1, simple=True),
+                    _format_projection_range(p6, 1, simple=True),
                 ])
             subtitle = f"Datos al {fecha}" if fecha else None
             img = _bar_image_from_rank(
