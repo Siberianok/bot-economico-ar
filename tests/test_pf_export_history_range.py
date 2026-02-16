@@ -81,12 +81,7 @@ def test_pf_export_range_preset_callback_sets_user_data_and_exports(monkeypatch)
         called["export_chat_id"] = chat_id
         called["label"] = context.user_data.get(bot.PF_EXPORT_RANGE_LABEL_KEY)
 
-    async def _fake_refresh_menu(context, chat_id, force_new=False):
-        called["refresh_chat_id"] = chat_id
-        called["force_new"] = force_new
-
     monkeypatch.setattr(bot, "pf_export_history", _fake_export_history)
-    monkeypatch.setattr(bot, "pf_refresh_menu", _fake_refresh_menu)
 
     update = _DummyUpdate("PF:EXPORT:HISTORY:RANGE:PRESET:30d")
     context = _DummyContext()
@@ -94,11 +89,11 @@ def test_pf_export_range_preset_callback_sets_user_data_and_exports(monkeypatch)
     asyncio.run(bot.pf_menu_cb(update, context))
 
     assert called["export_chat_id"] == 123
-    assert called["refresh_chat_id"] == 123
-    assert called["force_new"] is True
     assert context.user_data[bot.PF_EXPORT_RANGE_FROM_KEY] is not None
     assert context.user_data[bot.PF_EXPORT_RANGE_TO_KEY] is not None
     assert "a" in context.user_data[bot.PF_EXPORT_RANGE_LABEL_KEY]
+    args, _ = update.callback_query.edits[-1]
+    assert "generada" in args[0].lower()
 
 
 def test_pf_export_menu_uses_local_back_and_main_menu_button(monkeypatch):
