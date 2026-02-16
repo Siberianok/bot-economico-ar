@@ -8310,6 +8310,41 @@ def _pf_snapshot_for_history(snapshot: List[Dict[str, Any]]) -> List[Dict[str, A
     return cleaned
 
 
+def _pf_record_history(
+    chat_id: int,
+    pf: Dict[str, Any],
+    snapshot: List[Dict[str, Any]],
+    last_ts: Optional[int],
+    tc_val: Optional[float],
+    tc_ts: Optional[int],
+    *,
+    snapshot_ts: Optional[float] = None,
+) -> None:
+    if not snapshot:
+        return
+    ts_now = float(snapshot_ts if snapshot_ts is not None else time())
+    entry = {
+        "ts": ts_now,
+        "snapshot": _pf_snapshot_for_history(snapshot),
+        "base": {
+            "moneda": ((pf.get("base") or {}).get("moneda") or "ARS").upper(),
+            "tc": ((pf.get("base") or {}).get("tc") or "oficial").lower(),
+        },
+        "tc_val": tc_val,
+        "tc_ts": tc_ts,
+        "last_ts": last_ts,
+    }
+    history = PF_HISTORY.setdefault(chat_id, [])
+    if history and abs(float(history[-1].get("ts") or 0.0) - ts_now) < 300:
+        history[-1] = entry
+    else:
+        history.append(entry)
+    max_entries = 2000
+    if len(history) > max_entries:
+        del history[:-max_entries]
+    schedule_state_save()
+
+
 def _pf_export_write_rows(
     writer: csv.writer,
     snapshot: List[Dict[str, Any]],
@@ -8895,11 +8930,24 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "PF:HELP":
-        txt = ("<b>Cómo armar tu portafolio</b>\n\n"
-               "1) Fijá base y tipo de cambio.\n2) Definí el monto total (solo número).\n"
-               "3) Agregá instrumentos (por cantidad, importe o % del monto).\n"
-               "4) Ver composición y editar.\n5) Rendimiento (actual) y Proyección (3/6M).\n\n"
-               "<i>Formato de números: solo dígitos y decimal. Sin $ ni % ni comas.</i>")
+        txt = (
+            "<b>Cómo usar Portafolio (paso a paso)</b>\n\n"
+            "1) <b>Fijar base</b>: elegí moneda (ARS/USD) y tipo de cambio de referencia.\n"
+            "2) <b>Presupuesto</b>: cargá el monto objetivo total del portafolio.\n"
+            "3) <b>Benchmark</b>: definí contra qué comparar rendimiento (Merval, Dólar o sin benchmark).\n"
+            "4) <b>Agregar instrumentos</b>: por cantidad, importe o % del monto objetivo.\n"
+            "5) <b>Composición</b>: distribución actual (valor, peso y variación por instrumento).\n\n"
+            "<b>Cómo completar campos sin errores</b>\n"
+            "• Monto, cantidad, importe y %: solo números (ej: 100000, 12.5).\n"
+            "• No uses símbolos ($, %, comas) ni texto.\n"
+            "• En cripto, verificá moneda y tipo de cambio aplicado.\n\n"
+            "<b>Rebalanceo y simulación</b>\n"
+            "• Objetivo por %: fijá peso objetivo de cada instrumento.\n"
+            "• Simular aporte único/mensual: evaluá cómo cambia la asignación antes de operar.\n"
+            "• En cada paso podés usar <b>Volver</b> para regresar a la etapa anterior.\n\n"
+            "<b>Métricas de performance</b>\n"
+            "• /performance muestra qué tan precisas fueron las proyecciones históricas (3M y 6M)."
+        )
         await q.edit_message_text(txt, reply_markup=_pf_with_menu_nav([]), parse_mode=ParseMode.HTML); return
 
     if data == "PF:SETBASE":
@@ -9070,17 +9118,38 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx = int(data.split(":")[3])
         context.user_data["pf_rebal_idx"] = idx
         context.user_data["pf_mode"] = "pf_rebal_pct"
-        await q.edit_message_text("Ingresá el <b>porcentaje objetivo</b> (solo número). Ej: 12.5", parse_mode=ParseMode.HTML, reply_markup=_pf_with_menu_nav([]))
+        await q.edit_message_text(
+            "Ingresá el <b>porcentaje objetivo</b> (solo número). Ej: 12.5",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Volver", callback_data="PF:REBAL:PCT")],
+                _pf_menu_nav_row(),
+            ]),
+        )
         return
 
     if data == "PF:REBAL:SIM:ONE":
         context.user_data["pf_mode"] = "pf_rebal_sim_one"
-        await q.edit_message_text("Ingresá el <b>monto del aporte único</b> (solo número).", parse_mode=ParseMode.HTML, reply_markup=_pf_with_menu_nav([]))
+        await q.edit_message_text(
+            "Ingresá el <b>monto del aporte único</b> (solo número).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Volver", callback_data="PF:REBAL")],
+                _pf_menu_nav_row(),
+            ]),
+        )
         return
 
     if data == "PF:REBAL:SIM:MONTH":
         context.user_data["pf_mode"] = "pf_rebal_sim_month"
-        await q.edit_message_text("Ingresá el <b>monto del aporte mensual</b> (solo número).", parse_mode=ParseMode.HTML, reply_markup=_pf_with_menu_nav([]))
+        await q.edit_message_text(
+            "Ingresá el <b>monto del aporte mensual</b> (solo número).",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Volver", callback_data="PF:REBAL")],
+                _pf_menu_nav_row(),
+            ]),
+        )
         return
 
     if data == "PF:SEARCH":
@@ -9298,7 +9367,10 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "PF:EXPORT:NOW":
         await pf_export_current(context, chat_id)
-        await pf_refresh_menu(context, chat_id, force_new=True)
+        await q.edit_message_text(
+            "Exportación generada. Elegí otra opción si querés.",
+            reply_markup=_pf_with_menu_nav(kb_export.inline_keyboard),
+        )
         return
 
     if data == "PF:EXPORT:HISTORY":
@@ -9306,7 +9378,10 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data[PF_EXPORT_RANGE_TO_KEY] = None
         context.user_data[PF_EXPORT_RANGE_LABEL_KEY] = "Todo"
         await pf_export_history(context, chat_id)
-        await pf_refresh_menu(context, chat_id, force_new=True)
+        await q.edit_message_text(
+            "Exportación histórica generada. Elegí otra opción si querés.",
+            reply_markup=_pf_with_menu_nav(kb_export.inline_keyboard),
+        )
         return
 
     if data == "PF:EXPORT:HISTORY:RANGE":
@@ -9336,7 +9411,10 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data[PF_EXPORT_RANGE_TO_KEY] = to_ts
         context.user_data[PF_EXPORT_RANGE_LABEL_KEY] = label
         await pf_export_history(context, chat_id)
-        await pf_refresh_menu(context, chat_id, force_new=True)
+        await q.edit_message_text(
+            f"Exportación histórica ({label}) generada. Elegí otra opción si querés.",
+            reply_markup=_pf_with_menu_nav(kb_export.inline_keyboard),
+        )
         return
 
     if data == "PF:EXPORT:HISTORY:CUSTOM":
@@ -9493,7 +9571,12 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop(PF_EXPORT_CUSTOM_STEP_KEY, None)
         context.user_data.pop(PF_EXPORT_CUSTOM_FROM_DATE_KEY, None)
         await pf_export_history(context, chat_id)
-        await pf_refresh_menu(context, chat_id, force_new=True)
+        await _send_below_menu(
+            context,
+            chat_id,
+            text="Exportación histórica personalizada generada. El menú de exportación sigue disponible.",
+            reply_markup=_pf_with_menu_nav(kb_export.inline_keyboard),
+        )
         return
 
     if not mode: return
@@ -11015,6 +11098,7 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     if not pf["items"]:
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Usá «Agregar instrumento»."); return
     snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts, _ = await pf_market_snapshot(pf)
+    _pf_record_history(chat_id, pf, snapshot, last_ts, tc_val, tc_ts)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     header = f"<b>🎨 Portafolio</b> — Base: {pf['base']['moneda'].upper()}/{pf['base']['tc'].upper()}"
     if fecha:
@@ -11033,17 +11117,6 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     delta = total_actual - total_invertido
     if total_invertido > 0:
         lines.append(f"📊 Variación estimada: {f_money(delta)} ({pct(delta/total_invertido*100.0,2)})")
-    fx_price_effect, fx_fx_effect, fx_has_data = (0.0, 0.0, False)
-    if total_invertido > 0:
-        fx_price_effect, fx_fx_effect, fx_has_data = _pf_fx_decomposition(snapshot, pf_base)
-    if fx_has_data:
-        price_pct = pct((fx_price_effect / total_invertido) * 100.0, 2)
-        fx_pct = pct((fx_fx_effect / total_invertido) * 100.0, 2)
-        lines.append(
-            "💱 Efecto FX estimado: "
-            + f"Precio {f_money(fx_price_effect)} ({price_pct})"
-            + f" | FX {f_money(fx_fx_effect)} ({fx_pct})"
-        )
     restante = max(0.0, pf['monto'] - total_invertido)
     lines.append(f"🪙 Restante del objetivo: {f_money(restante)}")
     if tc_val is not None:
@@ -11055,34 +11128,41 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     for i, entry in enumerate(snapshot, 1):
         if i > 1:
             lines.append("")
-        linea = f"{i}. {entry['label']}"
-        linea += f" · 💰 Valor: {f_money(entry['valor_actual'])}"
+        cambio = "⚪"
+        r_ind = None
+        if entry['invertido'] > 0:
+            r_ind = (entry['valor_actual']/entry['invertido']-1.0)*100.0
+            cambio = "🟢" if r_ind >= 0 else "🔴"
+        lines.append(f"<b>{i}. {entry['label']}</b>")
+        lines.append(f"• Tipo/Currency: {str(entry.get('tipo') or '').upper()} ({entry.get('inst_currency') or pf_base})")
+        linea = f"• Valor actual: {f_money(entry['valor_actual'])}"
         inst_currency = entry.get("inst_currency")
         native_val = _fmt_native(entry.get("valor_actual_nativo"), inst_currency)
         if native_val and inst_currency and inst_currency != pf_base:
-            linea += f" · 🧾 Nativo: {native_val}"
-        if entry['invertido'] > 0:
-            r_ind = (entry['valor_actual']/entry['invertido']-1.0)*100.0
-            linea += f" ({pct(r_ind,2)} vs {f_money(entry['invertido'])})"
-        if entry.get("valuation_mode") == "estimated_from_daily_change":
-            linea += " · ~estimado"
-        if entry.get("valuation_stale"):
-            linea += " · ⚠️ stale"
+            linea += f" ({native_val} nativo)"
+        lines.append(linea)
+        if r_ind is not None:
+            lines.append(
+                f"• Variación vs inversión inicial: {cambio} {pct(r_ind,2)} (invertido: {f_money(entry['invertido'])})"
+            )
+        if entry.get('peso'):
+            lines.append(f"• Peso en portafolio: {pct_plain(entry['peso']*100.0,1)}")
         qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
         if qty_txt:
-            linea += f" · 📦 Cant: {qty_txt}"
-        if entry.get('peso'):
-            linea += f" · ⚖️ Peso: {pct_plain(entry['peso']*100.0,1)}"
+            lines.append(f"• Cantidad: {qty_txt}")
+        if entry.get("valuation_mode") == "estimated_from_daily_change":
+            lines.append("• Valuación: ~estimado")
+        if entry.get("valuation_stale"):
+            lines.append("• ⚠️ Dato con demora (stale)")
         fx_ts_used = entry.get("fx_ts_used")
         if inst_currency and inst_currency != pf_base and fx_ts_used:
-            linea += f" · 💱 TC al {datetime.fromtimestamp(int(fx_ts_used), TZ).strftime('%d/%m/%Y %H:%M')}"
+            lines.append(f"• Tipo de cambio usado: {datetime.fromtimestamp(int(fx_ts_used), TZ).strftime('%d/%m/%Y %H:%M')}")
         added_str = format_added_date(entry.get('added_ts'))
         if added_str:
-            linea += f" · ⏳ Desde: {added_str}"
+            lines.append(f"• En cartera desde: {added_str}")
         last_data = format_last_data_date(entry.get("price_ts"))
         if last_data and entry in stale_entries:
-            linea += f" · 🕒 último dato: {last_data}"
-        lines.append(linea)
+            lines.append(f"• Último dato de mercado: {last_data}")
     invalid_sources = [entry['label'] for entry in snapshot if entry.get('source_valid') is False]
     if invalid_sources:
         lines.append("")
@@ -11119,6 +11199,7 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             return fmt_money_usd(value)
         return f"{fmt_money_usd(value)} {currency}" if currency else fmt_money_usd(value)
     snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts, perf_summary = await pf_market_snapshot(pf)
+    _pf_record_history(chat_id, pf, snapshot, last_ts, tc_val, tc_ts)
     fecha = datetime.fromtimestamp(last_ts, TZ).strftime("%d/%m/%Y") if last_ts else None
     header = "<b>📈 Rendimiento del portafolio</b>"
     if fecha:
@@ -11310,6 +11391,7 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     if not pf["items"]:
         await _send_below_menu(context, chat_id, text="Tu portafolio está vacío. Agregá instrumentos primero."); return
     snapshot, last_ts, total_invertido, total_actual, tc_val, tc_ts, _ = await pf_market_snapshot(pf)
+    _pf_record_history(chat_id, pf, snapshot, last_ts, tc_val, tc_ts)
     if total_actual <= 0:
         await _send_below_menu(context, chat_id, text="Sin valores suficientes para proyectar."); return
     if horizon_months not in (1, 3, 6, 12):
