@@ -8695,10 +8695,9 @@ def kb_pf_budget(currency: Optional[str] = None) -> InlineKeyboardMarkup:
             for label in PF_BUDGET_PRESETS[selected_curr]
         ])
         rows.append([InlineKeyboardButton("Ingresar manual", callback_data=f"PF:BUDGET:MANUAL:{selected_curr}")])
-    rows.extend([
-        [InlineKeyboardButton("Volver", callback_data="PF:BUDGET:BACK")],
-        _pf_menu_nav_row(),
-    ])
+    if selected_curr is not None:
+        rows.append([InlineKeyboardButton("Volver", callback_data="PF:BUDGET:BACK")])
+    rows.append(_pf_menu_nav_row())
     return InlineKeyboardMarkup(rows)
 
 def kb_pf_projection_horizons(selected: int) -> InlineKeyboardMarkup:
