@@ -201,3 +201,93 @@ def test_pf_budget_manual_mode_uses_numeric_parser(monkeypatch):
     assert bot.PF[chat_id]["monto"] == pytest.approx(500000.0)
     assert calls == [True]
     assert context.user_data["pf_mode"] is None
+
+
+def test_pf_show_return_below_renders_multiline_instrument_block(monkeypatch):
+    sent_messages = []
+
+    async def _fake_market_snapshot(_pf):
+        snapshot = [
+            {
+                "label": "GGAL",
+                "symbol": "GGAL",
+                "valor_actual": 120000.0,
+                "invertido": 100000.0,
+                "peso": 0.6,
+                "cantidad": 10,
+                "daily_change": 1.23,
+                "precio_base": 12000.0,
+                "metrics": {"r6": 3.0, "r3": 2.0, "r1": 1.0},
+            }
+        ]
+        return (snapshot, 0.0, 100000.0, 120000.0, None, None, None)
+
+    async def _fake_send(_context, _chat_id, text=None, **_kwargs):
+        if text is not None:
+            sent_messages.append(text)
+
+    async def _fake_refresh(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "pf_market_snapshot", _fake_market_snapshot)
+    monkeypatch.setattr(bot, "_send_below_menu", _fake_send)
+    monkeypatch.setattr(bot, "pf_refresh_menu", _fake_refresh)
+    monkeypatch.setattr(bot, "_pf_record_history", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "HAS_MPL", False)
+
+    chat_id = 70
+    bot.pf_get(chat_id)["items"] = [{"symbol": "GGAL"}]
+    asyncio.run(bot.pf_show_return_below(SimpleNamespace(user_data={}), chat_id))
+
+    body = sent_messages[0]
+    assert "• <b>Instrumento:</b> GGAL" in body
+    assert "• Valor actual:" in body
+    assert "• Invertido:" in body
+    assert "• Resultado:" in body
+    assert "• Rendimiento:" in body
+    assert "• Peso:" in body
+    assert "• Cantidad:" in body
+
+
+def test_pf_show_return_below_keeps_optional_markers_on_separate_lines(monkeypatch):
+    sent_messages = []
+
+    async def _fake_market_snapshot(_pf):
+        snapshot = [
+            {
+                "label": "AL30",
+                "symbol": "AL30",
+                "valor_actual": 90000.0,
+                "invertido": 100000.0,
+                "peso": 1.0,
+                "cantidad": 100,
+                "daily_change": -0.45,
+                "valuation_mode": "estimated_from_daily_change",
+                "valuation_stale": True,
+                "price_ts": 0,
+                "metrics": {"r6": 1.0, "r3": 1.0, "r1": 1.0},
+            }
+        ]
+        return (snapshot, 0.0, 100000.0, 90000.0, None, None, None)
+
+    async def _fake_send(_context, _chat_id, text=None, **_kwargs):
+        if text is not None:
+            sent_messages.append(text)
+
+    async def _fake_refresh(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "pf_market_snapshot", _fake_market_snapshot)
+    monkeypatch.setattr(bot, "_send_below_menu", _fake_send)
+    monkeypatch.setattr(bot, "pf_refresh_menu", _fake_refresh)
+    monkeypatch.setattr(bot, "_pf_record_history", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bot, "HAS_MPL", False)
+
+    chat_id = 71
+    bot.pf_get(chat_id)["items"] = [{"symbol": "AL30"}]
+    asyncio.run(bot.pf_show_return_below(SimpleNamespace(user_data={}), chat_id))
+
+    body_lines = sent_messages[0].splitlines()
+    assert "• Valuación: ~estimado" in body_lines
+    assert "• ⚠️ Dato con demora (stale)" in body_lines
+    assert "• 🌅 Día:" in sent_messages[0]
