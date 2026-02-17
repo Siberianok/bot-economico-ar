@@ -865,7 +865,13 @@ def label_with_currency(sym: str) -> str:
     if sym in CRIPTO_TOP_NAMES: return f"{sym} (USD)"
     return sym
 
-def requires_integer_units(sym: str) -> bool: return sym.endswith(".BA")
+FRACTIONAL_SYMBOL_WHITELIST: Set[str] = set()
+
+def allows_fractional_units(symbol: str, tipo: Optional[str]) -> bool:
+    t = str(tipo or "").lower()
+    if t == "cripto":
+        return True
+    return (symbol or "").upper() in FRACTIONAL_SYMBOL_WHITELIST
 
 def pf_guess_symbol(raw: str) -> Optional[Tuple[str, str]]:
     if not raw:
@@ -1656,10 +1662,10 @@ def pct_plain(n: Optional[float], nd: int = 1) -> str:
     try: return f"{n:.{nd}f}%".replace(".", ",")
     except Exception: return "—"
 
-def format_quantity(sym: str, qty: Optional[float]) -> Optional[str]:
+def format_quantity(sym: str, qty: Optional[float], tipo: Optional[str] = None) -> Optional[str]:
     if qty is None: return None
     try:
-        if requires_integer_units(sym):
+        if not allows_fractional_units(sym, tipo):
             return str(int(round(qty)))
         s = f"{qty:.4f}"
         return s.rstrip("0").rstrip(".")
@@ -9016,9 +9022,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<b>Rebalanceo y simulación</b>\n"
             "• Objetivo por %: fijá peso objetivo de cada instrumento.\n"
             "• Simular aporte único/mensual: evaluá cómo cambia la asignación antes de operar.\n"
-            "• En cada paso podés usar <b>Volver</b> para regresar a la etapa anterior.\n\n"
-            "<b>Métricas de performance</b>\n"
-            "• /performance muestra un resumen ejecutivo de precisión histórica (3M y 6M)."
+            "• En cada paso podés usar <b>Volver</b> para regresar a la etapa anterior."
         )
         await q.edit_message_text(txt, reply_markup=_pf_with_menu_nav([]), parse_mode=ParseMode.HTML); return
 
@@ -9346,7 +9350,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if qty is not None:
                 try:
                     qty_val = float(qty)
-                    if requires_integer_units(sym):
+                    if not allows_fractional_units(sym, it.get("tipo")):
                         qty_str = f"cant: {int(qty_val)}"
                     else:
                         qty_str = f"cant: {qty_val:.4f}".rstrip("0").rstrip(".")
@@ -9815,14 +9819,14 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if mode == "pf_add_qty":
             cantidad = float(v)
-            if requires_integer_units(yfsym): cantidad = math.floor(cantidad)
+            if not allows_fractional_units(yfsym, tipo): cantidad = math.floor(cantidad)
             if price_base is not None: importe_base = float(cantidad) * float(price_base)
 
         elif mode == "pf_add_amt":
             importe_base = float(v)  # EN MONEDA BASE
             if price_base and price_base > 0:
                 raw_qty = importe_base / float(price_base)
-                if requires_integer_units(yfsym):
+                if not allows_fractional_units(yfsym, tipo):
                     cantidad = float(math.floor(raw_qty))
                     importe_base = float(cantidad) * float(price_base)
                 else:
@@ -9835,7 +9839,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             importe_base = round(pf["monto"] * pct_val / 100.0, 2)
             if price_base and price_base > 0:
                 raw_qty = importe_base / float(price_base)
-                if requires_integer_units(yfsym):
+                if not allows_fractional_units(yfsym, tipo):
                     cantidad = float(math.floor(raw_qty))
                     importe_base = float(cantidad) * float(price_base)
                 else:
@@ -9869,7 +9873,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pf_base = pf["base"]["moneda"].upper()
         qty_str = ""
         if cantidad is not None:
-            qty_str = f"(cant: {int(cantidad)}) " if requires_integer_units(yfsym) else f"(cant: {cantidad}) "
+            qty_str = f"(cant: {int(cantidad)}) " if not allows_fractional_units(yfsym, tipo) else f"(cant: {cantidad}) "
         unit_px_str = ""
         if price_base is not None:
             unit_px_str = f"a {(fmt_money_ars(price_base) if pf_base=='ARS' else fmt_money_usd(price_base))} c/u "
@@ -9996,12 +10000,12 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             it["importe"] = nuevo_importe
             if price_base and price_base > 0:
                 raw_qty = nuevo_importe/price_base
-                it["cantidad"] = float(math.floor(raw_qty)) if requires_integer_units(yfsym) else round(raw_qty, 6)
+                it["cantidad"] = float(math.floor(raw_qty)) if not allows_fractional_units(yfsym, it.get("tipo")) else round(raw_qty, 6)
         else:
             delta = float(v) if mode=="edit_addq" else -float(v)
             cur = float(it.get("cantidad") or 0.0)
             nueva_cant = cur + delta
-            if requires_integer_units(yfsym): nueva_cant = float(max(0, math.floor(nueva_cant)))
+            if not allows_fractional_units(yfsym, it.get("tipo")): nueva_cant = float(max(0, math.floor(nueva_cant)))
             else: nueva_cant = max(0.0, nueva_cant)
             if price_base and price_base > 0:
                 nuevo_importe = nueva_cant * float(price_base)
@@ -10120,6 +10124,98 @@ def _pf_fx_decomposition(
         fx_has_data = True
 
     return fx_price_effect, fx_fx_effect, fx_has_data
+
+def _calc_basic_twr(entries: List[Dict[str, Any]], end_ts: Optional[int]) -> Optional[float]:
+    """Calcula una aproximación básica de TWR con la foto actual del portafolio.
+
+    Sin valuaciones históricas por período no es posible calcular un TWR canónico.
+    Este helper evita crashes y devuelve una métrica consistente sobre la foto actual.
+    """
+    invested_total = 0.0
+    current_total = 0.0
+
+    for entry in entries or []:
+        try:
+            invested = float(entry.get("invertido") or 0.0)
+            current = float(entry.get("valor_actual") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if invested <= 0:
+            continue
+        invested_total += invested
+        current_total += current
+
+    if invested_total <= 0:
+        return None
+
+    return (current_total / invested_total) - 1.0
+
+
+def _calc_basic_mwr(cash_flows: List[Tuple[int, float]], end_ts: int, ending_value: float) -> Optional[float]:
+    """Calcula una TIR anual simple (MWR) usando flujos y valor final.
+
+    Convención: aportes (cash_flows positivos) se modelan como egresos del inversor.
+    """
+    if not cash_flows:
+        return None
+
+    try:
+        final_value = float(ending_value)
+    except (TypeError, ValueError):
+        return None
+    if final_value < 0:
+        return None
+
+    normalized: List[Tuple[int, float]] = []
+    total_invested = 0.0
+    for ts, amount in cash_flows:
+        try:
+            ts_i = int(ts)
+            amt_f = float(amount)
+        except (TypeError, ValueError):
+            continue
+        if amt_f <= 0:
+            continue
+        normalized.append((ts_i, amt_f))
+        total_invested += amt_f
+
+    if not normalized or total_invested <= 0:
+        return None
+
+    end_ts_i = int(end_ts) if end_ts is not None else max(ts for ts, _ in normalized)
+
+    def _npv(rate: float) -> float:
+        if rate <= -0.999999:
+            return float("inf")
+        total = 0.0
+        for ts, amt in normalized:
+            years = max(0.0, (end_ts_i - ts) / (365.25 * 24 * 3600))
+            total += (-amt) / ((1.0 + rate) ** years)
+        total += final_value
+        return total
+
+    lo, hi = -0.999, 10.0
+    npv_lo = _npv(lo)
+    npv_hi = _npv(hi)
+
+    if math.isfinite(npv_lo) and math.isfinite(npv_hi) and npv_lo * npv_hi < 0:
+        for _ in range(80):
+            mid = (lo + hi) / 2.0
+            npv_mid = _npv(mid)
+            if not math.isfinite(npv_mid):
+                break
+            if abs(npv_mid) < 1e-9:
+                return mid
+            if npv_lo * npv_mid <= 0:
+                hi = mid
+                npv_hi = npv_mid
+            else:
+                lo = mid
+                npv_lo = npv_mid
+        return (lo + hi) / 2.0
+
+    return (final_value / total_invested) - 1.0
+
 
 async def pf_market_snapshot(
     pf: Dict[str, Any],
@@ -11283,7 +11379,7 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             )
         if entry.get('peso'):
             lines.append(f"• Peso en portafolio: {pct_plain(entry['peso']*100.0,1)}")
-        qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
+        qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'), entry.get('tipo'))
         if qty_txt:
             lines.append(f"• Cantidad: {qty_txt}")
         if entry.get("valuation_mode") == "estimated_from_daily_change":
@@ -11413,7 +11509,7 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             lines.append(f"• Peso: ⚖️ {pct_plain(entry['peso']*100.0,1)}")
         else:
             lines.append("• Peso: —")
-        qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
+        qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'), entry.get('tipo'))
         if qty_txt:
             lines.append(f"• Cantidad: 📦 {qty_txt}")
         else:
