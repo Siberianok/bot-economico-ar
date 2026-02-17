@@ -8894,6 +8894,19 @@ async def _pf_total_usado(chat_id: int) -> float:
             total += float(it["importe"])
     return total
 
+
+async def _pf_restante_para_invertir_line(chat_id: int) -> str:
+    pf = pf_get(chat_id)
+    usado = await _pf_total_usado(chat_id)
+    base_currency = ((pf.get("base") or {}).get("moneda") or "ARS").upper()
+    f_money = fmt_money_ars if base_currency == "ARS" else fmt_money_usd
+    monto = pf.get("monto")
+    if monto is None:
+        restante_txt = "Sin presupuesto definido"
+    else:
+        restante_txt = f_money(max(0.0, float(monto) - usado))
+    return f"🪙 Restante para invertir: {restante_txt}"
+
 async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     chat_id = q.message.chat_id; data = q.data
@@ -9080,7 +9093,8 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("Buscar ticker", callback_data="PF:SEARCH")],
             _pf_menu_nav_row(),
         ])
-        await q.edit_message_text("¿Qué querés agregar?", reply_markup=kb_add)
+        restante_line = await _pf_restante_para_invertir_line(chat_id)
+        await q.edit_message_text(f"¿Qué querés agregar?\n{restante_line}", reply_markup=kb_add)
         return
 
     if data == "PF:REBAL":
@@ -9237,7 +9251,8 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["pf_add_simbolo"] = sym
             sel_label = _label_long(sym)
         kb_ask = kb_pf_add_methods()
-        await q.edit_message_text(f"Seleccionado: {sel_label}\n¿Cómo cargar?", reply_markup=kb_ask)
+        restante_line = await _pf_restante_para_invertir_line(chat_id)
+        await q.edit_message_text(f"Seleccionado: {sel_label}\n¿Cómo cargar?\n{restante_line}", reply_markup=kb_ask)
         return
 
     if data == "PF:ADDQTY":
