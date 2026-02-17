@@ -9845,7 +9845,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         aporte = float(v)
-        snapshot, _, _, total_actual, _, _ = await pf_market_snapshot(pf)
+        snapshot, _, _, total_actual, _, _, _ = await pf_market_snapshot(pf)
         if not snapshot:
             await update.message.reply_text("No hay instrumentos para simular."); context.user_data["pf_mode"]=None; return
         base_conf = pf.get("base", {})
@@ -10059,7 +10059,9 @@ def _pf_fx_decomposition(
 
     return fx_price_effect, fx_fx_effect, fx_has_data
 
-async def pf_market_snapshot(pf: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Optional[int], float, float, Optional[float], Optional[int]]:
+async def pf_market_snapshot(
+    pf: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Optional[int], float, float, Optional[float], Optional[int], Optional[Dict[str, Any]]]:
     items = pf.get("items", [])
     base_conf = pf.get("base", {})
     base_currency = (base_conf.get("moneda") or "ARS").upper()
