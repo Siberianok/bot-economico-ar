@@ -865,7 +865,13 @@ def label_with_currency(sym: str) -> str:
     if sym in CRIPTO_TOP_NAMES: return f"{sym} (USD)"
     return sym
 
-def requires_integer_units(sym: str) -> bool: return sym.endswith(".BA")
+FRACTIONAL_SYMBOL_WHITELIST: Set[str] = set()
+
+def allows_fractional_units(symbol: str, tipo: Optional[str]) -> bool:
+    t = str(tipo or "").lower()
+    if t == "cripto":
+        return True
+    return (symbol or "").upper() in FRACTIONAL_SYMBOL_WHITELIST
 
 def pf_guess_symbol(raw: str) -> Optional[Tuple[str, str]]:
     if not raw:
@@ -1656,10 +1662,10 @@ def pct_plain(n: Optional[float], nd: int = 1) -> str:
     try: return f"{n:.{nd}f}%".replace(".", ",")
     except Exception: return "—"
 
-def format_quantity(sym: str, qty: Optional[float]) -> Optional[str]:
+def format_quantity(sym: str, qty: Optional[float], tipo: Optional[str] = None) -> Optional[str]:
     if qty is None: return None
     try:
-        if requires_integer_units(sym):
+        if not allows_fractional_units(sym, tipo):
             return str(int(round(qty)))
         s = f"{qty:.4f}"
         return s.rstrip("0").rstrip(".")
@@ -9430,7 +9436,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if qty is not None:
                 try:
                     qty_val = float(qty)
-                    if requires_integer_units(sym):
+                    if not allows_fractional_units(sym, it.get("tipo")):
                         qty_str = f"cant: {int(qty_val)}"
                     else:
                         qty_str = f"cant: {qty_val:.4f}".rstrip("0").rstrip(".")
@@ -9899,14 +9905,14 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if mode == "pf_add_qty":
             cantidad = float(v)
-            if requires_integer_units(yfsym): cantidad = math.floor(cantidad)
+            if not allows_fractional_units(yfsym, tipo): cantidad = math.floor(cantidad)
             if price_base is not None: importe_base = float(cantidad) * float(price_base)
 
         elif mode == "pf_add_amt":
             importe_base = float(v)  # EN MONEDA BASE
             if price_base and price_base > 0:
                 raw_qty = importe_base / float(price_base)
-                if requires_integer_units(yfsym):
+                if not allows_fractional_units(yfsym, tipo):
                     cantidad = float(math.floor(raw_qty))
                     importe_base = float(cantidad) * float(price_base)
                 else:
@@ -9919,7 +9925,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             importe_base = round(pf["monto"] * pct_val / 100.0, 2)
             if price_base and price_base > 0:
                 raw_qty = importe_base / float(price_base)
-                if requires_integer_units(yfsym):
+                if not allows_fractional_units(yfsym, tipo):
                     cantidad = float(math.floor(raw_qty))
                     importe_base = float(cantidad) * float(price_base)
                 else:
@@ -9953,7 +9959,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pf_base = pf["base"]["moneda"].upper()
         qty_str = ""
         if cantidad is not None:
-            qty_str = f"(cant: {int(cantidad)}) " if requires_integer_units(yfsym) else f"(cant: {cantidad}) "
+            qty_str = f"(cant: {int(cantidad)}) " if not allows_fractional_units(yfsym, tipo) else f"(cant: {cantidad}) "
         unit_px_str = ""
         if price_base is not None:
             unit_px_str = f"a {(fmt_money_ars(price_base) if pf_base=='ARS' else fmt_money_usd(price_base))} c/u "
@@ -10080,12 +10086,12 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             it["importe"] = nuevo_importe
             if price_base and price_base > 0:
                 raw_qty = nuevo_importe/price_base
-                it["cantidad"] = float(math.floor(raw_qty)) if requires_integer_units(yfsym) else round(raw_qty, 6)
+                it["cantidad"] = float(math.floor(raw_qty)) if not allows_fractional_units(yfsym, it.get("tipo")) else round(raw_qty, 6)
         else:
             delta = float(v) if mode=="edit_addq" else -float(v)
             cur = float(it.get("cantidad") or 0.0)
             nueva_cant = cur + delta
-            if requires_integer_units(yfsym): nueva_cant = float(max(0, math.floor(nueva_cant)))
+            if not allows_fractional_units(yfsym, it.get("tipo")): nueva_cant = float(max(0, math.floor(nueva_cant)))
             else: nueva_cant = max(0.0, nueva_cant)
             if price_base and price_base > 0:
                 nuevo_importe = nueva_cant * float(price_base)
@@ -11367,7 +11373,7 @@ async def pf_send_composition(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
             )
         if entry.get('peso'):
             lines.append(f"• Peso en portafolio: {pct_plain(entry['peso']*100.0,1)}")
-        qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
+        qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'), entry.get('tipo'))
         if qty_txt:
             lines.append(f"• Cantidad: {qty_txt}")
         if entry.get("valuation_mode") == "estimated_from_daily_change":
@@ -11497,7 +11503,7 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
             lines.append(f"• Peso: ⚖️ {pct_plain(entry['peso']*100.0,1)}")
         else:
             lines.append("• Peso: —")
-        qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
+        qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'), entry.get('tipo'))
         if qty_txt:
             lines.append(f"• Cantidad: 📦 {qty_txt}")
         else:
