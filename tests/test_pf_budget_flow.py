@@ -84,7 +84,8 @@ def test_pf_setmonto_opens_budget_screen():
     all_labels = [btn.text for row in kb for btn in row]
     assert "Ingresar manual" not in all_labels
     assert "500.000" not in all_labels
-    assert kb[-2][0].text == "Volver"
+    assert "Volver" not in all_labels
+    assert kb[-1][0].text == "⬅️ Volver al menú portafolio"
     assert context.user_data.get("pf_budget_currency") is None
 
 
@@ -99,6 +100,7 @@ def test_pf_budget_currency_selection_ars_shows_ars_presets():
     assert "100.000" in all_labels
     assert "1.000" not in all_labels
     assert "Ingresar manual" in all_labels
+    assert "Volver" in all_labels
 
 
 def test_pf_budget_currency_selection_usd_shows_usd_presets():
@@ -112,6 +114,20 @@ def test_pf_budget_currency_selection_usd_shows_usd_presets():
     assert "1.000" in all_labels
     assert "500.000" not in all_labels
     assert "Ingresar manual" in all_labels
+
+
+def test_pf_budget_currency_selection_shows_back_button_only_after_currency_selected():
+    kb_initial = bot.kb_pf_budget(None).inline_keyboard
+    kb_ars = bot.kb_pf_budget("ARS").inline_keyboard
+    kb_usd = bot.kb_pf_budget("USD").inline_keyboard
+
+    initial_labels = [btn.text for row in kb_initial for btn in row]
+    ars_labels = [btn.text for row in kb_ars for btn in row]
+    usd_labels = [btn.text for row in kb_usd for btn in row]
+
+    assert "Volver" not in initial_labels
+    assert "Volver" in ars_labels
+    assert "Volver" in usd_labels
 
 
 def test_pf_budget_back_returns_to_budget_base_and_not_portfolio_main(monkeypatch):
