@@ -9187,6 +9187,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pct_str = f" · objetivo: {pct_plain(obj_pct_val, 1)}" if obj_pct_val is not None else ""
             lines.append(f"{i}. {label}{pct_str}")
             buttons.append([InlineKeyboardButton(f"{i}. {label}", callback_data=f"PF:REBAL:PICK:{i-1}")])
+        buttons.append([InlineKeyboardButton("Volver", callback_data="PF:REBAL")])
         buttons.append(_pf_menu_nav_row())
         await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML)
         return

@@ -219,6 +219,28 @@ def test_pf_budget_manual_mode_uses_numeric_parser(monkeypatch):
     assert context.user_data["pf_mode"] is None
 
 
+def test_pf_rebal_pct_list_includes_back_button_to_rebal_menu():
+    chat_id = 81
+    pf = bot.pf_get(chat_id)
+    pf["items"] = [
+        {"simbolo": "AL30", "objetivo_pct": 40.0},
+        {"simbolo": "GGAL.BA", "objetivo_pct": 60.0},
+    ]
+
+    update, q = _make_update_with_query("PF:REBAL:PCT", chat_id=chat_id)
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(bot.pf_menu_cb(update, context))
+
+    kb = q.edits[-1][1]["reply_markup"].inline_keyboard
+    all_labels = [btn.text for row in kb for btn in row]
+    all_callbacks = [btn.callback_data for row in kb for btn in row]
+
+    assert "Volver" in all_labels
+    assert "PF:REBAL" in all_callbacks
+    assert kb[-1][0].text == "⬅️ Volver al menú portafolio"
+
+
 @pytest.mark.parametrize("callback_data", ["PF:ADD", "PF:PICK:GGAL.BA"])
 def test_pf_add_flow_shows_remaining_line_with_defined_budget(callback_data):
     chat_id = 77
