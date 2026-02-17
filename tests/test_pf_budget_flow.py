@@ -201,3 +201,38 @@ def test_pf_budget_manual_mode_uses_numeric_parser(monkeypatch):
     assert bot.PF[chat_id]["monto"] == pytest.approx(500000.0)
     assert calls == [True]
     assert context.user_data["pf_mode"] is None
+
+
+@pytest.mark.parametrize("callback_data", ["PF:ADD", "PF:PICK:GGAL.BA"])
+def test_pf_add_flow_shows_remaining_line_with_defined_budget(callback_data):
+    chat_id = 77
+    pf = bot.pf_get(chat_id)
+    pf["base"]["moneda"] = "USD"
+    pf["monto"] = 1000.0
+    pf["items"] = [{"importe": 250.0, "simbolo": "AAPL.BA"}]
+
+    update, q = _make_update_with_query(callback_data, chat_id=chat_id)
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(bot.pf_menu_cb(update, context))
+
+    text, _kwargs = q.edits[-1]
+    assert "🪙 Restante para invertir:" in text
+    assert bot.fmt_money_usd(750.0) in text
+
+
+@pytest.mark.parametrize("callback_data", ["PF:ADD", "PF:PICK:GGAL.BA"])
+def test_pf_add_flow_shows_remaining_line_without_defined_budget(callback_data):
+    chat_id = 78
+    pf = bot.pf_get(chat_id)
+    pf["base"]["moneda"] = "ARS"
+    pf["monto"] = None
+
+    update, q = _make_update_with_query(callback_data, chat_id=chat_id)
+    context = SimpleNamespace(user_data={})
+
+    asyncio.run(bot.pf_menu_cb(update, context))
+
+    text, _kwargs = q.edits[-1]
+    assert "🪙 Restante para invertir:" in text
+    assert "Sin presupuesto definido" in text
