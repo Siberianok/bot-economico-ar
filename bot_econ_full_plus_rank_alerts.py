@@ -5760,7 +5760,7 @@ async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             ACCIONES_BA,
             "📈 Top 3 Acciones (Rendimiento)",
-            throttle_key="rankings:acciones:top3",
+            throttle_key=None,
         )
         await dec_and_maybe_show(update, context, "acciones", cmd_acciones_menu)
     elif data == "ACC:TOP5":
@@ -5768,7 +5768,7 @@ async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             ACCIONES_BA,
             "🏁 Top 5 Acciones (Proyección)",
-            throttle_key="rankings:acciones:top5",
+            throttle_key=None,
         )
         await dec_and_maybe_show(update, context, "acciones", cmd_acciones_menu)
     elif data == "CED:TOP3":
