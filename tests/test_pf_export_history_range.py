@@ -107,6 +107,10 @@ def test_pf_export_menu_uses_local_back_and_main_menu_button(monkeypatch):
 
     _, kwargs = update.callback_query.edits[-1]
     kb = kwargs["reply_markup"].inline_keyboard
+    assert kb[0][0].text == "Actual"
+    assert kb[0][0].callback_data == "PF:EXPORT:NOW"
+    assert kb[1][0].text == "Histórico"
+    assert kb[1][0].callback_data == "PF:EXPORT:HISTORY:RANGE"
     assert kb[-2][0].text == "Volver"
     assert kb[-2][0].callback_data == "PF:EXPORT:BACK"
     assert "menú" in kb[-1][0].text.lower()
@@ -124,6 +128,8 @@ def test_pf_export_history_range_back_returns_to_export_menu(monkeypatch):
 
     _, kwargs = update.callback_query.edits[-1]
     kb = kwargs["reply_markup"].inline_keyboard
+    assert kb[2][0].text == "Personalizado"
+    assert kb[2][0].callback_data == "PF:EXPORT:HISTORY:CUSTOM"
     assert kb[-2][0].text == "Volver"
     assert kb[-2][0].callback_data == "PF:EXPORT"
     assert "menú" in kb[-1][0].text.lower()
