@@ -5163,6 +5163,152 @@ def _summarize_projection_performance(batches: List[Dict[str, Any]]) -> Dict[str
         "spearman": spearman_avg,
     }
 
+
+PERFORMANCE_MAE_MAX = 4.0
+PERFORMANCE_HIT_RATE_MIN = 0.50
+
+
+def _format_projection_overview_line(label: str, summary: Dict[str, Optional[float]]) -> str:
+    if summary.get("count"):
+        return (
+            f"• {label}: MAE {pct_plain(summary.get('mae'), 2)}"
+            f" | Hit {pct_plain((summary.get('hit_rate') or 0) * 100.0, 1)}"
+            f" | Spearman {fmt_number(summary.get('spearman'), 2)}"
+            f" | N={summary.get('count')}"
+        )
+    return f"• {label}: sin datos evaluados."
+
+
+def _build_performance_lines(show_detail: bool = False) -> List[str]:
+    all_batches = list(PROJECTION_BATCHES)
+    evaluated = [b for b in PROJECTION_BATCHES if b.get("evaluated")]
+    pending = [b for b in PROJECTION_BATCHES if not b.get("evaluated")]
+    batches_3m = [b for b in evaluated if b.get("horizon") == WINDOW_DAYS[3]]
+    batches_6m = [b for b in evaluated if b.get("horizon") == WINDOW_DAYS[6]]
+    summary_3m = _summarize_projection_performance(batches_3m)
+    summary_6m = _summarize_projection_performance(batches_6m)
+
+    all_summaries = [s for s in (summary_3m, summary_6m) if s.get("count")]
+    mae_ok = all(
+        isinstance(s.get("mae"), (int, float)) and float(s["mae"]) <= PERFORMANCE_MAE_MAX
+        for s in all_summaries
+    )
+    hit_ok = all(
+        isinstance(s.get("hit_rate"), (int, float)) and float(s["hit_rate"]) >= PERFORMANCE_HIT_RATE_MIN
+        for s in all_summaries
+    )
+    status = "OK" if all_summaries and mae_ok and hit_ok else "Atención"
+
+    latest_eval = max(
+        evaluated,
+        key=lambda b: b.get("evaluated_at") or 0,
+        default=None,
+    )
+    latest_eval_txt = "sin evaluaciones"
+    if latest_eval:
+        ts = latest_eval.get("evaluated_at")
+        if ts:
+            try:
+                latest_eval_txt = datetime.fromtimestamp(float(ts), TZ).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                latest_eval_txt = str(latest_eval.get("created_date") or "s/d")
+        else:
+            latest_eval_txt = str(latest_eval.get("created_date") or "s/d")
+
+    lines = ["<b>📊 Performance de Proyecciones</b>"]
+    lines.append(
+        "• Estado general: "
+        f"<b>{status}</b> (umbrales: Hit ≥ {pct_plain(PERFORMANCE_HIT_RATE_MIN * 100.0, 1)}"
+        f" y MAE ≤ {pct_plain(PERFORMANCE_MAE_MAX, 2)})"
+    )
+    lines.append(_format_projection_overview_line(f"3M ({WINDOW_DAYS[3]} ruedas)", summary_3m))
+    lines.append(_format_projection_overview_line(f"6M ({WINDOW_DAYS[6]} ruedas)", summary_6m))
+    lines.append(f"• Batches pendientes: {len(pending)}")
+    lines.append(f"• Última evaluación: {latest_eval_txt}")
+
+    if not show_detail:
+        return lines
+
+    latest_evaluated = sorted(
+        evaluated,
+        key=lambda b: b.get("evaluated_at") or b.get("created_at") or 0,
+        reverse=True,
+    )[:5]
+    if latest_evaluated:
+        lines.append("")
+        lines.append("<b>Últimos batches</b>")
+        for batch in latest_evaluated:
+            created_date = batch.get("created_date") or "s/d"
+            horizon = batch.get("horizon")
+            mae = pct_plain(batch.get("mae"), 2)
+            hit_rate = pct_plain((batch.get("hit_rate") or 0) * 100.0, 1)
+            spearman = fmt_number(batch.get("spearman"), 2)
+            count = batch.get("count") or 0
+            lines.append(
+                f"• {created_date} · {horizon}r: MAE {mae} | Hit {hit_rate} | ρ {spearman} | N={count}"
+            )
+
+    lines.append("")
+    lines.append("<b>Estado actual del motor de proyecciones</b>")
+    lines.append(f"• Total de batches registrados: {len(all_batches)}")
+
+    pending_by_horizon: Dict[str, int] = {}
+    for batch in pending:
+        horizon = batch.get("horizon")
+        key = f"{horizon}r" if isinstance(horizon, int) else "s/d"
+        pending_by_horizon[key] = pending_by_horizon.get(key, 0) + 1
+    if pending_by_horizon:
+        parts = [f"{k}: {v}" for k, v in sorted(pending_by_horizon.items())]
+        lines.append("• Pendientes por horizonte: " + " · ".join(parts))
+    else:
+        lines.append("• Pendientes por horizonte: sin pendientes.")
+
+    latest_created = max(
+        all_batches,
+        key=lambda b: b.get("created_at") or b.get("evaluated_at") or 0,
+        default=None,
+    )
+    if latest_created:
+        latest_ts = latest_created.get("created_at") or latest_created.get("evaluated_at")
+        latest_txt = latest_created.get("created_date") or "s/d"
+        if latest_ts:
+            try:
+                latest_txt = datetime.fromtimestamp(float(latest_ts), TZ).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                latest_txt = str(latest_txt)
+        lines.append(f"• Último batch creado: {latest_txt}")
+    else:
+        lines.append("• Último batch creado: sin batches registrados.")
+
+    progress_parts: List[str] = []
+    for batch in pending:
+        horizon = batch.get("horizon")
+        if not isinstance(horizon, int) or horizon <= 0:
+            continue
+        created_ref = batch.get("created_date")
+        if not created_ref and batch.get("created_at"):
+            try:
+                created_ref = datetime.fromtimestamp(float(batch.get("created_at")), TZ).strftime("%Y-%m-%d")
+            except Exception:
+                created_ref = None
+        if not created_ref:
+            continue
+        try:
+            created_dt = datetime.strptime(str(created_ref), "%Y-%m-%d").date()
+        except Exception:
+            continue
+        elapsed = _trading_days_between(created_dt, datetime.now(TZ).date())
+        ratio = min(100.0, (elapsed / float(horizon)) * 100.0)
+        progress_parts.append(f"{horizon}r: {elapsed}/{horizon} ({pct_plain(ratio, 1)})")
+    if progress_parts:
+        lines.append("• Progreso estimado: " + " · ".join(progress_parts))
+    elif pending:
+        lines.append("• Progreso estimado: sin fechas válidas para calcular avance.")
+    else:
+        lines.append("• Progreso estimado: no hay batches pendientes.")
+
+    return lines
+
 RET_SERIES_BASE: List[Tuple[str, str]] = [
     ("6m", "Rend. 6M"),
     ("3m", "Rend. 3M"),
@@ -8955,7 +9101,8 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Simular aporte único/mensual: evaluá cómo cambia la asignación antes de operar.\n"
             "• En cada paso podés usar <b>Volver</b> para regresar a la etapa anterior.\n\n"
             "<b>Métricas de performance</b>\n"
-            "• /performance muestra qué tan precisas fueron las proyecciones históricas (3M y 6M)."
+            "• /performance muestra un resumen ejecutivo de precisión histórica (3M y 6M).\n"
+            "• /performance full o /performance_detalle muestran el desglose completo."
         )
         await q.edit_message_text(txt, reply_markup=_pf_with_menu_nav([]), parse_mode=ParseMode.HTML); return
 
@@ -11658,112 +11805,19 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    all_batches = list(PROJECTION_BATCHES)
-    evaluated = [b for b in PROJECTION_BATCHES if b.get("evaluated")]
-    pending = [b for b in PROJECTION_BATCHES if not b.get("evaluated")]
+    args = [str(a).strip().lower() for a in getattr(context, "args", []) if str(a).strip()]
+    show_detail = any(arg in {"full", "detalle", "detallado"} for arg in args)
+    lines = _build_performance_lines(show_detail=show_detail)
 
-    lines = ["<b>📊 Performance de Proyecciones</b>"]
-    lines.append("")
-    lines.append("<b>Precisión histórica</b>")
-    if evaluated:
-        batches_3m = [b for b in evaluated if b.get("horizon") == WINDOW_DAYS[3]]
-        batches_6m = [b for b in evaluated if b.get("horizon") == WINDOW_DAYS[6]]
-        summary_3m = _summarize_projection_performance(batches_3m)
-        summary_6m = _summarize_projection_performance(batches_6m)
-        for label, summary in (
-            (f"3M ({WINDOW_DAYS[3]} ruedas)", summary_3m),
-            (f"6M ({WINDOW_DAYS[6]} ruedas)", summary_6m),
-        ):
-            if summary.get("count"):
-                lines.append(
-                    f"• {label}: MAE {pct_plain(summary.get('mae'), 2)}"
-                    f" | Hit {pct_plain((summary.get('hit_rate') or 0) * 100.0, 1)}"
-                    f" | Spearman {fmt_number(summary.get('spearman'), 2)}"
-                    f" | N={summary.get('count')}"
-                )
-            else:
-                lines.append(f"• {label}: sin datos evaluados.")
-    else:
-        lines.append("• Aún sin batches evaluados (requiere maduración).")
-
-    latest_evaluated = sorted(
-        evaluated,
-        key=lambda b: b.get("evaluated_at") or b.get("created_at") or 0,
-        reverse=True,
-    )[:5]
-    if latest_evaluated:
-        lines.append("")
-        lines.append("<b>Últimos batches</b>")
-        for batch in latest_evaluated:
-            created_date = batch.get("created_date") or "s/d"
-            horizon = batch.get("horizon")
-            mae = pct_plain(batch.get("mae"), 2)
-            hit_rate = pct_plain((batch.get("hit_rate") or 0) * 100.0, 1)
-            spearman = fmt_number(batch.get("spearman"), 2)
-            count = batch.get("count") or 0
-            lines.append(
-                f"• {created_date} · {horizon}r: MAE {mae} | Hit {hit_rate} | ρ {spearman} | N={count}"
-            )
-
-    lines.append("")
-    lines.append("<b>Estado actual del motor de proyecciones</b>")
-    lines.append(f"• Total de batches registrados: {len(all_batches)}")
-
-    pending_by_horizon: Dict[str, int] = {}
-    for batch in pending:
-        horizon = batch.get("horizon")
-        key = f"{horizon}r" if isinstance(horizon, int) else "s/d"
-        pending_by_horizon[key] = pending_by_horizon.get(key, 0) + 1
-    if pending_by_horizon:
-        parts = [f"{k}: {v}" for k, v in sorted(pending_by_horizon.items())]
-        lines.append("• Pendientes por horizonte: " + " · ".join(parts))
-    else:
-        lines.append("• Pendientes por horizonte: sin pendientes.")
-
-    latest_created = max(
-        all_batches,
-        key=lambda b: b.get("created_at") or b.get("evaluated_at") or 0,
-        default=None,
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        link_preview_options=build_preview_options(),
     )
-    if latest_created:
-        latest_ts = latest_created.get("created_at") or latest_created.get("evaluated_at")
-        latest_txt = latest_created.get("created_date") or "s/d"
-        if latest_ts:
-            try:
-                latest_txt = datetime.fromtimestamp(float(latest_ts), TZ).strftime("%Y-%m-%d %H:%M")
-            except Exception:
-                latest_txt = str(latest_txt)
-        lines.append(f"• Último batch creado: {latest_txt}")
-    else:
-        lines.append("• Último batch creado: sin batches registrados.")
 
-    progress_parts: List[str] = []
-    for batch in pending:
-        horizon = batch.get("horizon")
-        if not isinstance(horizon, int) or horizon <= 0:
-            continue
-        created_ref = batch.get("created_date")
-        if not created_ref and batch.get("created_at"):
-            try:
-                created_ref = datetime.fromtimestamp(float(batch.get("created_at")), TZ).strftime("%Y-%m-%d")
-            except Exception:
-                created_ref = None
-        if not created_ref:
-            continue
-        try:
-            created_dt = datetime.strptime(str(created_ref), "%Y-%m-%d").date()
-        except Exception:
-            continue
-        elapsed = _trading_days_between(created_dt, datetime.now(TZ).date())
-        ratio = min(100.0, (elapsed / float(horizon)) * 100.0)
-        progress_parts.append(f"{horizon}r: {elapsed}/{horizon} ({pct_plain(ratio, 1)})")
-    if progress_parts:
-        lines.append("• Progreso estimado: " + " · ".join(progress_parts))
-    elif pending:
-        lines.append("• Progreso estimado: sin fechas válidas para calcular avance.")
-    else:
-        lines.append("• Progreso estimado: no hay batches pendientes.")
 
+async def cmd_performance_detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = _build_performance_lines(show_detail=True)
     await update.effective_message.reply_text(
         "\n".join(lines),
         parse_mode=ParseMode.HTML,
@@ -11866,6 +11920,7 @@ BOT_COMMANDS = [
     BotCommand("portafolio","Menú portafolio"),
     BotCommand("subs","Suscripción a resumen diario"),
     BotCommand("performance","Métricas de performance"),
+    BotCommand("performance_detalle","Métricas de performance (detalle)"),
 ]
 
 
@@ -11980,6 +12035,7 @@ def build_application() -> Application:
     # Resumen diario on-demand
     app.add_handler(CommandHandler("resumen", instrument_command("resumen", cmd_resumen_diario)))
     app.add_handler(CommandHandler("performance", instrument_command("performance", cmd_performance)))
+    app.add_handler(CommandHandler("performance_detalle", instrument_command("performance_detalle", cmd_performance_detalle)))
 
     app.add_error_handler(handle_error)
 
