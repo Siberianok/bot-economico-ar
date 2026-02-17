@@ -11275,40 +11275,47 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         ret_pct = (delta / invertido * 100.0) if invertido > 0 else None
         if idx > 0:
             lines.append("")
-        detail = f"• {label}: {f_money(valor_actual)}"
-        if ret_pct is not None:
-            detail += f" ({pct(ret_pct,2)} | Δ {f_money(delta)})"
-        elif invertido > 0:
-            detail += f" (Δ {f_money(delta)})"
-        if entry.get("valuation_mode") == "estimated_from_daily_change":
-            detail += " · ~estimado"
-        if entry.get("valuation_stale"):
-            detail += " · ⚠️ stale"
-        qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
-        if qty_txt:
-            detail += f" · 📦 Cant: {qty_txt}"
-        if entry.get('precio_base') is not None:
-            detail += f" · 💵 Px: {f_money(entry['precio_base'])}"
+        lines.append(f"• <b>Instrumento:</b> {label}")
+        value_line = f"• Valor actual: {f_money(valor_actual)}"
         if view_fx:
             native_val = _fmt_native(entry.get("valor_actual_nativo"), entry.get("inst_currency"))
             if native_val:
-                detail += f" · 🧾 Nativo: {native_val}"
+                value_line += f" · 🧾 Nativo: {native_val}"
+        lines.append(value_line)
+        lines.append(f"• Invertido: {f_money(invertido)}")
+        lines.append(f"• Resultado: Δ {f_money(delta)}")
+        if ret_pct is not None:
+            lines.append(f"• Rendimiento: {pct(ret_pct,2)}")
+        else:
+            lines.append("• Rendimiento: —")
+        if entry.get('peso') is not None:
+            lines.append(f"• Peso: ⚖️ {pct_plain(entry['peso']*100.0,1)}")
+        else:
+            lines.append("• Peso: —")
+        qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
+        if qty_txt:
+            lines.append(f"• Cantidad: 📦 {qty_txt}")
+        else:
+            lines.append("• Cantidad: —")
+        if entry.get('precio_base') is not None:
+            lines.append(f"• Precio: 💵 {f_money(entry['precio_base'])}")
+        if entry.get("valuation_mode") == "estimated_from_daily_change":
+            lines.append("• Valuación: ~estimado")
+        if entry.get("valuation_stale"):
+            lines.append("• ⚠️ Dato con demora (stale)")
         daily = entry.get('daily_change')
         if daily is not None:
-            detail += f" · 🌅 Día: {pct(daily,2)}"
-        if entry.get('peso'):
-            detail += f" · ⚖️ Peso: {pct_plain(entry['peso']*100.0,1)}"
+            lines.append(f"• 🌅 Día: {pct(daily,2)}")
         inst_currency = entry.get("inst_currency")
         fx_ts_used = entry.get("fx_ts_used")
         if view_fx and inst_currency and inst_currency != pf_base and fx_ts_used:
-            detail += f" · 💱 TC al {datetime.fromtimestamp(int(fx_ts_used), TZ).strftime('%d/%m/%Y %H:%M')}"
+            lines.append(f"• 💱 TC al {datetime.fromtimestamp(int(fx_ts_used), TZ).strftime('%d/%m/%Y %H:%M')}")
         added_str = format_added_date(entry.get('added_ts'))
         if added_str:
-            detail += f" · ⏳ Desde: {added_str}"
+            lines.append(f"• ⏳ Desde: {added_str}")
         last_data = format_last_data_date(entry.get("price_ts"))
         if last_data and entry in stale_entries:
-            detail += f" · 🕒 último dato: {last_data}"
-        lines.append(detail)
+            lines.append(f"• 🕒 Último dato: {last_data}")
 
         short_label = _label_short(entry['symbol']) if entry.get('symbol') else label
         if ret_pct is not None:
