@@ -8434,11 +8434,8 @@ PF_EXPORT_HEADERS = [
 
 kb_export = InlineKeyboardMarkup(
     [
-        [
-            InlineKeyboardButton("Actual", callback_data="PF:EXPORT:NOW"),
-            InlineKeyboardButton("Histórico", callback_data="PF:EXPORT:HISTORY"),
-        ],
-        [InlineKeyboardButton("Histórico por fechas", callback_data="PF:EXPORT:HISTORY:RANGE")],
+        [InlineKeyboardButton("Actual", callback_data="PF:EXPORT:NOW")],
+        [InlineKeyboardButton("Histórico", callback_data="PF:EXPORT:HISTORY:RANGE")],
         [InlineKeyboardButton("Volver", callback_data="PF:EXPORT:BACK")],
     ]
 )
@@ -9395,11 +9392,12 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("YTD", callback_data="PF:EXPORT:HISTORY:RANGE:PRESET:ytd"),
                 InlineKeyboardButton("Todo", callback_data="PF:EXPORT:HISTORY:RANGE:PRESET:all"),
             ],
+            [InlineKeyboardButton("Personalizado", callback_data="PF:EXPORT:HISTORY:CUSTOM")],
             [InlineKeyboardButton("Volver", callback_data="PF:EXPORT")],
             _pf_menu_nav_row(),
         ])
         await q.edit_message_text(
-            "Elegí un rango para exportar histórico.\nManual (opcional): dd/mm/aaaa.",
+            "Elegí un rango para exportar histórico.",
             reply_markup=kb_history_range,
         )
         return
