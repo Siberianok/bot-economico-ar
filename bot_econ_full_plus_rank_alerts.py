@@ -9105,10 +9105,7 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<b>Rebalanceo y simulación</b>\n"
             "• Objetivo por %: fijá peso objetivo de cada instrumento.\n"
             "• Simular aporte único/mensual: evaluá cómo cambia la asignación antes de operar.\n"
-            "• En cada paso podés usar <b>Volver</b> para regresar a la etapa anterior.\n\n"
-            "<b>Métricas de performance</b>\n"
-            "• /performance muestra un resumen ejecutivo de precisión histórica (3M y 6M).\n"
-            "• /performance full o /performance_detalle muestran el desglose completo."
+            "• En cada paso podés usar <b>Volver</b> para regresar a la etapa anterior."
         )
         await q.edit_message_text(txt, reply_markup=_pf_with_menu_nav([]), parse_mode=ParseMode.HTML); return
 
