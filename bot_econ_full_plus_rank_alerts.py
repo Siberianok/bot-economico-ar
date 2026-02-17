@@ -9527,10 +9527,66 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 def _parse_num_text(s: str) -> Optional[float]:
-    if re.search(r"[^\d\.,\-+]", s): return None
-    s2 = s.replace(".","").replace(",",".")
-    try: return float(s2)
-    except: return None
+    if s is None:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    if re.search(r"[^\d\.,\-+]", s):
+        return None
+    if s.count("+") + s.count("-") > 1:
+        return None
+    if ("+" in s[1:]) or ("-" in s[1:]):
+        return None
+
+    sign = ""
+    if s[0] in "+-":
+        sign = s[0]
+        s = s[1:]
+    if not s:
+        return None
+
+    has_dot = "." in s
+    has_comma = "," in s
+
+    if has_dot and has_comma:
+        decimal_sep = "." if s.rfind(".") > s.rfind(",") else ","
+        thousand_sep = "," if decimal_sep == "." else "."
+        s = s.replace(thousand_sep, "")
+        if s.count(decimal_sep) > 1:
+            return None
+        int_part, dec_part = s.split(decimal_sep)
+        if not int_part.isdigit() or not dec_part.isdigit():
+            return None
+        s_norm = f"{sign}{int_part}.{dec_part}"
+    elif has_dot or has_comma:
+        sep = "." if has_dot else ","
+        parts = s.split(sep)
+        if any(not p.isdigit() for p in parts):
+            return None
+        if len(parts) == 2:
+            int_part, tail = parts
+            if not int_part or not tail:
+                return None
+            if len(tail) <= 2:
+                s_norm = f"{sign}{int_part}.{tail}"
+            elif len(tail) == 3:
+                s_norm = f"{sign}{int_part}{tail}"
+            else:
+                return None
+        else:
+            if any(len(p) != 3 for p in parts[1:]):
+                return None
+            s_norm = f"{sign}{''.join(parts)}"
+    else:
+        if not s.isdigit():
+            return None
+        s_norm = f"{sign}{s}"
+
+    try:
+        return float(s_norm)
+    except Exception:
+        return None
 
 async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -9769,10 +9825,13 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["pf_mode"]=None; return
 
     if mode in ("pf_rebal_sim_one", "pf_rebal_sim_month"):
-        v = _parse_num_text(text)
-        if v is None:
-            await update.message.reply_text("Ingresá solo número (sin símbolos)."); return
-        aporte = max(0.0, float(v))
+        v = parse_budget_value(text)
+        if v is None or float(v) <= 0:
+            await update.message.reply_text(
+                "Monto inválido. Ingresá un número mayor a 0. Ejemplos válidos: 100000, 100.000, 100,000, 100000,50, 100000.50"
+            )
+            return
+        aporte = float(v)
         snapshot, _, _, total_actual, _, _ = await pf_market_snapshot(pf)
         if not snapshot:
             await update.message.reply_text("No hay instrumentos para simular."); context.user_data["pf_mode"]=None; return
