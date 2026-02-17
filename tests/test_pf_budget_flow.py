@@ -203,66 +203,36 @@ def test_pf_budget_manual_mode_uses_numeric_parser(monkeypatch):
     assert context.user_data["pf_mode"] is None
 
 
-@pytest.mark.parametrize(
-    ("raw_amount", "expected"),
-    [
-        ("100000", 100000.0),
-        ("100.000", 100000.0),
-        ("100,000", 100000.0),
-        ("100000,50", 100000.5),
-        ("100000.50", 100000.5),
-    ],
-)
-def test_pf_rebal_sim_month_accepts_multiple_amount_formats(monkeypatch, raw_amount, expected):
-    captured = {}
+@pytest.mark.parametrize("callback_data", ["PF:ADD", "PF:PICK:GGAL.BA"])
+def test_pf_add_flow_shows_remaining_line_with_defined_budget(callback_data):
+    chat_id = 77
+    pf = bot.pf_get(chat_id)
+    pf["base"]["moneda"] = "USD"
+    pf["monto"] = 1000.0
+    pf["items"] = [{"importe": 250.0, "simbolo": "AAPL.BA"}]
 
-    async def _fake_market_snapshot(_pf):
-        return ([{"label": "AL30"}], 0.0, 0.0, 50000.0, None, None)
+    update, q = _make_update_with_query(callback_data, chat_id=chat_id)
+    context = SimpleNamespace(user_data={})
 
-    def _fake_rebalance_suggestions(_snapshot, _total_actual, aporte):
-        captured["aporte"] = aporte
-        return (
-            [{"label": "AL30", "delta": aporte, "peso_actual": 50.0, "peso_objetivo": 60.0}],
-            100.0,
-        )
+    asyncio.run(bot.pf_menu_cb(update, context))
 
-    monkeypatch.setattr(bot, "pf_market_snapshot", _fake_market_snapshot)
-    monkeypatch.setattr(bot, "pf_rebalance_suggestions", _fake_rebalance_suggestions)
-
-    chat_id = 81
-    bot.pf_get(chat_id)["items"] = [{"simbolo": "AL30", "tipo": "bond"}]
-    context = SimpleNamespace(user_data={"pf_mode": "pf_rebal_sim_month"})
-    message = DummyMessage(raw_amount)
-    update = SimpleNamespace(effective_chat=SimpleNamespace(id=chat_id), message=message)
-
-    asyncio.run(bot.pf_text_input(update, context))
-
-    assert captured["aporte"] == pytest.approx(expected)
-    assert context.user_data["pf_mode"] is None
-    assert "Simulación de aporte mensual" in message.replies[-1][0]
+    text, _kwargs = q.edits[-1]
+    assert "🪙 Restante para invertir:" in text
+    assert bot.fmt_money_usd(750.0) in text
 
 
-def test_pf_rebal_sim_month_rejects_invalid_or_non_positive_amount(monkeypatch):
-    called = {"value": False}
+@pytest.mark.parametrize("callback_data", ["PF:ADD", "PF:PICK:GGAL.BA"])
+def test_pf_add_flow_shows_remaining_line_without_defined_budget(callback_data):
+    chat_id = 78
+    pf = bot.pf_get(chat_id)
+    pf["base"]["moneda"] = "ARS"
+    pf["monto"] = None
 
-    async def _fake_market_snapshot(_pf):
-        called["value"] = True
-        return ([{"label": "AL30"}], 0.0, 0.0, 50000.0, None, None)
+    update, q = _make_update_with_query(callback_data, chat_id=chat_id)
+    context = SimpleNamespace(user_data={})
 
-    monkeypatch.setattr(bot, "pf_market_snapshot", _fake_market_snapshot)
+    asyncio.run(bot.pf_menu_cb(update, context))
 
-    chat_id = 82
-    bot.pf_get(chat_id)["items"] = [{"simbolo": "AL30", "tipo": "bond"}]
-
-    for raw_amount in ("abc", "0", "-10"):
-        context = SimpleNamespace(user_data={"pf_mode": "pf_rebal_sim_month"})
-        message = DummyMessage(raw_amount)
-        update = SimpleNamespace(effective_chat=SimpleNamespace(id=chat_id), message=message)
-
-        asyncio.run(bot.pf_text_input(update, context))
-
-        assert "Monto inválido" in message.replies[-1][0]
-        assert "100000.50" in message.replies[-1][0]
-        assert context.user_data["pf_mode"] == "pf_rebal_sim_month"
-
-    assert called["value"] is False
+    text, _kwargs = q.edits[-1]
+    assert "🪙 Restante para invertir:" in text
+    assert "Sin presupuesto definido" in text

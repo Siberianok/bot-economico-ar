@@ -100,3 +100,6 @@ def test_pf_show_projection_below_supports_12m_horizon(monkeypatch):
 
     assert context.user_data["pf_proj_horizon"] == 12
     assert any("Horizonte: 12M (~252 ruedas)." in msg for msg in sent_messages)
+    assert any("<b>Instrumento:</b> GGAL" in msg for msg in sent_messages)
+    assert any("<b>Peso:</b>" in msg for msg in sent_messages)
+    assert any("<b>Rango esperado (P25–P75):</b>" in msg for msg in sent_messages)

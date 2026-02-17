@@ -5760,7 +5760,7 @@ async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             ACCIONES_BA,
             "📈 Top 3 Acciones (Rendimiento)",
-            throttle_key="rankings:acciones:top3",
+            throttle_key=None,
         )
         await dec_and_maybe_show(update, context, "acciones", cmd_acciones_menu)
     elif data == "ACC:TOP5":
@@ -5768,7 +5768,7 @@ async def acc_ced_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update,
             ACCIONES_BA,
             "🏁 Top 5 Acciones (Proyección)",
-            throttle_key="rankings:acciones:top5",
+            throttle_key=None,
         )
         await dec_and_maybe_show(update, context, "acciones", cmd_acciones_menu)
     elif data == "CED:TOP3":
@@ -8894,6 +8894,19 @@ async def _pf_total_usado(chat_id: int) -> float:
             total += float(it["importe"])
     return total
 
+
+async def _pf_restante_para_invertir_line(chat_id: int) -> str:
+    pf = pf_get(chat_id)
+    usado = await _pf_total_usado(chat_id)
+    base_currency = ((pf.get("base") or {}).get("moneda") or "ARS").upper()
+    f_money = fmt_money_ars if base_currency == "ARS" else fmt_money_usd
+    monto = pf.get("monto")
+    if monto is None:
+        restante_txt = "Sin presupuesto definido"
+    else:
+        restante_txt = f_money(max(0.0, float(monto) - usado))
+    return f"🪙 Restante para invertir: {restante_txt}"
+
 async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     chat_id = q.message.chat_id; data = q.data
@@ -9080,7 +9093,8 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("Buscar ticker", callback_data="PF:SEARCH")],
             _pf_menu_nav_row(),
         ])
-        await q.edit_message_text("¿Qué querés agregar?", reply_markup=kb_add)
+        restante_line = await _pf_restante_para_invertir_line(chat_id)
+        await q.edit_message_text(f"¿Qué querés agregar?\n{restante_line}", reply_markup=kb_add)
         return
 
     if data == "PF:REBAL":
@@ -9237,7 +9251,8 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["pf_add_simbolo"] = sym
             sel_label = _label_long(sym)
         kb_ask = kb_pf_add_methods()
-        await q.edit_message_text(f"Seleccionado: {sel_label}\n¿Cómo cargar?", reply_markup=kb_ask)
+        restante_line = await _pf_restante_para_invertir_line(chat_id)
+        await q.edit_message_text(f"Seleccionado: {sel_label}\n¿Cómo cargar?\n{restante_line}", reply_markup=kb_ask)
         return
 
     if data == "PF:ADDQTY":
@@ -11319,40 +11334,47 @@ async def pf_show_return_below(context: ContextTypes.DEFAULT_TYPE, chat_id: int,
         ret_pct = (delta / invertido * 100.0) if invertido > 0 else None
         if idx > 0:
             lines.append("")
-        detail = f"• {label}: {f_money(valor_actual)}"
-        if ret_pct is not None:
-            detail += f" ({pct(ret_pct,2)} | Δ {f_money(delta)})"
-        elif invertido > 0:
-            detail += f" (Δ {f_money(delta)})"
-        if entry.get("valuation_mode") == "estimated_from_daily_change":
-            detail += " · ~estimado"
-        if entry.get("valuation_stale"):
-            detail += " · ⚠️ stale"
-        qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
-        if qty_txt:
-            detail += f" · 📦 Cant: {qty_txt}"
-        if entry.get('precio_base') is not None:
-            detail += f" · 💵 Px: {f_money(entry['precio_base'])}"
+        lines.append(f"• <b>Instrumento:</b> {label}")
+        value_line = f"• Valor actual: {f_money(valor_actual)}"
         if view_fx:
             native_val = _fmt_native(entry.get("valor_actual_nativo"), entry.get("inst_currency"))
             if native_val:
-                detail += f" · 🧾 Nativo: {native_val}"
+                value_line += f" · 🧾 Nativo: {native_val}"
+        lines.append(value_line)
+        lines.append(f"• Invertido: {f_money(invertido)}")
+        lines.append(f"• Resultado: Δ {f_money(delta)}")
+        if ret_pct is not None:
+            lines.append(f"• Rendimiento: {pct(ret_pct,2)}")
+        else:
+            lines.append("• Rendimiento: —")
+        if entry.get('peso') is not None:
+            lines.append(f"• Peso: ⚖️ {pct_plain(entry['peso']*100.0,1)}")
+        else:
+            lines.append("• Peso: —")
+        qty_txt = format_quantity(entry['symbol'], entry.get('cantidad'))
+        if qty_txt:
+            lines.append(f"• Cantidad: 📦 {qty_txt}")
+        else:
+            lines.append("• Cantidad: —")
+        if entry.get('precio_base') is not None:
+            lines.append(f"• Precio: 💵 {f_money(entry['precio_base'])}")
+        if entry.get("valuation_mode") == "estimated_from_daily_change":
+            lines.append("• Valuación: ~estimado")
+        if entry.get("valuation_stale"):
+            lines.append("• ⚠️ Dato con demora (stale)")
         daily = entry.get('daily_change')
         if daily is not None:
-            detail += f" · 🌅 Día: {pct(daily,2)}"
-        if entry.get('peso'):
-            detail += f" · ⚖️ Peso: {pct_plain(entry['peso']*100.0,1)}"
+            lines.append(f"• 🌅 Día: {pct(daily,2)}")
         inst_currency = entry.get("inst_currency")
         fx_ts_used = entry.get("fx_ts_used")
         if view_fx and inst_currency and inst_currency != pf_base and fx_ts_used:
-            detail += f" · 💱 TC al {datetime.fromtimestamp(int(fx_ts_used), TZ).strftime('%d/%m/%Y %H:%M')}"
+            lines.append(f"• 💱 TC al {datetime.fromtimestamp(int(fx_ts_used), TZ).strftime('%d/%m/%Y %H:%M')}")
         added_str = format_added_date(entry.get('added_ts'))
         if added_str:
-            detail += f" · ⏳ Desde: {added_str}"
+            lines.append(f"• ⏳ Desde: {added_str}")
         last_data = format_last_data_date(entry.get("price_ts"))
         if last_data and entry in stale_entries:
-            detail += f" · 🕒 último dato: {last_data}"
-        lines.append(detail)
+            lines.append(f"• 🕒 Último dato: {last_data}")
 
         short_label = _label_short(entry['symbol']) if entry.get('symbol') else label
         if ret_pct is not None:
@@ -11491,28 +11513,27 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         short_label = _label_short(entry["symbol"]) if entry.get("symbol") else entry["label"]
         per_instrument_points.append((short_label, proj))
 
-        if detail:
-            detail.append("")
-        extras = [f"⚖️ Peso {pct_plain(weight * 100.0, 1)}"]
-        added_str = format_added_date(entry.get("added_ts"))
-        if added_str:
-            extras.append(f"⏳ Desde {added_str}")
-
         invertido = float(entry.get("invertido") or 0.0)
         valor_actual = float(entry.get("valor_actual") or 0.0)
         delta = valor_actual - invertido
         actual_pct = (delta / invertido) * 100.0 if invertido > 0 else None
-        actual_txt = pct(actual_pct, 2)
-        proj_txt = f"🔭 {horizon_label} {_format_projection_range(proj, 2, simple=True)}"
-        delta_txt = f"📈 Δ {f_money(delta)}"
-
-        detail.append(
-            "• "
-            + short_label
-            + f" → Rend. actual 📊 {actual_txt} ({delta_txt}) | Proyección {proj_txt} ("
-            + " · ".join(extras)
-            + ")"
-        )
+        actual_txt = f"{pct(actual_pct, 2)} ({f_money(delta)})"
+        nominal_amount = total_actual * ((center or 0.0) / 100.0) * weight
+        nominal_txt = f"{pct(center, 2)} ({f_money(nominal_amount)})"
+        detail_block = [
+            "<b>Instrumento:</b> " + short_label,
+            "<b>Peso:</b> " + pct_plain(weight * 100.0, 1),
+            "<b>Rendimiento actual:</b> " + actual_txt,
+            "<b>Variación nominal:</b> " + nominal_txt,
+            f"<b>Proyección {horizon_label}:</b> " + _format_projection_range(proj, 2, simple=True),
+            "<b>Rango esperado (P25–P75):</b> " + f"{pct(low, 2)} a {pct(high, 2)}",
+        ]
+        added_str = format_added_date(entry.get("added_ts"))
+        if added_str:
+            detail_block.append("<b>Desde:</b> " + added_str)
+        if detail:
+            detail.append("")
+        detail.extend(detail_block)
 
     forecast = total_actual * (1.0 + w/100.0)
     forecast_low = total_actual * (1.0 + w_low/100.0)
@@ -11520,17 +11541,14 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     header = "<b>🔮 Proyección del Portafolio</b>"
     if fecha:
         header += f" <i>Datos al {fecha}</i>"
-    lines = [header, f"🧮 Valor actual estimado: {f_money(total_actual)}"]
-    lines.append(
-        f"✨ Proyección {horizon_label}: "
-        + f"{pct(w,2)} → "
-        + f"{f_money(forecast)}"
-    )
+    lines = [header]
+    lines.append(f"• Valor actual: {f_money(total_actual)}")
+    lines.append(f"• Proyección total {horizon_label}: {f_money(forecast)} ({pct(w,2)})")
     if tc_val is not None:
         tc_line = f"💱 Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
         if tc_ts:
             tc_line += f" (al {datetime.fromtimestamp(tc_ts, TZ).strftime('%d/%m/%Y %H:%M')})"
-        lines.append(tc_line)
+        lines.append(f"• {tc_line}")
 
     lines.append("")
     lines.append("<b>Supuestos</b>")
