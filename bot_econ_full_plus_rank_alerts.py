@@ -11454,28 +11454,27 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
         short_label = _label_short(entry["symbol"]) if entry.get("symbol") else entry["label"]
         per_instrument_points.append((short_label, proj))
 
-        if detail:
-            detail.append("")
-        extras = [f"⚖️ Peso {pct_plain(weight * 100.0, 1)}"]
-        added_str = format_added_date(entry.get("added_ts"))
-        if added_str:
-            extras.append(f"⏳ Desde {added_str}")
-
         invertido = float(entry.get("invertido") or 0.0)
         valor_actual = float(entry.get("valor_actual") or 0.0)
         delta = valor_actual - invertido
         actual_pct = (delta / invertido) * 100.0 if invertido > 0 else None
-        actual_txt = pct(actual_pct, 2)
-        proj_txt = f"🔭 {horizon_label} {_format_projection_range(proj, 2, simple=True)}"
-        delta_txt = f"📈 Δ {f_money(delta)}"
-
-        detail.append(
-            "• "
-            + short_label
-            + f" → Rend. actual 📊 {actual_txt} ({delta_txt}) | Proyección {proj_txt} ("
-            + " · ".join(extras)
-            + ")"
-        )
+        actual_txt = f"{pct(actual_pct, 2)} ({f_money(delta)})"
+        nominal_amount = total_actual * ((center or 0.0) / 100.0) * weight
+        nominal_txt = f"{pct(center, 2)} ({f_money(nominal_amount)})"
+        detail_block = [
+            "<b>Instrumento:</b> " + short_label,
+            "<b>Peso:</b> " + pct_plain(weight * 100.0, 1),
+            "<b>Rendimiento actual:</b> " + actual_txt,
+            "<b>Variación nominal:</b> " + nominal_txt,
+            f"<b>Proyección {horizon_label}:</b> " + _format_projection_range(proj, 2, simple=True),
+            "<b>Rango esperado (P25–P75):</b> " + f"{pct(low, 2)} a {pct(high, 2)}",
+        ]
+        added_str = format_added_date(entry.get("added_ts"))
+        if added_str:
+            detail_block.append("<b>Desde:</b> " + added_str)
+        if detail:
+            detail.append("")
+        detail.extend(detail_block)
 
     forecast = total_actual * (1.0 + w/100.0)
     forecast_low = total_actual * (1.0 + w_low/100.0)
@@ -11483,17 +11482,14 @@ async def pf_show_projection_below(context: ContextTypes.DEFAULT_TYPE, chat_id: 
     header = "<b>🔮 Proyección del Portafolio</b>"
     if fecha:
         header += f" <i>Datos al {fecha}</i>"
-    lines = [header, f"🧮 Valor actual estimado: {f_money(total_actual)}"]
-    lines.append(
-        f"✨ Proyección {horizon_label}: "
-        + f"{pct(w,2)} → "
-        + f"{f_money(forecast)}"
-    )
+    lines = [header]
+    lines.append(f"• Valor actual: {f_money(total_actual)}")
+    lines.append(f"• Proyección total {horizon_label}: {f_money(forecast)} ({pct(w,2)})")
     if tc_val is not None:
         tc_line = f"💱 Tipo de cambio ref. ({pf['base']['tc'].upper()}): {fmt_money_ars(tc_val)} por USD"
         if tc_ts:
             tc_line += f" (al {datetime.fromtimestamp(tc_ts, TZ).strftime('%d/%m/%Y %H:%M')})"
-        lines.append(tc_line)
+        lines.append(f"• {tc_line}")
 
     lines.append("")
     lines.append("<b>Supuestos</b>")
