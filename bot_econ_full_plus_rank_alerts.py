@@ -10205,6 +10205,98 @@ def _pf_fx_decomposition(
 
     return fx_price_effect, fx_fx_effect, fx_has_data
 
+def _calc_basic_twr(entries: List[Dict[str, Any]], end_ts: Optional[int]) -> Optional[float]:
+    """Calcula una aproximación básica de TWR con la foto actual del portafolio.
+
+    Sin valuaciones históricas por período no es posible calcular un TWR canónico.
+    Este helper evita crashes y devuelve una métrica consistente sobre la foto actual.
+    """
+    invested_total = 0.0
+    current_total = 0.0
+
+    for entry in entries or []:
+        try:
+            invested = float(entry.get("invertido") or 0.0)
+            current = float(entry.get("valor_actual") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if invested <= 0:
+            continue
+        invested_total += invested
+        current_total += current
+
+    if invested_total <= 0:
+        return None
+
+    return (current_total / invested_total) - 1.0
+
+
+def _calc_basic_mwr(cash_flows: List[Tuple[int, float]], end_ts: int, ending_value: float) -> Optional[float]:
+    """Calcula una TIR anual simple (MWR) usando flujos y valor final.
+
+    Convención: aportes (cash_flows positivos) se modelan como egresos del inversor.
+    """
+    if not cash_flows:
+        return None
+
+    try:
+        final_value = float(ending_value)
+    except (TypeError, ValueError):
+        return None
+    if final_value < 0:
+        return None
+
+    normalized: List[Tuple[int, float]] = []
+    total_invested = 0.0
+    for ts, amount in cash_flows:
+        try:
+            ts_i = int(ts)
+            amt_f = float(amount)
+        except (TypeError, ValueError):
+            continue
+        if amt_f <= 0:
+            continue
+        normalized.append((ts_i, amt_f))
+        total_invested += amt_f
+
+    if not normalized or total_invested <= 0:
+        return None
+
+    end_ts_i = int(end_ts) if end_ts is not None else max(ts for ts, _ in normalized)
+
+    def _npv(rate: float) -> float:
+        if rate <= -0.999999:
+            return float("inf")
+        total = 0.0
+        for ts, amt in normalized:
+            years = max(0.0, (end_ts_i - ts) / (365.25 * 24 * 3600))
+            total += (-amt) / ((1.0 + rate) ** years)
+        total += final_value
+        return total
+
+    lo, hi = -0.999, 10.0
+    npv_lo = _npv(lo)
+    npv_hi = _npv(hi)
+
+    if math.isfinite(npv_lo) and math.isfinite(npv_hi) and npv_lo * npv_hi < 0:
+        for _ in range(80):
+            mid = (lo + hi) / 2.0
+            npv_mid = _npv(mid)
+            if not math.isfinite(npv_mid):
+                break
+            if abs(npv_mid) < 1e-9:
+                return mid
+            if npv_lo * npv_mid <= 0:
+                hi = mid
+                npv_hi = npv_mid
+            else:
+                lo = mid
+                npv_lo = npv_mid
+        return (lo + hi) / 2.0
+
+    return (final_value / total_invested) - 1.0
+
+
 async def pf_market_snapshot(
     pf: Dict[str, Any],
 ) -> Tuple[List[Dict[str, Any]], Optional[int], float, float, Optional[float], Optional[int], Optional[Dict[str, Any]]]:
