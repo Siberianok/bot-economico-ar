@@ -3,6 +3,7 @@
 
 import os, asyncio, logging, re, html as _html, json, math, io, signal, csv, unicodedata, textwrap
 import copy
+import calendar
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
@@ -8515,6 +8516,8 @@ PF_EXPORT_RANGE_TO_KEY = "pf_export_history_to_ts"
 PF_EXPORT_RANGE_LABEL_KEY = "pf_export_history_range_label"
 PF_EXPORT_CUSTOM_STEP_KEY = "pf_export_custom_step"
 PF_EXPORT_CUSTOM_FROM_DATE_KEY = "pf_export_custom_from_date"
+PF_EXPORT_CUSTOM_CAL_YEAR_KEY = "pf_export_custom_cal_year"
+PF_EXPORT_CUSTOM_CAL_MONTH_KEY = "pf_export_custom_cal_month"
 
 
 def _parse_pf_export_date(raw: str) -> Optional[datetime]:
@@ -8526,6 +8529,94 @@ def _parse_pf_export_date(raw: str) -> Optional[datetime]:
     except ValueError:
         return None
     return datetime(parsed.year, parsed.month, parsed.day, tzinfo=TZ)
+
+
+def _pf_export_valid_date_bounds(chat_id: int) -> Tuple[datetime, datetime]:
+    today = datetime.now(TZ)
+    max_dt = datetime(today.year, today.month, today.day, tzinfo=TZ)
+    min_ts: Optional[float] = None
+
+    pf = pf_get(chat_id)
+    for item in pf.get("items", []):
+        ts = item.get("added_ts") if isinstance(item, dict) else None
+        try:
+            ts_f = float(ts)
+        except (TypeError, ValueError):
+            continue
+        if min_ts is None or ts_f < min_ts:
+            min_ts = ts_f
+
+    history_entries = PF_HISTORY.get(chat_id, [])
+    for entry in history_entries:
+        try:
+            ts_f = float(entry.get("ts"))
+        except (TypeError, ValueError):
+            continue
+        if min_ts is None or ts_f < min_ts:
+            min_ts = ts_f
+
+    if min_ts is None:
+        return max_dt, max_dt
+
+    min_dt_raw = datetime.fromtimestamp(min_ts, TZ)
+    min_dt = datetime(min_dt_raw.year, min_dt_raw.month, min_dt_raw.day, tzinfo=TZ)
+    if min_dt > max_dt:
+        min_dt = max_dt
+    return min_dt, max_dt
+
+
+def _pf_export_calendar_keyboard(
+    year: int,
+    month: int,
+    min_dt: datetime,
+    max_dt: datetime,
+) -> InlineKeyboardMarkup:
+    month_start = datetime(year, month, 1, tzinfo=TZ)
+    month_label = month_start.strftime("%B %Y").capitalize()
+    first_weekday, month_days = calendar.monthrange(year, month)
+
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(f"📅 {month_label}", callback_data="PF:EXPORT:CAL:NOOP")],
+        [
+            InlineKeyboardButton("L", callback_data="PF:EXPORT:CAL:NOOP"),
+            InlineKeyboardButton("M", callback_data="PF:EXPORT:CAL:NOOP"),
+            InlineKeyboardButton("M", callback_data="PF:EXPORT:CAL:NOOP"),
+            InlineKeyboardButton("J", callback_data="PF:EXPORT:CAL:NOOP"),
+            InlineKeyboardButton("V", callback_data="PF:EXPORT:CAL:NOOP"),
+            InlineKeyboardButton("S", callback_data="PF:EXPORT:CAL:NOOP"),
+            InlineKeyboardButton("D", callback_data="PF:EXPORT:CAL:NOOP"),
+        ],
+    ]
+
+    offset = first_weekday
+    current_row: List[InlineKeyboardButton] = []
+    for _ in range(offset):
+        current_row.append(InlineKeyboardButton("·", callback_data="PF:EXPORT:CAL:NOOP"))
+
+    for day in range(1, month_days + 1):
+        day_dt = datetime(year, month, day, tzinfo=TZ)
+        is_valid = min_dt <= day_dt <= max_dt
+        callback = f"PF:EXPORT:CAL:DAY:{day_dt.strftime('%Y-%m-%d')}" if is_valid else "PF:EXPORT:CAL:NOOP"
+        text = str(day) if is_valid else "✖"
+        current_row.append(InlineKeyboardButton(text, callback_data=callback))
+        if len(current_row) == 7:
+            rows.append(current_row)
+            current_row = []
+
+    while current_row and len(current_row) < 7:
+        current_row.append(InlineKeyboardButton("·", callback_data="PF:EXPORT:CAL:NOOP"))
+    if current_row:
+        rows.append(current_row)
+
+    prev_month = month_start - timedelta(days=1)
+    next_month = datetime(year + (1 if month == 12 else 0), 1 if month == 12 else month + 1, 1, tzinfo=TZ)
+    rows.append([
+        InlineKeyboardButton("⬅️", callback_data=f"PF:EXPORT:CAL:MONTH:{prev_month.year}:{prev_month.month}"),
+        InlineKeyboardButton("➡️", callback_data=f"PF:EXPORT:CAL:MONTH:{next_month.year}:{next_month.month}"),
+    ])
+    rows.append([InlineKeyboardButton("Volver", callback_data="PF:EXPORT:HISTORY:RANGE")])
+    rows.append(_pf_menu_nav_row())
+    return InlineKeyboardMarkup(rows)
 
 
 def _pf_export_range_label(from_ts: Optional[float], to_ts: Optional[float]) -> str:
@@ -9498,12 +9589,103 @@ async def pf_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "PF:EXPORT:HISTORY:CUSTOM":
+        min_dt, max_dt = _pf_export_valid_date_bounds(chat_id)
         context.user_data[PF_EXPORT_CUSTOM_STEP_KEY] = "from"
         context.user_data.pop(PF_EXPORT_CUSTOM_FROM_DATE_KEY, None)
+        context.user_data[PF_EXPORT_CUSTOM_CAL_YEAR_KEY] = max_dt.year
+        context.user_data[PF_EXPORT_CUSTOM_CAL_MONTH_KEY] = max_dt.month
         await q.edit_message_text(
-            "Ingresá la fecha <b>desde</b> (dd/mm/aaaa).",
+            (
+                "Elegí la fecha <b>desde</b>.\n"
+                f"Fechas válidas: {min_dt.strftime('%d/%m/%Y')} a {max_dt.strftime('%d/%m/%Y')}."
+            ),
             parse_mode=ParseMode.HTML,
-            reply_markup=_pf_with_menu_nav([]),
+            reply_markup=_pf_export_calendar_keyboard(max_dt.year, max_dt.month, min_dt, max_dt),
+        )
+        return
+
+    if data == "PF:EXPORT:CAL:NOOP":
+        return
+
+    if data.startswith("PF:EXPORT:CAL:MONTH:"):
+        parts = data.split(":")
+        try:
+            year = int(parts[4])
+            month = int(parts[5])
+            if month < 1 or month > 12:
+                raise ValueError
+        except (ValueError, IndexError):
+            return
+        min_dt, max_dt = _pf_export_valid_date_bounds(chat_id)
+        step = context.user_data.get(PF_EXPORT_CUSTOM_STEP_KEY) or "from"
+        from_dt = context.user_data.get(PF_EXPORT_CUSTOM_FROM_DATE_KEY)
+        if step == "to" and isinstance(from_dt, datetime):
+            min_dt = from_dt
+        context.user_data[PF_EXPORT_CUSTOM_CAL_YEAR_KEY] = year
+        context.user_data[PF_EXPORT_CUSTOM_CAL_MONTH_KEY] = month
+        prompt = "Elegí la fecha <b>hasta</b>." if step == "to" else "Elegí la fecha <b>desde</b>."
+        await q.edit_message_text(
+            (
+                f"{prompt}\n"
+                f"Fechas válidas: {min_dt.strftime('%d/%m/%Y')} a {max_dt.strftime('%d/%m/%Y')}."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_pf_export_calendar_keyboard(year, month, min_dt, max_dt),
+        )
+        return
+
+    if data.startswith("PF:EXPORT:CAL:DAY:"):
+        date_raw = data.split(":", 4)[4]
+        try:
+            selected_dt = datetime.strptime(date_raw, "%Y-%m-%d").replace(tzinfo=TZ)
+        except ValueError:
+            return
+        min_dt, max_dt = _pf_export_valid_date_bounds(chat_id)
+        step = context.user_data.get(PF_EXPORT_CUSTOM_STEP_KEY) or "from"
+
+        if step == "to":
+            from_dt = context.user_data.get(PF_EXPORT_CUSTOM_FROM_DATE_KEY)
+            if not isinstance(from_dt, datetime):
+                context.user_data[PF_EXPORT_CUSTOM_STEP_KEY] = "from"
+                await q.edit_message_text(
+                    "No encontré la fecha desde. Volvé a elegirla.",
+                    reply_markup=_pf_export_calendar_keyboard(max_dt.year, max_dt.month, min_dt, max_dt),
+                )
+                return
+            if selected_dt < from_dt:
+                await q.answer("La fecha hasta no puede ser menor que la fecha desde.")
+                return
+            from_ts = from_dt.timestamp()
+            to_ts = (selected_dt + timedelta(days=1) - timedelta(seconds=1)).timestamp()
+            context.user_data[PF_EXPORT_RANGE_FROM_KEY] = from_ts
+            context.user_data[PF_EXPORT_RANGE_TO_KEY] = to_ts
+            context.user_data[PF_EXPORT_RANGE_LABEL_KEY] = f"{from_dt.strftime('%d/%m/%Y')} a {selected_dt.strftime('%d/%m/%Y')}"
+            context.user_data.pop(PF_EXPORT_CUSTOM_STEP_KEY, None)
+            context.user_data.pop(PF_EXPORT_CUSTOM_FROM_DATE_KEY, None)
+            context.user_data.pop(PF_EXPORT_CUSTOM_CAL_YEAR_KEY, None)
+            context.user_data.pop(PF_EXPORT_CUSTOM_CAL_MONTH_KEY, None)
+            await pf_export_history(context, chat_id)
+            await q.edit_message_text(
+                "Exportación histórica personalizada generada. Elegí otra opción si querés.",
+                reply_markup=_pf_with_menu_nav(kb_export.inline_keyboard),
+            )
+            return
+
+        if not (min_dt <= selected_dt <= max_dt):
+            await q.answer("Fecha fuera de rango válido.")
+            return
+
+        context.user_data[PF_EXPORT_CUSTOM_FROM_DATE_KEY] = selected_dt
+        context.user_data[PF_EXPORT_CUSTOM_STEP_KEY] = "to"
+        context.user_data[PF_EXPORT_CUSTOM_CAL_YEAR_KEY] = selected_dt.year
+        context.user_data[PF_EXPORT_CUSTOM_CAL_MONTH_KEY] = selected_dt.month
+        await q.edit_message_text(
+            (
+                "Elegí la fecha <b>hasta</b>.\n"
+                f"Desde: {selected_dt.strftime('%d/%m/%Y')} · Hasta máximo: {max_dt.strftime('%d/%m/%Y')}."
+            ),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_pf_export_calendar_keyboard(selected_dt.year, selected_dt.month, selected_dt, max_dt),
         )
         return
 
@@ -9940,6 +10122,7 @@ async def pf_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append("")
             lines.append(f"ℹ️ Objetivos normalizados (suma: {pct_plain(target_total, 1)}).")
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+        await pf_refresh_menu(context, chat_id, force_new=True)
         context.user_data["pf_mode"]=None; return
 
     # Ediciones

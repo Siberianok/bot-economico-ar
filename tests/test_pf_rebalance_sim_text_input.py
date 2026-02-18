@@ -52,6 +52,11 @@ def test_pf_rebal_sim_one_with_valid_numeric_input(monkeypatch):
 
     monkeypatch.setattr(bot, "pf_market_snapshot", _fake_market_snapshot)
 
+    async def _fake_refresh_menu(_context, _chat_id, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "pf_refresh_menu", _fake_refresh_menu)
+
     chat_id = 101
     bot.pf_get(chat_id)
     message = DummyMessage("100")
@@ -72,6 +77,11 @@ def test_pf_rebal_sim_month_with_valid_numeric_input(monkeypatch):
         return _build_snapshot(), 0, 1000.0, 1000.0, None, None, None
 
     monkeypatch.setattr(bot, "pf_market_snapshot", _fake_market_snapshot)
+
+    async def _fake_refresh_menu(_context, _chat_id, **_kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "pf_refresh_menu", _fake_refresh_menu)
 
     chat_id = 202
     bot.pf_get(chat_id)
