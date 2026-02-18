@@ -14,7 +14,7 @@ class _DummyCallbackQuery:
         self.message = _DummyMessage()
         self.edits = []
 
-    async def answer(self):
+    async def answer(self, *args, **kwargs):
         return None
 
     async def edit_message_text(self, *args, **kwargs):
@@ -156,3 +156,43 @@ def test_pf_export_back_routes_to_main_without_refresh(monkeypatch):
     assert args[0] == "menú principal"
     assert kwargs.get("parse_mode") == bot.ParseMode.HTML
     assert calls["refresh"] == 0
+
+
+def test_pf_export_custom_shows_calendar_with_valid_range(monkeypatch):
+    chat_id = 123
+    pf = bot.pf_get(chat_id)
+    pf["items"] = [{"simbolo": "GGAL.BA", "added_ts": 1_700_000_000}]
+
+    update = _DummyUpdate("PF:EXPORT:HISTORY:CUSTOM")
+    context = _DummyContext()
+
+    asyncio.run(bot.pf_menu_cb(update, context))
+
+    args, kwargs = update.callback_query.edits[-1]
+    assert "fecha <b>desde</b>" in args[0].lower()
+    kb = kwargs["reply_markup"].inline_keyboard
+    flat = [btn.callback_data for row in kb for btn in row]
+    assert any(cb and cb.startswith("PF:EXPORT:CAL:DAY:") for cb in flat)
+
+
+def test_pf_export_custom_calendar_day_transitions_to_to_step(monkeypatch):
+    called = {}
+
+    async def _fake_export_history(context, chat_id):
+        called["chat_id"] = chat_id
+
+    monkeypatch.setattr(bot, "pf_export_history", _fake_export_history)
+
+    chat_id = 123
+    pf = bot.pf_get(chat_id)
+    pf["items"] = [{"simbolo": "GGAL.BA", "added_ts": 1_700_000_000}]
+
+    update = _DummyUpdate("PF:EXPORT:CAL:DAY:2024-01-10")
+    context = _DummyContext()
+    context.user_data[bot.PF_EXPORT_CUSTOM_STEP_KEY] = "from"
+
+    asyncio.run(bot.pf_menu_cb(update, context))
+
+    assert context.user_data[bot.PF_EXPORT_CUSTOM_STEP_KEY] == "to"
+    assert context.user_data[bot.PF_EXPORT_CUSTOM_FROM_DATE_KEY].strftime("%Y-%m-%d") == "2024-01-10"
+    assert "chat_id" not in called
