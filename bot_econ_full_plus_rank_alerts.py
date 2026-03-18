@@ -83,7 +83,7 @@ WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 CRYPTOYA_DOLAR_URL = "https://criptoya.com/api/dolar"
 DOLARAPI_BASE = "https://dolarapi.com/v1"
 BANDAS_CAMBIARIAS_URL = f"{DOLARAPI_BASE}/bandas-cambiarias"
-DOLARITO_BANDAS_HTML = "https://dolarito.ar/dolar/bandas-cambiarias"
+DOLARITO_BANDAS_HTML = "https://www.dolarito.ar/dolar/bandas-cambiarias"
 DOLARITO_BANDAS_JSON = "https://api.dolarito.ar/api/frontend/bandas-cambiarias"
 
 AMBITO_RIESGO_URL = "https://mercados.ambito.com//riesgo-pais/variacion"
@@ -5532,14 +5532,19 @@ async def _parse_dolarito_bandas_html(html: str) -> Optional[Dict[str, Any]]:
             continue
 
         data: Dict[str, Any] = {
-            "banda_superior": bands.get("upper") or bands.get("upperBand"),
-            "banda_inferior": bands.get("lower") or bands.get("lowerBand"),
+            "banda_superior": _extract_band_amount(bands.get("upper") or bands.get("upperBand")),
+            "banda_inferior": _extract_band_amount(bands.get("lower") or bands.get("lowerBand")),
             "variacion_diaria": (bands.get("dolarMayorista") or {}).get("variation"),
             "variacion_superior": bands.get("upperVariation"),
             "variacion_inferior": bands.get("lowerVariation"),
             "variacion_mensual_superior": bands.get("upperMonthlyVariation") or bands.get("upper_monthly_variation"),
             "variacion_mensual_inferior": bands.get("lowerMonthlyVariation") or bands.get("lower_monthly_variation"),
-            "fecha": None,
+            "fecha": _extract_band_date(
+                bands.get("upper"),
+                bands.get("lower"),
+                bands.get("date"),
+                parsed.get("date"),
+            ),
             "fuente": "Dolarito.ar",
         }
 
@@ -5560,6 +5565,29 @@ async def _parse_dolarito_bandas_html(html: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _extract_band_amount(value: Any) -> Optional[float]:
+    if isinstance(value, dict):
+        value = value.get("value") or value.get("price") or value.get("amount")
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _extract_band_date(*values: Any) -> Optional[str]:
+    for value in values:
+        if isinstance(value, dict):
+            for key in ("date", "fecha", "updatedAt", "updated_at"):
+                raw = value.get(key)
+                if raw:
+                    return str(raw)
+        elif value:
+            return str(value)
+    return None
+
+
 async def _fetch_dolarito_bandas_json(session: ClientSession) -> Optional[Dict[str, Any]]:
     try:
         async with session.get(
@@ -5576,8 +5604,8 @@ async def _fetch_dolarito_bandas_json(session: ClientSession) -> Optional[Dict[s
 
     bands = raw.get("bands") if isinstance(raw.get("bands"), dict) else raw
     data: Dict[str, Any] = {
-        "banda_superior": bands.get("upper") or bands.get("upperBand"),
-        "banda_inferior": bands.get("lower") or bands.get("lowerBand"),
+        "banda_superior": _extract_band_amount(bands.get("upper") or bands.get("upperBand")),
+        "banda_inferior": _extract_band_amount(bands.get("lower") or bands.get("lowerBand")),
         "variacion_mensual_superior": bands.get("upperMonthlyVariation")
         or bands.get("upper_monthly_variation"),
         "variacion_mensual_inferior": bands.get("lowerMonthlyVariation")
@@ -5585,7 +5613,12 @@ async def _fetch_dolarito_bandas_json(session: ClientSession) -> Optional[Dict[s
         "variacion_diaria": (bands.get("dolarMayorista") or {}).get("variation"),
         "variacion_superior": bands.get("upperVariation"),
         "variacion_inferior": bands.get("lowerVariation"),
-        "fecha": None,
+        "fecha": _extract_band_date(
+            bands.get("upper"),
+            bands.get("lower"),
+            bands.get("date"),
+            raw.get("date"),
+        ),
         "fuente": "Dolarito.ar (JSON)",
     }
 
@@ -5651,13 +5684,9 @@ async def get_bandas_cambiarias(session: ClientSession) -> Optional[Dict[str, An
 
 def _fmt_band_val(row: Dict[str, Any], keys: List[str]) -> Optional[float]:
     for k in keys:
-        val = row.get(k)
-        if isinstance(val, (int, float)):
-            return float(val)
-        try:
-            return float(val)
-        except Exception:
-            continue
+        val = _extract_band_amount(row.get(k))
+        if val is not None:
+            return val
     return None
 
 def _fmt_band_pct(row: Dict[str, Any], keys: List[str]) -> Optional[float]:
