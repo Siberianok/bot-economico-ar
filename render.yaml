@@ -43,8 +43,9 @@ services:
       - key: DEV_TELEGRAM_USER_ID
         sync: false
 
-  - type: static
+    - type: web
     name: observatorio-economico-miniapp
+    runtime: static
     rootDir: frontend
     buildCommand: npm install && npm run build
     staticPublishPath: dist
