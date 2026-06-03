@@ -10,6 +10,8 @@ services:
         value: 3.11.9
       - key: TELEGRAM_TOKEN
         sync: false
+      - key: BASE_URL
+        sync: false
       - key: WEBHOOK_SECRET
         sync: false
       - key: MINIAPP_URL
@@ -43,7 +45,7 @@ services:
       - key: DEV_TELEGRAM_USER_ID
         sync: false
 
-    - type: web
+  - type: web
     name: observatorio-economico-miniapp
     runtime: static
     rootDir: frontend
@@ -58,5 +60,5 @@ services:
         value: production
     routes:
       - type: rewrite
-        source: /*
+        source: "/*"
         destination: /index.html
