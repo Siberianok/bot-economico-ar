@@ -1,18 +1,61 @@
 services:
   - type: web
     name: bot-economico-ar
-    env: python
+    runtime: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     envVars:
-      - key: TELEGRAM_TOKEN
-        sync: false          # cargalo en Render → Environment
-      - key: UPSTASH_REDIS_REST_URL
-        sync: false          # cargalo en Render → Environment
-      - key: UPSTASH_REDIS_REST_TOKEN
-        sync: false          # cargalo en Render → Environment
-      - key: UPSTASH_STATE_KEY     # opcional: solo si queres customizarlo
-        sync: false
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: MINIAPP_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: UPSTASH_STATE_KEY
+        sync: false
+
+  - type: web
+    name: observatorio-economico-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DATABASE_URL
+        value: sqlite:///./data/observatorio.db
+      - key: API_CORS_ORIGINS
+        sync: false
+      - key: MINIAPP_URL
+        sync: false
+      - key: SIGNAL_MIN_SCORE
+        value: "70"
+      - key: LEGACY_LIVE_FETCH_ENABLED
+        value: "0"
+      - key: DEV_TELEGRAM_USER_ID
+        sync: false
+
+  - type: static
+    name: observatorio-economico-miniapp
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: VITE_API_BASE_URL
+        sync: false
+      - key: VITE_MINIAPP_ENV
+        value: production
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html

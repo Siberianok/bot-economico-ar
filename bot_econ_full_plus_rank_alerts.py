@@ -38,6 +38,7 @@ except Exception:
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
 from telegram import (
     Update, LinkPreviewOptions, BotCommand, InlineKeyboardMarkup, InlineKeyboardButton, InputFile,
+    WebAppInfo,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -72,6 +73,7 @@ TELEGRAM_TOKEN = config.telegram_token
 WEBHOOK_SECRET = config.webhook_secret
 PORT = config.port
 BASE_URL = config.base_url
+MINIAPP_URL = config.miniapp_url
 UPSTASH_URL = config.upstash.rest_url
 UPSTASH_TOKEN = config.upstash.rest_token
 UPSTASH_REDIS_URL = config.upstash.redis_url
@@ -5417,6 +5419,33 @@ async def dec_and_maybe_show(
     if cnt > 0:
         return await show_func(update, context)
 
+
+def _dashboard_button_row() -> Optional[List[InlineKeyboardButton]]:
+    url = (MINIAPP_URL or "").strip()
+    if not url:
+        return None
+    return [InlineKeyboardButton("Abrir Dashboard", web_app=WebAppInfo(url=url))]
+
+
+def _dashboard_markup() -> Optional[InlineKeyboardMarkup]:
+    row = _dashboard_button_row()
+    if not row:
+        return None
+    return InlineKeyboardMarkup([row])
+
+
+async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    markup = _dashboard_markup()
+    if not markup:
+        await update.effective_message.reply_text("Dashboard no configurado. Definí MINIAPP_URL.")
+        return
+    await update.effective_message.reply_text(
+        "📊 Observatorio Económico\nAbrí el dashboard interactivo desde Telegram.",
+        reply_markup=markup,
+        link_preview_options=build_preview_options(),
+    )
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     intro = (
         "<b>¡Hola! Soy tu asistente de mercados argentinos.</b>\n"
@@ -5452,6 +5481,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("💼 Portafolio", callback_data="PF:MENU"),
         ],
     ]
+    dashboard_row = _dashboard_button_row()
+    if dashboard_row:
+        kb_rows.append(dashboard_row)
 
     await update.effective_message.reply_text(
         intro,
@@ -12130,6 +12162,7 @@ BOT_COMMANDS = [
     BotCommand("economia","Menú de economía"),
     BotCommand("acciones","Menú acciones"),
     BotCommand("cedears","Menú cedears"),
+    BotCommand("dashboard","Abrir dashboard"),
     BotCommand("alertas_menu","Configurar alertas"),
     BotCommand("portafolio","Menú portafolio"),
     BotCommand("subs","Suscripción a resumen diario"),
@@ -12171,6 +12204,7 @@ def build_application() -> Application:
 
     # Comandos
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("dashboard", cmd_dashboard))
     app.add_handler(CommandHandler("economia", cmd_menu_economia))
     app.add_handler(CommandHandler("reservas", cmd_reservas))
     app.add_handler(CommandHandler("inflacion", cmd_inflacion))

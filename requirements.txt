@@ -7,3 +7,7 @@ tzdata
 matplotlib==3.8.*
 numpy==1.26.*
 redis>=5.0.0,<6
+fastapi>=0.115.0,<1
+uvicorn[standard]>=0.30.0,<1
+pydantic>=2.8.0,<3
+sqlalchemy>=2.0.0,<3
