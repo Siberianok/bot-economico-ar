@@ -32,6 +32,7 @@ class BotConfig:
     webhook_secret: str
     port: int
     base_url: str
+    miniapp_url: str
     state_path: Path
     upstash: UpstashConfig
     link_previews_enabled: bool
@@ -86,6 +87,7 @@ def load_config() -> BotConfig:
 
     webhook_secret = _get_first(["WEBHOOK_SECRET"], "tgwebhook").strip("/")
     base_url = _get_first(["BASE_URL", "RENDER_EXTERNAL_URL"], "http://localhost").rstrip("/")
+    miniapp_url = _get_first(["MINIAPP_URL"], "")
     port = _get_int("PORT", 10000)
     state_path = Path(_get_first(["STATE_PATH"], "state.json"))
 
@@ -123,6 +125,7 @@ def load_config() -> BotConfig:
         webhook_secret=webhook_secret,
         port=port,
         base_url=base_url,
+        miniapp_url=miniapp_url,
         state_path=state_path,
         upstash=upstash,
         link_previews_enabled=link_previews_enabled,
