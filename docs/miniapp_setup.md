@@ -1,14 +1,11 @@
-# Mini App Setup
+# Mini App: ejecución local y Telegram
 
-## Desarrollo Local
-
-Backend:
+## Backend local sin Telegram
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt -r requirements-dev.txt
-python -m uvicorn backend.app.main:app --reload
+$env:TELEGRAM_RUNTIME_ENABLED="0"
+$env:LEGACY_LIVE_FETCH_ENABLED="1"
+.\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --reload
 ```
 
 Abrir:
@@ -16,7 +13,17 @@ Abrir:
 - `http://127.0.0.1:8000/api/v1/health`
 - `http://127.0.0.1:8000/docs`
 
-Frontend:
+## Frontend local
+
+Crear `frontend/.env.local` sin subirlo al repositorio:
+
+```dotenv
+VITE_API_BASE_URL=http://127.0.0.1:8000
+VITE_MINIAPP_ENV=development
+VITE_DEV_TELEGRAM_USER_ID=local-dev
+```
+
+Ejecutar:
 
 ```powershell
 cd frontend
@@ -24,74 +31,83 @@ npm install
 npm run dev
 ```
 
-Abrir:
+Abrir `http://127.0.0.1:5173`.
 
-- `http://127.0.0.1:5173`
+## Runtime combinado local
 
-Variables locales recomendadas:
+No usar el token de producción para una prueba innecesaria. Cuando se quiera validar expresamente el
+webhook combinado se requieren:
 
-- `VITE_API_BASE_URL=http://127.0.0.1:8000`
-- `VITE_MINIAPP_ENV=development`
-- `VITE_DEV_TELEGRAM_USER_ID=local-dev`
-- `MINIAPP_URL=http://127.0.0.1:5173`
-- `API_CORS_ORIGINS=http://127.0.0.1:5173,http://localhost:5173`
-- `DATABASE_URL=sqlite:///./data/observatorio.db`
-- `LEGACY_LIVE_FETCH_ENABLED=0`
+```powershell
+$env:TELEGRAM_RUNTIME_ENABLED="1"
+$env:TELEGRAM_TOKEN="..."
+$env:WEBHOOK_SECRET="..."
+$env:BASE_URL="https://URL-HTTPS-PUBLICA"
+$env:MINIAPP_URL="https://URL-MINIAPP"
+```
 
-## Producción Render
+Telegram no acepta `localhost` como webhook. La prueba completa se realiza después del deploy HTTPS o
+mediante un túnel temporal aprobado para esa validación.
 
-El frontend se despliega como Static Site:
+## Integración Telegram
 
-- `rootDir`: `frontend`
-- `buildCommand`: `npm install && npm run build`
-- `staticPublishPath`: `dist`
-- rewrite SPA: `/* -> /index.html`
+La Mini App detecta `window.Telegram.WebApp`, llama `ready()` y `expand()`, y envía
+`X-Telegram-Init-Data` al backend cuando está disponible. En producción el backend valida firma,
+`auth_date` y usuario con `TELEGRAM_TOKEN`; el valor no debe aceptarse sin validación. En desarrollo,
+con `TELEGRAM_AUTH_REQUIRED=0`, usa el usuario configurado por `VITE_DEV_TELEGRAM_USER_ID`.
 
-Configurar en Render:
+`GET /api/v1/session` permite comprobar desde la interfaz si la identidad fue validada por el
+backend y si el usuario tiene un PF legacy disponible. El detalle de seguridad y cálculo se encuentra
+en `docs/portfolio_v2.md`.
 
-- `VITE_API_BASE_URL=https://BACKEND_RENDER_URL`
-- `VITE_MINIAPP_ENV=production`
+Prueba en celular:
 
-El backend debe permitir el origen del frontend:
+1. Ejecutar `/start` y confirmar que se conservan los botones existentes.
+2. Ejecutar `/dashboard`.
+3. Tocar `Abrir Dashboard`.
+4. Verificar Inicio, Economía, Screener, Noticias, Portfolio, Alertas, Lecturas automáticas y Ajustes.
+5. Confirmar en Ajustes que `initData` está disponible y `Validación backend` figura como `Verificada`.
+6. Comparar Portfolio con `/portafolio` y comprobar cantidad de posiciones, capital y cobertura.
+7. Comparar la pestaña Telegram de Alertas con `/alertas_menu` y comprobar cantidad, estado y umbrales.
+8. Comparar Suscripción con `/subs` y verificar el horario del resumen diario.
+9. Crear un borrador de alerta y confirmar que queda separado de las reglas Telegram activas.
 
-- `API_CORS_ORIGINS=https://FRONTEND_RENDER_URL`
-
-El bot debe conocer la Mini App:
-
-- `MINIAPP_URL=https://FRONTEND_RENDER_URL`
-
-No hardcodear estas URLs en el código. Se cargan como variables de entorno cuando Render genere las URLs reales.
-
-## Telegram
-
-1. Confirmar que `MINIAPP_URL` está cargada en el servicio del bot.
-2. Redeploy del bot.
-3. Enviar `/dashboard` en Telegram.
-4. Tocar `Abrir Dashboard`.
-5. Verificar que abre dentro de Telegram en celular.
-
-Si `MINIAPP_URL` no está configurada, el bot responde:
+Si falta `MINIAPP_URL`, el mensaje esperado sigue siendo:
 
 ```text
 Dashboard no configurado. Definí MINIAPP_URL.
 ```
 
-## Endpoints Para Probar
+## Estados de datos
 
-- `GET /api/v1/health`
-- `GET /api/v1/market/pulse`
-- `GET /api/v1/screener?kind=acciones`
-- `GET /api/v1/screener?kind=cedears`
-- `GET /api/v1/portfolio/summary`
-- `GET /api/v1/alerts`
-- `GET /api/v1/signals`
-- `GET /api/v1/config`
-- `GET /api/v1/projections`
-- `GET /api/v1/validations`
+La interfaz diferencia `loading`, `error`, `stale`, `fallback` y `not_available`. No se deben reemplazar
+datos ausentes por valores simulados.
 
-## Advertencias
+Con `LEGACY_LIVE_FETCH_ENABLED=1`, Market Pulse consulta tipos de cambio, reservas, inflacion,
+riesgo pais y bandas mediante las fuentes reales ya integradas en el bot legacy. El Screener obtiene
+precios, retornos, volatilidad y proyecciones para acciones y CEDEARs; en CEDEARs separa rendimiento
+ARS, subyacente USD y efecto FX. Senales evalua reglas transparentes sobre esos datos reales y aplica
+cooldown antes de persistir una nueva lectura. Los endpoints se mantienen como `partial` mientras
+liquidez, noticias o bloques historicos no tengan una adaptacion confiable.
 
-- SQLite en Render sin disco persistente puede perder datos entre reinicios o redeploys.
-- Para uso productivo sostenido, migrar a PostgreSQL.
-- Las secciones no adaptadas del legacy deben seguir apareciendo como `not_available`.
-- `LEGACY_LIVE_FETCH_ENABLED=1` habilita consultas reales legacy y debe activarse solo cuando el entorno esté listo.
+Portfolio usa un adaptador de solo lectura sobre una copia profunda de `PF`. Solo devuelve posiciones
+cuando la solicitud incluye una identidad Telegram numerica validada y ese usuario tiene un portfolio
+legacy cargado en el proceso. Fuera de Telegram, el usuario de desarrollo `local-dev` recibe
+`not_available`; el backend nunca elige ni expone el portfolio de otro chat como fallback. El adaptador
+no llama `load_state()`, `save_state()` ni `pf_market_snapshot()` y no modifica `PF`.
+
+En modo local fuera de Telegram, Settings muestra el SDK cargado pero `Contexto Telegram: modo
+desarrollo`. La deteccion positiva exige `initData`, usuario Telegram o una plataforma WebApp real.
+
+Noticias consume en modo de solo lectura los RSS configurados en el bot legacy. `/api/v1/news`
+devuelve únicamente artículos recibidos de esas fuentes y `/api/v1/summary` compone el inicio con
+mercado, noticias y lecturas automáticas. Una fuente que falla queda documentada en `warnings`; no se
+rellena con titulares inventados.
+
+La correspondencia completa entre comandos y pantallas está documentada en
+`docs/miniapp_menu_parity.md`.
+
+Alertas muestra `ALERTS` y `SUBS` del usuario autenticado mediante copias profundas de solo lectura.
+Las reglas Telegram operativas se mantienen separadas de los borradores SQLite, que continúan
+aislados por usuario y con delivery `not_connected`. La promoción de un borrador y cualquier cambio
+de estado legacy requieren una fase posterior con persistencia externa y auditoría de escritura.

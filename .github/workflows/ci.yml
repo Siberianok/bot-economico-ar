@@ -25,3 +25,28 @@ jobs:
       - name: Run pip-audit
         run: |
           pip-audit -r requirements.txt -r requirements-dev.txt --progress-spinner=off
+
+      - name: Run Python tests
+        run: |
+          python -m pytest -q -p no:cacheprovider
+
+      - name: Compile Python sources
+        run: |
+          python -m compileall -q backend bot main.py bot_econ_full_plus_rank_alerts.py
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.19.5'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Audit and build frontend
+        working-directory: frontend
+        run: |
+          npm audit --audit-level=moderate
+          npm run build

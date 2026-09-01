@@ -1,24 +1,31 @@
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 .pytest_cache/
+.pytest-tmp/
+.pytest-basetemp-*/
 pytest-cache-files-*/
+.ruff_cache/
 .venv/
 .packages/
+.codex/.tmp/
 
-# Node
-node_modules/
+# Runtime state and local databases
+state.json
+data/*.db
+data/*.db-*
+data/.pytest-*/
+
+# Frontend
 frontend/node_modules/
 frontend/dist/
+frontend/.vite/
+frontend/.npm-cache/
 
-# Bases y estado local
-data/*.db
-state.json
-
-# Entorno / secretos
+# Local environment and tooling
 .env
-*.env
-
-# Sistema
+.env.*
+!.env.example
+*.log
 .DS_Store
 Thumbs.db

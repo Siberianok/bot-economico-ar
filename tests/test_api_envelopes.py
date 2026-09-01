@@ -14,11 +14,14 @@ def assert_envelope(payload):
 def test_initial_endpoints_return_envelopes():
     paths = [
         "/api/v1/market/pulse",
+        "/api/v1/news",
+        "/api/v1/summary",
         "/api/v1/screener?kind=acciones",
         "/api/v1/screener?kind=cedears",
         "/api/v1/portfolio/summary",
         "/api/v1/alerts",
         "/api/v1/signals",
+        "/api/v1/session",
         "/api/v1/config",
         "/api/v1/projections",
         "/api/v1/validations",
@@ -38,3 +41,15 @@ def test_screener_invalid_kind_returns_structured_error():
     assert_envelope(payload)
     assert payload["status"] == "error"
 
+
+def test_invalid_alert_payload_returns_structured_error():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/alerts",
+            json={"asset": "", "target_value": "not-a-number"},
+        )
+    assert response.status_code == 422
+    payload = response.json()
+    assert_envelope(payload)
+    assert payload["status"] == "error"
+    assert payload["source"] == "validation"

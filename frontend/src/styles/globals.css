@@ -11,10 +11,17 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
+html,
+body,
+#root {
+  width: 100%;
+  min-width: 0;
+}
+
 body {
   margin: 0;
-  min-width: 320px;
   min-height: 100vh;
+  overflow-x: hidden;
   background: #07111f;
 }
 
@@ -39,3 +46,7 @@ select {
   outline-offset: 1px;
 }
 
+select.field option {
+  background: #101f35;
+  color: #eaf2ff;
+}

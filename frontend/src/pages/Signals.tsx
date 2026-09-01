@@ -10,8 +10,8 @@ export function Signals() {
   return (
     <div className="space-y-5">
       <header>
-        <div className="text-xs uppercase tracking-wide text-obs-blue">Señales</div>
-        <h2 className="text-3xl font-semibold">Eventos automáticos</h2>
+        <div className="text-xs uppercase tracking-wide text-obs-blue">Monitoreo</div>
+        <h2 className="text-3xl font-semibold">Lecturas automáticas</h2>
       </header>
       {loading ? <DataState title="Cargando señales" /> : null}
       {error ? <DataState title="Error de carga" detail={error} /> : null}
@@ -28,13 +28,18 @@ export function Signals() {
               </div>
             </div>
             <p className="mt-2 text-sm text-obs-muted">{signal.description}</p>
+            <div className="mt-4 grid gap-2 border-t border-obs-border pt-3 text-xs text-obs-muted sm:grid-cols-4">
+              <div><span className="block uppercase">Activo</span><strong className="text-obs-text">{signal.asset || "-"}</strong></div>
+              <div><span className="block uppercase">Métrica</span><strong className="text-obs-text">{signal.metric || signal.type}</strong></div>
+              <div><span className="block uppercase">Valor</span><strong className="text-obs-text">{signal.current_value ?? "-"}</strong></div>
+              <div><span className="block uppercase">Fuente</span><strong className="text-obs-text">{signal.source}</strong></div>
+            </div>
             <div className="mt-3 text-xs text-obs-muted">{signal.timestamp}</div>
           </article>
         ))}
-        {!loading && !items.length ? <DataState title="Sin señales" detail="El motor inicial no generó señales nuevas." /> : null}
+        {!loading && !items.length ? <DataState title="Sin lecturas activas" detail="Los datos observados no superan los umbrales configurados." /> : null}
       </div>
       {payload?.warnings.length ? <DataState title="Advertencias" detail={payload.warnings.join(" · ")} /> : null}
     </div>
   );
 }
-

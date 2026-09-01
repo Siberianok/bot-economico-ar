@@ -7,7 +7,7 @@ interface Props {
 
 export function DataTable({ headers, rows }: Props) {
   return (
-    <div className="overflow-x-auto rounded-lg border border-obs-border">
+    <div className="max-w-full overflow-x-auto rounded-lg border border-obs-border">
       <table className="min-w-full divide-y divide-obs-border text-sm">
         <thead className="bg-obs-card2 text-xs uppercase text-obs-muted">
           <tr>
@@ -33,4 +33,3 @@ export function DataTable({ headers, rows }: Props) {
     </div>
   );
 }
-

@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Optional
 
 log = logging.getLogger(__name__)
 

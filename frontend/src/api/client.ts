@@ -55,4 +55,15 @@ export async function apiPatch<T>(path: string, body: unknown): Promise<ApiEnvel
   return (await response.json()) as ApiEnvelope<T>;
 }
 
+export async function apiDelete<T>(path: string): Promise<ApiEnvelope<T>> {
+  const initData = getTelegramInitData();
+  const response = await fetch(apiUrl(path), {
+    method: "DELETE",
+    headers: {
+      ...(initData ? { "X-Telegram-Init-Data": initData } : {}),
+    },
+  });
+  return (await response.json()) as ApiEnvelope<T>;
+}
+
 export { API_BASE_URL, API_CONFIG_ERROR };

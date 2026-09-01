@@ -31,7 +31,7 @@ def test_dashboard_without_miniapp_url_returns_exact_message(monkeypatch):
 
 
 def test_dashboard_with_miniapp_url_uses_webapp_button(monkeypatch):
-    url = "https://observatorio-economico-miniapp.onrender.com"
+    url = "https://obeconbot-miniapp.onrender.com"
     monkeypatch.setattr(bot, "MINIAPP_URL", url)
     message = DummyMessage()
     update = SimpleNamespace(effective_message=message)
@@ -40,7 +40,7 @@ def test_dashboard_with_miniapp_url_uses_webapp_button(monkeypatch):
     _run(bot.cmd_dashboard(update, context))
 
     text, kwargs = message.replies[-1]
-    assert "Observatorio Económico" in text
+    assert "ObeconBot" in text
     assert "Abrí el dashboard interactivo desde Telegram." in text
     button = kwargs["reply_markup"].inline_keyboard[0][0]
     assert button.text == "Abrir Dashboard"
@@ -48,7 +48,7 @@ def test_dashboard_with_miniapp_url_uses_webapp_button(monkeypatch):
 
 
 def test_start_adds_dashboard_button_without_removing_existing_buttons(monkeypatch):
-    url = "https://observatorio-economico-miniapp.onrender.com"
+    url = "https://obeconbot-miniapp.onrender.com"
     monkeypatch.setattr(bot, "MINIAPP_URL", url)
     message = DummyMessage()
     update = SimpleNamespace(effective_message=message)
@@ -70,11 +70,13 @@ def test_bot_commands_keep_legacy_commands_and_add_dashboard():
     command_names = {command.command for command in bot.BOT_COMMANDS}
     assert {
         "economia",
+        "menu",
         "acciones",
         "cedears",
         "alertas_menu",
         "portafolio",
         "subs",
         "performance",
+        "performance_detalle",
         "dashboard",
     }.issubset(command_names)

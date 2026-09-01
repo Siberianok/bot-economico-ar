@@ -1,95 +1,93 @@
-# Deployment Render
+# Deploy gratuito en Render
 
-Este repo queda preparado para deploy real en Render con tres servicios separados:
+> Estado actual: preparación local. No aplicar el Blueprint ni eliminar servicios existentes hasta
+> reconciliar esta carpeta con GitHub y recibir autorización explícita.
 
-- `bot-economico-ar`: bot Telegram legacy.
-- `observatorio-economico-api`: backend FastAPI.
-- `observatorio-economico-miniapp`: frontend estático HTTPS.
+La verificación pública del 2026-09-01 encontró dos Blueprints antiguos de tres servicios cada uno.
+Las dos Mini Apps cargan, pero no tienen `VITE_API_BASE_URL` embebida y sus APIs rechazan los orígenes
+CORS correspondientes. No deben reutilizarse como staging V2 sin una reconciliación explícita. El
+protocolo de prueba está en `docs/telegram_acceptance.md`.
 
-No se deben cargar tokens ni secretos en el código. Las variables marcadas como `sync: false` se configuran manualmente en Render.
+## Servicios objetivo
 
-## 1. Blueprint
+| Servicio | Tipo | Responsabilidad |
+| --- | --- | --- |
+| `obeconbot-core` | Web Service Free | FastAPI, webhook Telegram, jobs legacy y keep-alive |
+| `obeconbot-miniapp` | Static Site | React/Vite y navegación SPA |
 
-Crear el Blueprint desde `render.yaml`.
+Las capas de bot y API siguen separadas en código, pero comparten una instancia Python para no duplicar
+horas gratuitas.
 
-Servicios esperados:
+## Variables de `obeconbot-core`
 
-| Servicio | Tipo | Build command | Start / Publish |
-| --- | --- | --- | --- |
-| `bot-economico-ar` | Web Service Python | `pip install -r requirements.txt` | `python main.py` |
-| `observatorio-economico-api` | Web Service Python | `pip install -r requirements.txt` | `python -m uvicorn backend.app.main:app --host 0.0.0.0 --port $PORT` |
-| `observatorio-economico-miniapp` | Static Site | `npm install && npm run build` | `dist` |
+Obligatorias:
 
-El frontend usa `rootDir: frontend` y rewrite SPA hacia `/index.html`.
+- `TELEGRAM_RUNTIME_ENABLED=1`
+- `TELEGRAM_AUTH_REQUIRED=1`
+- `TELEGRAM_INIT_DATA_MAX_AGE_SECONDS=3600`
+- `TELEGRAM_TOKEN`: secreto cargado manualmente.
+- `WEBHOOK_SECRET`: valor aleatorio cargado manualmente.
+- `BASE_URL`: URL HTTPS final de `obeconbot-core`.
+- `MINIAPP_URL`: URL HTTPS final de `obeconbot-miniapp`.
+- `API_CORS_ORIGINS`: URL HTTPS exacta de `obeconbot-miniapp`.
 
-## 2. Variables
+Persistencia legacy:
 
-### Bot
+- `UPSTASH_REDIS_REST_URL`
+- `UPSTASH_REDIS_REST_TOKEN`
+- `UPSTASH_STATE_KEY=bot-econ-state`
 
-- `TELEGRAM_TOKEN`: token real del bot.
-- `WEBHOOK_SECRET`: path secreto del webhook.
-- `MINIAPP_URL`: URL HTTPS final del Static Site.
-- `UPSTASH_REDIS_REST_URL`: URL REST de Upstash, si se usa.
-- `UPSTASH_REDIS_REST_TOKEN`: token REST de Upstash, si se usa.
-- `UPSTASH_STATE_KEY`: clave de estado, opcional.
+Opcionales:
 
-### Backend API
+- `KEEPALIVE_ENABLED=1`
+- `DATABASE_URL=sqlite:///./data/obeconbot.db`
+- `SIGNAL_MIN_SCORE=70`
+- `LEGACY_LIVE_FETCH_ENABLED=0`
 
-- `DATABASE_URL`: por defecto `sqlite:///./data/observatorio.db`.
-- `API_CORS_ORIGINS`: URL HTTPS final del frontend, separada por coma si hay más de un origen.
-- `MINIAPP_URL`: URL HTTPS final del Static Site.
-- `SIGNAL_MIN_SCORE`: default `70`.
-- `LEGACY_LIVE_FETCH_ENABLED`: default `0`; usar `1` solo si se quieren consultas live legacy.
-- `DEV_TELEGRAM_USER_ID`: usuario local/dev opcional.
+## Variables del Static Site
 
-### Frontend
+- `VITE_API_BASE_URL`: URL HTTPS final de `obeconbot-core`.
+- `VITE_MINIAPP_ENV=production`.
+- `NODE_VERSION=20.19.5` o una versión compatible con Vite 8.
 
-- `VITE_API_BASE_URL`: URL HTTPS final del backend API.
-- `VITE_MINIAPP_ENV`: `production`.
+## Orden futuro de despliegue
 
-## 3. Orden Recomendado
+1. Convertir esta carpeta local en la fuente canónica y sincronizarla con GitHub.
+2. Preservar las variables Upstash y Telegram del servicio actualmente desplegado.
+3. Crear o actualizar `obeconbot-core` desde `render.yaml`.
+4. Cargar manualmente secretos y URLs; nunca escribirlos en el repositorio.
+5. Validar `https://CORE_URL/healthz`, `https://CORE_URL/readyz`,
+   `https://CORE_URL/api/v1/health` y `https://CORE_URL/docs`.
+6. Desplegar el Static Site con `VITE_API_BASE_URL=https://CORE_URL`.
+7. Cargar `MINIAPP_URL=https://MINIAPP_URL` y `API_CORS_ORIGINS=https://MINIAPP_URL`.
+8. Probar `/start`, `/dashboard` y todos los comandos legacy desde Telegram celular.
+9. Solo después de validar, solicitar confirmación para eliminar Blueprints o servicios duplicados.
 
-1. Crear Blueprint.
-2. Cargar secretos del bot.
-3. Desplegar `observatorio-economico-api`.
-4. Copiar su URL pública HTTPS.
-5. Configurar `VITE_API_BASE_URL` en el Static Site.
-6. Desplegar `observatorio-economico-miniapp`.
-7. Copiar su URL pública HTTPS.
-8. Configurar `MINIAPP_URL` en el bot y en la API.
-9. Configurar `API_CORS_ORIGINS` con la URL HTTPS del frontend.
-10. Redeploy del bot y de la API después de ajustar variables.
+## Health y diagnóstico
 
-## 4. Health Checks
+`GET /api/v1/health` muestra el estado de API y Telegram:
 
-Backend:
+- `disabled`: runtime desactivado por configuración.
+- `configuration_error`: falta token o secreto.
+- `running`: webhook y tareas Telegram iniciados.
+- `error`: fallo de inicialización; revisar logs sin exponer secretos.
 
-- `https://BACKEND_RENDER_URL/api/v1/health`
-- `https://BACKEND_RENDER_URL/docs`
+Render usa `GET /readyz` como health check: devuelve `503` cuando el runtime Telegram está habilitado
+pero no llegó a `running`. `GET /healthz` solo confirma que el proceso FastAPI responde.
 
-Frontend:
+El webhook usa una URL fija `/telegram/webhook`. Telegram entrega `WEBHOOK_SECRET` en el header
+`X-Telegram-Bot-Api-Secret-Token`; no se incluye el secreto en rutas ni logs.
 
-- `https://FRONTEND_RENDER_URL`
+El keep-alive consulta `BASE_URL/` cada cinco minutos. Un `200` en `/` y logs
+`Keepalive ... -> 200` confirman su ejecución.
 
-Bot:
+## Límites gratuitos
 
-- En Telegram, enviar `/dashboard`.
-- Tocar `Abrir Dashboard`.
-- Verificar que abre dentro de Telegram en celular.
-
-## 5. Pruebas Post-Deploy
-
-1. Abrir `/api/v1/health` y confirmar `status: "ok"`.
-2. Abrir `/docs` y confirmar endpoints.
-3. Abrir el frontend Render en navegador.
-4. Revisar que Settings muestre la URL del backend configurada.
-5. En Telegram celular, ejecutar `/dashboard`.
-6. Tocar `Abrir Dashboard`.
-7. Revisar pantallas: Market Pulse, Screener, Portfolio Command Center, Alerts, Signals y Settings.
-
-## 6. Límites Actuales
-
-- SQLite en Render sin disco persistente puede perder estado en redeploy, restart o recreación del servicio.
-- Para producción estable, migrar `DATABASE_URL` a PostgreSQL administrado.
-- Market live sigue desactivado salvo `LEGACY_LIVE_FETCH_ENABLED=1`.
-- Portfolio, validaciones financieras avanzadas y partes no adaptadas siguen respondiendo `not_available`.
+- Solo debe permanecer activo un Web Service gratuito en el workspace de ObeconBot.
+- El comando de inicio usa un solo worker. No escalar a varias instancias hasta implementar un lease
+  distribuido que garantice un único webhook y un único conjunto de jobs.
+- SQLite es efímero en Render. Upstash conserva únicamente el estado legacy configurado para usarlo.
+- Alertas y proyecciones creadas desde la Mini App son borradores locales y pueden perderse; su canal
+  Telegram permanece `not_connected`.
+- El keep-alive no evita la suspensión por agotar las 750 horas mensuales compartidas.
+- Alertas y jobs no tienen garantía de tiempo real durante reinicios o suspensiones de plataforma.

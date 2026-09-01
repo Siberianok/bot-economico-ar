@@ -10,6 +10,7 @@ from backend.app.schemas.envelope import envelope
 from backend.app.schemas.projections import ProjectionCreate
 from backend.app.services.projection_service import create_projection, list_projections, list_validations
 from backend.app.utils.time import utc_now_iso
+from backend.app.utils.telegram_auth import TelegramIdentity, get_telegram_identity
 
 
 projections_router = APIRouter(prefix="/projections", tags=["projections"])
@@ -29,7 +30,11 @@ def projections(db: Session = Depends(get_db)) -> dict:
 
 
 @projections_router.post("")
-def projections_create(payload: ProjectionCreate, db: Session = Depends(get_db)) -> dict:
+def projections_create(
+    payload: ProjectionCreate,
+    db: Session = Depends(get_db),
+    _: TelegramIdentity = Depends(get_telegram_identity),
+) -> dict:
     return envelope(
         status="ok",
         timestamp=utc_now_iso(),
@@ -50,4 +55,3 @@ def validations(db: Session = Depends(get_db)) -> dict:
         data={"items": list_validations(db)},
         warnings=["Evaluacion futura preparada; sin validaciones maduras todavia"],
     )
-

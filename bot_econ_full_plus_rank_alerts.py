@@ -5235,6 +5235,60 @@ def _build_performance_lines() -> List[str]:
     lines.append(f"• Última evaluación: {latest_eval_txt}")
     return lines
 
+
+def _build_performance_detail_lines() -> List[str]:
+    lines = _build_performance_lines()
+    recent_batches = sorted(
+        PROJECTION_BATCHES,
+        key=lambda batch: float(batch.get("created_at") or 0),
+        reverse=True,
+    )[:5]
+
+    lines.extend(["", "<b>Últimos batches</b>"])
+    if recent_batches:
+        for batch in recent_batches:
+            horizon = int(batch.get("horizon") or 0)
+            created = _html.escape(str(batch.get("created_date") or "s/d"))
+            status = "evaluado" if batch.get("evaluated") else "pendiente"
+            lines.append(f"• {created} | {horizon}r | {status}")
+    else:
+        lines.append("• Sin batches registrados.")
+
+    pending = [batch for batch in PROJECTION_BATCHES if not batch.get("evaluated")]
+    pending_counts: Dict[int, int] = {}
+    pending_progress: Dict[int, int] = {}
+    today = datetime.now(TZ).date()
+    for batch in pending:
+        try:
+            horizon = int(batch.get("horizon") or 0)
+        except (TypeError, ValueError):
+            continue
+        if horizon <= 0:
+            continue
+        pending_counts[horizon] = pending_counts.get(horizon, 0) + 1
+        created_raw = batch.get("created_date")
+        try:
+            created_date = date.fromisoformat(str(created_raw)[:10])
+            elapsed = min(horizon, max(0, _trading_days_between(created_date, today)))
+        except (TypeError, ValueError):
+            elapsed = 0
+        pending_progress[horizon] = max(pending_progress.get(horizon, 0), elapsed)
+
+    lines.extend(["", "<b>Estado actual del motor de proyecciones</b>"])
+    if pending_counts:
+        counts_text = ", ".join(
+            f"{horizon}r: {pending_counts[horizon]}" for horizon in sorted(pending_counts)
+        )
+        progress_text = ", ".join(
+            f"{horizon}r: {pending_progress[horizon]}/{horizon}"
+            for horizon in sorted(pending_progress)
+        )
+        lines.append(f"• Pendientes por horizonte: {counts_text}")
+        lines.append(f"• Progreso estimado: {progress_text}")
+    else:
+        lines.append("• Sin batches pendientes.")
+    return lines
+
 RET_SERIES_BASE: List[Tuple[str, str]] = [
     ("6m", "Rend. 6M"),
     ("3m", "Rend. 3M"),
@@ -5440,7 +5494,7 @@ async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("Dashboard no configurado. Definí MINIAPP_URL.")
         return
     await update.effective_message.reply_text(
-        "📊 Observatorio Económico\nAbrí el dashboard interactivo desde Telegram.",
+        "📊 ObeconBot\nAbrí el dashboard interactivo desde Telegram.",
         reply_markup=markup,
         link_preview_options=build_preview_options(),
     )
@@ -10536,10 +10590,12 @@ async def pf_market_snapshot(
         tipo = it.get("tipo", "")
         qty = float(it["cantidad"]) if it.get("cantidad") is not None else None
         invertido = float(it.get("importe") or 0.0)
+        met_raw = dict(mets.get(sym, {})) if sym in mets else {}
         if str(tipo).lower() == "fci" and idx in fci_item_metrics:
-            met_raw = fci_item_metrics[idx]
-        else:
-            met_raw = mets.get(sym, {}) if sym in mets else {}
+            # Preserve generic metrics when the preferred FCI source has gaps.
+            for key, value in fci_item_metrics[idx].items():
+                if value is not None or key.startswith("fci_"):
+                    met_raw[key] = value
         met = dict(met_raw) if met_raw else {}
         if str(tipo).lower() == "fci":
             selected_id = met.get("fci_selected_id")
@@ -12062,7 +12118,22 @@ async def cmd_resumen_diario(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def cmd_performance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = _build_performance_lines()
+    args = [str(arg).strip().lower() for arg in (getattr(context, "args", None) or [])]
+    lines = (
+        _build_performance_detail_lines()
+        if any(arg in {"full", "detalle", "detail"} for arg in args)
+        else _build_performance_lines()
+    )
+
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        link_preview_options=build_preview_options(),
+    )
+
+
+async def cmd_performance_detalle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = _build_performance_detail_lines()
 
     await update.effective_message.reply_text(
         "\n".join(lines),
@@ -12159,6 +12230,7 @@ def setup_health_routes(application: Application) -> None:
             logging.debug("No se pudo registrar ruta %s: %s", path, exc)
 
 BOT_COMMANDS = [
+    BotCommand("menu","Abrir menú principal"),
     BotCommand("economia","Menú de economía"),
     BotCommand("acciones","Menú acciones"),
     BotCommand("cedears","Menú cedears"),
@@ -12167,6 +12239,7 @@ BOT_COMMANDS = [
     BotCommand("portafolio","Menú portafolio"),
     BotCommand("subs","Suscripción a resumen diario"),
     BotCommand("performance","Métricas de performance"),
+    BotCommand("performance_detalle","Detalle de performance"),
 ]
 
 
@@ -12204,6 +12277,7 @@ def build_application() -> Application:
 
     # Comandos
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", cmd_start))
     app.add_handler(CommandHandler("dashboard", cmd_dashboard))
     app.add_handler(CommandHandler("economia", cmd_menu_economia))
     app.add_handler(CommandHandler("reservas", cmd_reservas))
@@ -12282,6 +12356,12 @@ def build_application() -> Application:
     # Resumen diario on-demand
     app.add_handler(CommandHandler("resumen", instrument_command("resumen", cmd_resumen_diario)))
     app.add_handler(CommandHandler("performance", instrument_command("performance", cmd_performance)))
+    app.add_handler(
+        CommandHandler(
+            "performance_detalle",
+            instrument_command("performance_detalle", cmd_performance_detalle),
+        )
+    )
 
     app.add_error_handler(handle_error)
 

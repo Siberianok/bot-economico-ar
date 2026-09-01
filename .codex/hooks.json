@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/ariel/Downloads/IA/ObeconBot/.codex/hooks/quality-gate.ps1\" -Mode Blocking",
+            "commandWindows": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/ariel/Downloads/IA/ObeconBot/.codex/hooks/quality-gate.ps1\" -Mode Blocking",
+            "timeout": 900,
+            "statusMessage": "Auditando ObeconBot antes de finalizar"
+          }
+        ]
+      }
+    ]
+  }
+}

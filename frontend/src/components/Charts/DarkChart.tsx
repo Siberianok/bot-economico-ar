@@ -1,4 +1,10 @@
-import ReactECharts from "echarts-for-react";
+import { BarChart } from "echarts/charts";
+import { GridComponent, TitleComponent, TooltipComponent } from "echarts/components";
+import * as echarts from "echarts/core";
+import { CanvasRenderer } from "echarts/renderers";
+import ReactEChartsCore from "echarts-for-react/esm/core";
+
+echarts.use([BarChart, GridComponent, TitleComponent, TooltipComponent, CanvasRenderer]);
 
 interface Props {
   title: string;
@@ -32,6 +38,5 @@ export function DarkChart({ title, labels, values }: Props) {
       },
     ],
   };
-  return <ReactECharts option={option} style={{ height: 280, width: "100%" }} />;
+  return <ReactEChartsCore echarts={echarts} option={option} style={{ height: 280, width: "100%" }} />;
 }
-

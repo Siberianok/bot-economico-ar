@@ -8,8 +8,14 @@ from typing import Any
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
-from backend.app.config import get_settings
 from backend.app.models import Signal
+from backend.app.services.market_service import get_market_pulse
+from backend.app.services.market_signal_rules import (
+    derive_market_signal_candidates as _derive_market_signal_candidates,
+)
+
+
+RETIRED_SYNTHETIC_SIGNAL_KEYS = {"system:api-online"}
 
 
 def _serialize_dt(value: datetime) -> str:
@@ -49,6 +55,11 @@ def emit_signal(
     type: str = "system",
     source: str = "backend",
     cooldown_minutes: int = 60,
+    asset: str | None = None,
+    metric: str | None = None,
+    current_value: float | None = None,
+    previous_value: float | None = None,
+    variation: float | None = None,
 ) -> tuple[dict[str, Any], bool]:
     now = datetime.now(timezone.utc)
     recent = db.execute(
@@ -67,6 +78,11 @@ def emit_signal(
         severity=severity,
         type=type,
         source=source,
+        asset=asset,
+        metric=metric,
+        current_value=current_value,
+        previous_value=previous_value,
+        variation=variation,
         status="active",
         created_at=now,
     )
@@ -76,23 +92,39 @@ def emit_signal(
     return serialize_signal(signal), True
 
 
-def ensure_system_signal(db: Session) -> None:
-    settings = get_settings()
-    emit_signal(
-        db,
-        dedup_key="system:api-online",
-        title="API backend operativa",
-        description="Se inicializo el backend modular del Observatorio Economico.",
-        score=max(settings.signal_min_score, 70),
-        severity="info",
-        type="system",
-        source="backend",
-        cooldown_minutes=24 * 60,
-    )
-
-
 def list_signals(db: Session) -> list[dict[str, Any]]:
-    ensure_system_signal(db)
-    rows = db.execute(select(Signal).order_by(desc(Signal.created_at))).scalars().all()
+    rows = db.execute(
+        select(Signal)
+        .where(~Signal.dedup_key.in_(RETIRED_SYNTHETIC_SIGNAL_KEYS))
+        .order_by(desc(Signal.created_at))
+    ).scalars().all()
     return [serialize_signal(row) for row in rows]
 
+
+def derive_market_signal_candidates(pulse: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compatibility wrapper kept for existing imports and tests."""
+    return _derive_market_signal_candidates(pulse)
+
+
+async def refresh_market_signals(db: Session) -> dict[str, Any]:
+    pulse = await get_market_pulse()
+    if pulse.get("status") in {"not_available", "error"}:
+        return {
+            "status": "not_available",
+            "freshness": "unknown",
+            "created": 0,
+            "warnings": list(pulse.get("warnings") or ["Market Pulse no disponible"]),
+        }
+
+    created = 0
+    for candidate in derive_market_signal_candidates(pulse):
+        _, was_created = emit_signal(db, **candidate)
+        created += int(was_created)
+    return {
+        "status": "ok",
+        "freshness": pulse.get("freshness", "unknown"),
+        "created": created,
+        "warnings": [
+            "Senales derivadas por reglas transparentes sobre datos reales; no son recomendaciones de inversion."
+        ],
+    }

@@ -59,7 +59,7 @@ def create_projection(db: Session, payload: ProjectionCreate) -> dict[str, Any]:
         base_date=base_date,
         target_date=target_date,
         validation_status="pending",
-        source=payload.source,
+        source="miniapp",
     )
     db.add(projection)
     db.commit()
@@ -90,4 +90,3 @@ def serialize_validation(validation: Validation) -> dict[str, Any]:
 def list_validations(db: Session) -> list[dict[str, Any]]:
     rows = db.execute(select(Validation).order_by(desc(Validation.created_at))).scalars().all()
     return [serialize_validation(row) for row in rows]
-

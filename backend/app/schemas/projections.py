@@ -17,5 +17,3 @@ class ProjectionCreate(BaseModel):
     confidence: float | None = Field(default=None, ge=0, le=100)
     base_date: datetime | None = None
     target_date: datetime | None = None
-    source: str = "api"
-

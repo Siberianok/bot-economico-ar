@@ -1,4 +1,4 @@
-"""State persistence helpers for bot-economico-ar."""
+"""State persistence helpers for ObeconBot."""
 
 from __future__ import annotations
 

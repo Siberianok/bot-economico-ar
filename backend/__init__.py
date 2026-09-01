@@ -1,2 +1,1 @@
-"""Backend package for Observatorio Economico."""
-
+"""Backend package for ObeconBot."""

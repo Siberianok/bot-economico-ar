@@ -11,6 +11,5 @@ router = APIRouter(prefix="/screener", tags=["screener"])
 
 
 @router.get("")
-def screener(kind: str) -> dict:
-    return get_screener(kind)
-
+async def screener(kind: str) -> dict:
+    return await get_screener(kind)

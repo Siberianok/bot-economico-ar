@@ -1,5 +1,6 @@
 import { API_BASE_URL, API_CONFIG_ERROR } from "../api/client";
 import { getConfig } from "../api/config";
+import { getSession } from "../api/session";
 import { StatusBadge } from "../components/Badges/StatusBadge";
 import { DataState } from "../components/States/DataState";
 import { useEnvelope } from "../hooks/useEnvelope";
@@ -7,7 +8,9 @@ import { getTelegramStatus } from "../lib/telegram";
 
 export function Settings() {
   const { payload, loading, error } = useEnvelope(getConfig);
+  const { payload: sessionPayload, loading: sessionLoading } = useEnvelope(getSession);
   const telegram = getTelegramStatus();
+  const serverSession = sessionPayload?.data;
 
   return (
     <div className="space-y-5">
@@ -30,9 +33,38 @@ export function Settings() {
         <div className="rounded-lg border border-obs-border bg-obs-card p-4">
           <h3 className="mb-3 text-lg font-semibold">Telegram Mini App</h3>
           <div className="space-y-2 text-sm text-obs-muted">
-            <div>Detectada: {telegram.detected ? "sí" : "no"}</div>
+            <div>SDK cargado: {telegram.sdkLoaded ? "sí" : "no"}</div>
+            <div>Contexto Telegram: {telegram.detected ? "detectado" : "modo desarrollo"}</div>
             <div>initData: {telegram.initDataAvailable ? "disponible" : "no disponible"}</div>
-            <div>Usuario/dev: {telegram.userId}</div>
+            <div className="flex items-center gap-2">
+              Validación backend:
+              {sessionLoading ? (
+                "Comprobando"
+              ) : (
+                <StatusBadge status={serverSession?.authentication.validated ? "validated" : "development"} />
+              )}
+            </div>
+            <div>
+              Usuario: {serverSession?.user.first_name || serverSession?.user.username || telegram.userId}
+            </div>
+            <div className="flex items-center gap-2">
+              Runtime Telegram:
+              <StatusBadge status={serverSession?.telegram_runtime.state || "unknown"} />
+            </div>
+            <div className="flex items-center gap-2">
+              Portfolio vinculado:
+              <StatusBadge status={serverSession?.portfolio.status || "not_available"} />
+            </div>
+            <div className="flex items-center gap-2">
+              Alertas Telegram:
+              <StatusBadge status={serverSession?.alerts?.status || "not_available"} />
+              <span>{serverSession?.alerts?.rule_count || 0}</span>
+            </div>
+            <div className="flex items-center gap-2">
+              Resumen diario:
+              <StatusBadge status={serverSession?.subscription?.enabled ? "active" : serverSession?.subscription?.status || "not_available"} />
+              <span>{serverSession?.subscription?.daily_time || "Sin horario"}</span>
+            </div>
           </div>
         </div>
       </section>
