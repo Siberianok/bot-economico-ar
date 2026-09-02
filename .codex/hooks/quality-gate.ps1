@@ -12,7 +12,8 @@ $expectedProjectRoot = [System.IO.Path]::GetFullPath("C:\Users\ariel\Downloads\I
 $python = Join-Path $projectRoot ".venv\Scripts\python.exe"
 $frontendRoot = Join-Path $projectRoot "frontend"
 $tempRoot = Join-Path $projectRoot ".codex\.tmp"
-$runRoot = Join-Path $tempRoot ("quality-gate-{0}" -f $PID)
+$runId = [System.Guid]::NewGuid().ToString("N")
+$runRoot = Join-Path $tempRoot ("quality-gate-{0}" -f $runId)
 $failures = New-Object System.Collections.Generic.List[string]
 $warnings = New-Object System.Collections.Generic.List[string]
 $passed = 0
@@ -65,7 +66,7 @@ try {
 
     $env:TELEGRAM_TOKEN = "quality-gate-placeholder-token"
     $env:BOT_TOKEN = "quality-gate-placeholder-token"
-    $env:DATABASE_URL = "sqlite:///./.codex/.tmp/quality-gate-$PID/quality_gate.db"
+    $env:DATABASE_URL = "sqlite:///./.codex/.tmp/quality-gate-$runId/quality_gate.db"
     $env:LEGACY_LIVE_FETCH_ENABLED = "0"
     $env:PYTHONDONTWRITEBYTECODE = "1"
 
