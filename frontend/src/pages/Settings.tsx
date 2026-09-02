@@ -11,6 +11,15 @@ export function Settings() {
   const { payload: sessionPayload, loading: sessionLoading } = useEnvelope(getSession);
   const telegram = getTelegramStatus();
   const serverSession = sessionPayload?.data;
+  const telegramVerified = Boolean(serverSession?.authentication.validated);
+  const alertsStatus = telegramVerified
+    ? serverSession?.alerts?.status || "not_available"
+    : "not_available";
+  const subscriptionStatus = telegramVerified
+    ? serverSession?.subscription?.enabled
+      ? "active"
+      : serverSession?.subscription?.status || "not_available"
+    : "not_available";
 
   return (
     <div className="space-y-5">
@@ -57,13 +66,13 @@ export function Settings() {
             </div>
             <div className="flex items-center gap-2">
               Alertas Telegram:
-              <StatusBadge status={serverSession?.alerts?.status || "not_available"} />
-              <span>{serverSession?.alerts?.rule_count || 0}</span>
+              <StatusBadge status={alertsStatus} />
+              <span>{telegramVerified ? serverSession?.alerts?.rule_count || 0 : "Sin vincular"}</span>
             </div>
             <div className="flex items-center gap-2">
               Resumen diario:
-              <StatusBadge status={serverSession?.subscription?.enabled ? "active" : serverSession?.subscription?.status || "not_available"} />
-              <span>{serverSession?.subscription?.daily_time || "Sin horario"}</span>
+              <StatusBadge status={subscriptionStatus} />
+              <span>{telegramVerified ? serverSession?.subscription?.daily_time || "Sin horario" : "Sin vincular"}</span>
             </div>
           </div>
         </div>

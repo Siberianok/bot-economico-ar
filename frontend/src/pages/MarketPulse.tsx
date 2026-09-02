@@ -6,6 +6,7 @@ import { KpiCard } from "../components/Cards/KpiCard";
 import { DataState } from "../components/States/DataState";
 import { DataTable } from "../components/Tables/DataTable";
 import { useEnvelope } from "../hooks/useEnvelope";
+import { formatObservationDate } from "../lib/format";
 
 const DarkChart = lazy(() =>
   import("../components/Charts/DarkChart").then((module) => ({ default: module.DarkChart })),
@@ -103,29 +104,29 @@ export function MarketPulse({ onNavigate }: PageProps) {
         <KpiCard
           title="Dólar cripto"
           value={fxValue((data as any)?.dolar_cripto, "venta")}
-          meta={(data as any)?.dolar_cripto?.data?.fecha || undefined}
+          meta={formatObservationDate((data as any)?.dolar_cripto?.data?.fecha)}
           tone="blue"
         />
         <KpiCard
           title="Dólar MEP"
           value={fxValue((data as any)?.dolar_mep, "venta")}
-          meta={(data as any)?.dolar_mep?.data?.fecha || undefined}
+          meta={formatObservationDate((data as any)?.dolar_mep?.data?.fecha)}
         />
         <KpiCard
           title="Riesgo país"
           value={macroValue((data as any)?.riesgo_pais, " pb")}
-          meta={(data as any)?.riesgo_pais?.data?.as_of || undefined}
+          meta={formatObservationDate((data as any)?.riesgo_pais?.data?.as_of)}
           tone="warning"
         />
         <KpiCard
           title="Reservas"
           value={macroValue((data as any)?.reservas, " M USD")}
-          meta={(data as any)?.reservas?.data?.as_of || undefined}
+          meta={formatObservationDate((data as any)?.reservas?.data?.as_of)}
         />
         <KpiCard
           title="Inflación mensual"
           value={macroValue((data as any)?.inflacion, "%")}
-          meta={(data as any)?.inflacion?.data?.as_of || undefined}
+          meta={formatObservationDate((data as any)?.inflacion?.data?.as_of)}
         />
       </div>
 
@@ -156,7 +157,7 @@ export function MarketPulse({ onNavigate }: PageProps) {
             <div className="mt-3 space-y-2 text-sm">
               <div className="flex justify-between gap-3"><span>Inferior</span><strong>{moneyFormatter.format(bands.banda_inferior)}</strong></div>
               <div className="flex justify-between gap-3"><span>Superior</span><strong>{moneyFormatter.format(bands.banda_superior)}</strong></div>
-              <div className="text-xs text-obs-muted">{bands.fuente} · {bands.fecha}</div>
+              <div className="text-xs text-obs-muted">{bands.fuente} · {formatObservationDate(bands.fecha) || "Sin fecha"}</div>
             </div>
           ) : <DataState title="No disponible" />}
         </div>

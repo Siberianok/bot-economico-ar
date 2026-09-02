@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { FormEvent, useState } from "react";
 import { createAlert, deleteAlert, getAlerts, updateAlert } from "../api/alerts";
+import { getSession } from "../api/session";
 import { StatusBadge } from "../components/Badges/StatusBadge";
 import { SegmentedTabs } from "../components/Buttons/SegmentedTabs";
 import { DataState } from "../components/States/DataState";
@@ -99,9 +100,16 @@ export function Alerts() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<number | null>(null);
   const { payload, loading, error } = useEnvelope(getAlerts, [refresh]);
+  const { payload: sessionPayload, loading: sessionLoading } = useEnvelope(getSession);
 
   const center = payload?.data;
-  const legacyItems = center?.legacy?.items || [];
+  const telegramVerified = Boolean(sessionPayload?.data?.authentication.validated);
+  const legacyItems = telegramVerified ? center?.legacy?.items || [] : [];
+  const subscriptionStatus = telegramVerified
+    ? center?.subscription?.enabled
+      ? "active"
+      : center?.subscription?.status || "not_available"
+    : "not_available";
   const draftItems = center?.drafts?.items || center?.items || [];
   const draftHistory = draftItems.flatMap((item) =>
     item.history.map((event) => ({
@@ -191,7 +199,7 @@ export function Alerts() {
         </div>
       </header>
 
-      {center?.legacy?.status === "ok" ? (
+      {telegramVerified && center?.legacy?.status === "ok" ? (
         <div className="flex items-start gap-3 border-l-2 border-obs-positive bg-obs-card2 p-4">
           <ShieldCheck className="mt-0.5 shrink-0 text-obs-positive" size={20} />
           <div><div className="font-medium">Estado Telegram vinculado</div><div className="text-sm text-obs-muted">Las reglas operativas se muestran sin modificar su estado.</div></div>
@@ -199,7 +207,10 @@ export function Alerts() {
       ) : (
         <div className="flex items-start gap-3 border-l-2 border-obs-warning bg-obs-card2 p-4">
           <LockKeyhole className="mt-0.5 shrink-0 text-obs-warning" size={20} />
-          <div><div className="font-medium">Estado Telegram no vinculado</div><div className="text-sm text-obs-muted">La sesión local no puede consultar ALERTS ni SUBS de ningún usuario.</div></div>
+          <div>
+            <div className="font-medium">{sessionLoading ? "Verificando identidad Telegram" : "Estado Telegram no vinculado"}</div>
+            <div className="text-sm text-obs-muted">{sessionLoading ? "Comprobando la sesión con el backend." : "Abrí la Mini App desde /dashboard para consultar ALERTS y SUBS de tu cuenta."}</div>
+          </div>
         </div>
       )}
 
@@ -226,8 +237,8 @@ export function Alerts() {
           <div className="grid gap-3">{legacyItems.map((item) => <LegacyRuleCard key={item.id} item={item} />)}</div>
         ) : (
           <DataState
-            title={center?.legacy?.status === "ok" ? "Sin alertas Telegram" : "Alertas Telegram no disponibles"}
-            detail={center?.legacy?.status === "ok" ? "La cuenta vinculada no tiene reglas operativas guardadas." : "Se requiere una identidad Telegram firmada para leerlas."}
+            title={telegramVerified && center?.legacy?.status === "ok" ? "Sin alertas Telegram" : "Alertas Telegram no vinculadas"}
+            detail={telegramVerified && center?.legacy?.status === "ok" ? "La cuenta vinculada no tiene reglas operativas guardadas." : "Se requiere una identidad Telegram firmada para leerlas."}
           />
         )
       ) : null}
@@ -275,9 +286,9 @@ export function Alerts() {
       {tab === "subscription" ? (
         <section className="grid gap-4 lg:grid-cols-[1.2fr_0.8fr]">
           <div className="rounded-lg border border-obs-border bg-obs-card p-5">
-            <div className="flex items-center justify-between gap-3"><div className="flex items-center gap-2"><Clock3 className="text-obs-blue" size={20} /><h3 className="font-semibold">Resumen diario</h3></div><StatusBadge status={center?.subscription?.enabled ? "active" : center?.subscription?.status || "not_available"} /></div>
-            <div className="mt-6 text-4xl font-semibold">{center?.subscription?.daily_time || "--:--"}</div>
-            <div className="mt-2 text-sm text-obs-muted">{center?.subscription?.timezone || "Hora Argentina"}</div>
+            <div className="flex items-center justify-between gap-3"><div className="flex items-center gap-2"><Clock3 className="text-obs-blue" size={20} /><h3 className="font-semibold">Resumen diario</h3></div><StatusBadge status={subscriptionStatus} /></div>
+            <div className="mt-6 text-4xl font-semibold">{telegramVerified ? center?.subscription?.daily_time || "--:--" : "--:--"}</div>
+            <div className="mt-2 text-sm text-obs-muted">{telegramVerified ? center?.subscription?.timezone || "Hora Argentina" : "Vinculación Telegram requerida"}</div>
           </div>
           <div className="rounded-lg border border-obs-border bg-obs-card p-5">
             <div className="flex items-center gap-2"><Radio className="text-obs-violet" size={20} /><h3 className="font-semibold">Entrega</h3></div>
